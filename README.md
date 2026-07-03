@@ -119,6 +119,10 @@ path used for every other deploy.
   HTTP→HTTPS redirect. Public domains still get Let's Encrypt certificates,
   but plaintext HTTP is not upgraded — forced-HTTPS for public domains is a
   later enhancement.
+- All app containers share the `lwd` Docker network with the Caddy container,
+  whose admin API is reachable on that network. lwd assumes all deployed apps
+  are trusted (single-operator use); isolating the router admin API from app
+  containers is a later hardening step.
 
 ## Testing
 

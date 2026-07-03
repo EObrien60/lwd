@@ -4,6 +4,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -64,11 +65,27 @@ func runDaemon() int {
 	defer s.Close()
 
 	r := router.NewCaddyRouter(n, config.DataDir())
+
+	// Seed the in-memory route set from reality BEFORE the startup reload: if
+	// lwd-caddy is still running from a prior daemon process, EnsureUp's
+	// Reload would otherwise POST a route-less Caddyfile (CaddyRouter.routes
+	// starts empty on every process start) and drop every app's live route
+	// for the duration of the reload. Seeding first means that reload's
+	// atomic /load installs the full correct set instead, with no empty
+	// window. A failure here is logged and tolerated: EnsureUp still runs, so
+	// the daemon comes up (just without routes restored) rather than failing
+	// to start entirely.
+	if routes, err := buildInitialRoutes(context.Background(), n, s); err != nil {
+		fmt.Fprintln(os.Stderr, "router: failed to build initial routes:", err)
+	} else {
+		r.SeedRoutes(routes)
+	}
+
 	if err := r.EnsureUp(context.Background()); err != nil {
 		fmt.Fprintln(os.Stderr, "router: failed to bring up Caddy:", err)
 		return 1
 	}
-	srv := api.New(reconciler.New(n, r, s), s, n)
+	srv := api.New(reconciler.New(n, r, s), s, n, r)
 
 	sock := config.SocketPath()
 	_ = os.Remove(sock) // clean stale socket
@@ -88,6 +105,67 @@ func runDaemon() int {
 		return 1
 	}
 	return 0
+}
+
+// buildInitialRoutes reconstructs the route set that should already be live
+// in a still-running Caddy container, from persisted deployment state, so a
+// restarting daemon can seed its in-memory Router (see Router.SeedRoutes)
+// before its startup reload runs. It considers every running "surface"
+// container, keeping only the one that matches the store's recorded current
+// (StatusRunning) deployment for its app — by container ID, not name, since
+// that's the durable link between a container and the deployment row that
+// produced it. Containers left over from an old, superseded deployment (e.g.
+// one the reconciler failed to remove) are skipped, as are apps with no
+// current deployment or no Domain configured. Routes are deduped by domain
+// (a domain can only have one current deployment at a time, so this is
+// mostly defensive).
+func buildInitialRoutes(ctx context.Context, n node.Node, s *store.Store) ([]router.Route, error) {
+	containers, err := n.ListContainers(ctx, map[string]string{"lwd.role": "surface"})
+	if err != nil {
+		return nil, fmt.Errorf("list surface containers: %w", err)
+	}
+
+	routes := make(map[string]router.Route)
+	for _, c := range containers {
+		if c.State != "running" {
+			continue
+		}
+		app := c.Labels["lwd.app"]
+		if app == "" {
+			continue
+		}
+		cur, err := s.CurrentDeployment(app)
+		if err != nil || cur == nil {
+			continue
+		}
+		if c.ID != cur.ContainerID {
+			// Not the current deployment's container (e.g. a stale surface
+			// left over from a failed swap) — skip it so we never seed a
+			// route pointing at the wrong container.
+			continue
+		}
+
+		var a spec.App
+		if err := json.Unmarshal([]byte(cur.Spec), &a); err != nil {
+			continue
+		}
+		if a.Domain == "" {
+			continue
+		}
+
+		routes[a.Domain] = router.Route{
+			Domain:      a.Domain,
+			Upstream:    c.Name,
+			Port:        a.Port,
+			TLSInternal: router.UseInternalTLS(a.Domain),
+		}
+	}
+
+	out := make([]router.Route, 0, len(routes))
+	for _, r := range routes {
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 func newClient() *client.Client { return client.New(config.SocketPath()) }

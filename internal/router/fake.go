@@ -106,3 +106,16 @@ func (f *FakeRouter) Reload(ctx context.Context) error {
 	f.record("Reload")
 	return nil
 }
+
+// SeedRoutes populates Routes with each of routes, keyed by Domain, and
+// records the call. It does not reload anything (the FakeRouter has nothing
+// to reload); it exists so callers can be tested against the same interface
+// as CaddyRouter.SeedRoutes.
+func (f *FakeRouter) SeedRoutes(routes []Route) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("SeedRoutes")
+	for _, r := range routes {
+		f.Routes[r.Domain] = r
+	}
+}

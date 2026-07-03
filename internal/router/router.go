@@ -29,6 +29,15 @@ const caddyContainerName = "lwd-caddy"
 // from the host is instead enforced one layer up, by node.RunContainer's
 // host-port binding rules for non-80/443 ports (see defaultCaddyAdminBaseURL
 // below, which the host process itself connects through).
+//
+// SECURITY NOTE: binding all interfaces also means the admin API is reachable
+// on the "lwd" Docker network by every app container attached to it, not just
+// from the host. Any deployed app can therefore reach 2019 on the Caddy
+// container's network IP and rewrite routing for every other app. This is
+// acceptable only under the single-operator/trusted-apps assumption for this
+// milestone (see README's "Known limitations"); isolating the admin API from
+// app containers (e.g. a second, app-inaccessible network for Caddy<->host,
+// or an auth-gated admin listener) is a later hardening step.
 const adminAddr = "0.0.0.0:2019"
 
 // defaultCaddyAdminBaseURL is the default base URL for Caddy's admin API.
@@ -65,6 +74,13 @@ type Router interface {
 	ProbeThroughCaddy(ctx context.Context, host, path string) (status int, err error)
 	// Reload regenerates the Caddyfile from current state and reloads Caddy.
 	Reload(ctx context.Context) error
+	// SeedRoutes replaces the in-memory active route set with routes, keyed by
+	// Domain, WITHOUT reloading Caddy. It exists so a daemon restart can seed
+	// reality (routes a still-running lwd-caddy container already has live)
+	// before the startup EnsureUp->Reload runs, so that reload's atomic /load
+	// installs the full correct set instead of a route-less one that would
+	// otherwise drop every app's live route for the reload's duration.
+	SeedRoutes(routes []Route)
 }
 
 // CaddyRouter is the real Router implementation: it drives a Caddy container
@@ -281,6 +297,20 @@ func (c *CaddyRouter) RemoveStaging(ctx context.Context, host string) error {
 	}
 	c.staging = staging
 	return nil
+}
+
+// SeedRoutes replaces the committed in-memory route set with routes, keyed by
+// Domain, without touching Caddy or the on-disk Caddyfile. Callers are
+// responsible for reloading afterward (typically via EnsureUp/Reload) so the
+// seeded set actually takes effect.
+func (c *CaddyRouter) SeedRoutes(routes []Route) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := make(map[string]Route, len(routes))
+	for _, r := range routes {
+		m[r.Domain] = r
+	}
+	c.routes = m
 }
 
 // copyRoutes returns a shallow copy of a domain/host -> Route map, so

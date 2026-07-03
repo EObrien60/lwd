@@ -11,15 +11,17 @@ import (
 
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
+	"lwd/internal/router"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
 
-// Server wires HTTP routes to the reconciler, store, and node.
+// Server wires HTTP routes to the reconciler, store, node, and router.
 type Server struct {
-	rec   *reconciler.Reconciler
-	store *store.Store
-	node  node.Node
+	rec    *reconciler.Reconciler
+	store  *store.Store
+	node   node.Node
+	router router.Router
 }
 
 // AppStatus is the wire representation of an app's current state.
@@ -32,8 +34,8 @@ type AppStatus struct {
 }
 
 // New returns a Server.
-func New(r *reconciler.Reconciler, s *store.Store, n node.Node) *Server {
-	return &Server{rec: r, store: s, node: n}
+func New(r *reconciler.Reconciler, s *store.Store, n node.Node, rt router.Router) *Server {
+	return &Server{rec: r, store: s, node: n, router: rt}
 }
 
 // Handler returns the HTTP handler for all routes.
@@ -176,6 +178,18 @@ func (srv *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (srv *Server) removeApp(ctx context.Context, name string) error {
+	cur, err := srv.store.CurrentDeployment(name)
+	if err != nil {
+		return err
+	}
+	var domain string
+	if cur != nil && cur.Spec != "" {
+		var a spec.App
+		if err := json.Unmarshal([]byte(cur.Spec), &a); err == nil {
+			domain = a.Domain
+		}
+	}
+
 	containers, err := srv.node.ListContainers(ctx, map[string]string{"lwd.app": name})
 	if err != nil {
 		return err
@@ -185,10 +199,14 @@ func (srv *Server) removeApp(ctx context.Context, name string) error {
 			return err
 		}
 	}
-	cur, err := srv.store.CurrentDeployment(name)
-	if err != nil {
-		return err
+
+	if domain != "" {
+		// Best-effort: a failure here shouldn't stop the app from being
+		// retired (its containers are already gone), but it does mean the
+		// domain may keep 502ing until a later reload/rm fixes it up.
+		_ = srv.router.RemoveRoute(ctx, domain)
 	}
+
 	if cur != nil {
 		return srv.store.SetStatus(cur.ID, store.StatusRetired)
 	}

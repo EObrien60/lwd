@@ -25,10 +25,29 @@ func newTestServer(t *testing.T) (*httptest.Server, *node.Fake) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	srv := New(reconciler.New(f, router.NewFakeRouter(), s), s, f)
+	rt := router.NewFakeRouter()
+	srv := New(reconciler.New(f, rt, s), s, f, rt)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f
+}
+
+// newTestServerWithRouter is like newTestServer but also returns the
+// FakeRouter, so tests can assert on route side effects (e.g. rm removing a
+// route).
+func newTestServerWithRouter(t *testing.T) (*httptest.Server, *node.Fake, *router.FakeRouter) {
+	t.Helper()
+	f := node.NewFake()
+	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	rt := router.NewFakeRouter()
+	srv := New(reconciler.New(f, rt, s), s, f, rt)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts, f, rt
 }
 
 func TestApplyEndpoint(t *testing.T) {
@@ -227,5 +246,33 @@ func TestDeleteEndpoint(t *testing.T) {
 		if a.Name == "blog" && a.Status == store.StatusRunning {
 			t.Fatalf("blog still running after delete: %+v", a)
 		}
+	}
+}
+
+func TestDeleteEndpointRemovesRoute(t *testing.T) {
+	ts, _, rt := newTestServerWithRouter(t)
+	body, _ := json.Marshal(spec.App{Name: "blog", Image: "img:1", Port: 8080, Node: "local", Domain: "blog.example.com"})
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /apply: %v", err)
+	}
+	resp.Body.Close()
+
+	if _, ok := rt.Routes["blog.example.com"]; !ok {
+		t.Fatalf("expected route for blog.example.com to be set after apply, got %+v", rt.Routes)
+	}
+
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/apps/blog", nil)
+	delResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	defer delResp.Body.Close()
+	if delResp.StatusCode != 204 {
+		t.Fatalf("status = %d, want 204", delResp.StatusCode)
+	}
+
+	if _, ok := rt.Routes["blog.example.com"]; ok {
+		t.Fatalf("expected route for blog.example.com to be removed after rm, got %+v", rt.Routes)
 	}
 }
