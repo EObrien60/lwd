@@ -310,3 +310,55 @@ func TestMigrationFromPreSpecSchema(t *testing.T) {
 		t.Fatalf("CurrentDeployment (after new) Spec = %q, want %q", cur2.Spec, newSpec)
 	}
 }
+
+func TestSecretSetGetDelete(t *testing.T) {
+	s := openTemp(t)
+	if err := s.SetSecret("blog", "DB", []byte{1, 2, 3}); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
+	got, err := s.GetSecret("blog", "DB")
+	if err != nil {
+		t.Fatalf("GetSecret: %v", err)
+	}
+	if string(got) != string([]byte{1, 2, 3}) {
+		t.Errorf("got %v", got)
+	}
+	// upsert
+	if err := s.SetSecret("blog", "DB", []byte{9}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	got, _ = s.GetSecret("blog", "DB")
+	if len(got) != 1 || got[0] != 9 {
+		t.Errorf("upsert failed: %v", got)
+	}
+	// delete
+	if err := s.DeleteSecret("blog", "DB"); err != nil {
+		t.Fatalf("DeleteSecret: %v", err)
+	}
+	got, _ = s.GetSecret("blog", "DB")
+	if got != nil {
+		t.Errorf("want nil after delete, got %v", got)
+	}
+}
+
+func TestGetSecretAbsentReturnsNil(t *testing.T) {
+	s := openTemp(t)
+	got, err := s.GetSecret("nope", "X")
+	if err != nil || got != nil {
+		t.Fatalf("want (nil,nil), got (%v,%v)", got, err)
+	}
+}
+
+func TestListSecretKeysSortedAndScoped(t *testing.T) {
+	s := openTemp(t)
+	s.SetSecret("blog", "B", []byte{1})
+	s.SetSecret("blog", "A", []byte{1})
+	s.SetSecret("api", "Z", []byte{1})
+	keys, err := s.ListSecretKeys("blog")
+	if err != nil {
+		t.Fatalf("ListSecretKeys: %v", err)
+	}
+	if len(keys) != 2 || keys[0] != "A" || keys[1] != "B" {
+		t.Fatalf("keys = %v, want [A B]", keys)
+	}
+}

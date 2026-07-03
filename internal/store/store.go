@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS deployments (
 	spec         TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_deployments_app ON deployments(app);
+CREATE TABLE IF NOT EXISTS secrets (
+	app   TEXT NOT NULL,
+	key   TEXT NOT NULL,
+	value BLOB NOT NULL,
+	PRIMARY KEY(app,key)
+);
 `
 
 // Open opens (creating if needed) the SQLite database at path and migrates it.
@@ -246,4 +252,59 @@ func (s *Store) ListApps() ([]string, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// SetSecret upserts an encrypted secret blob for (app, key).
+// The value is treated as an opaque byte blob; encryption is the caller's responsibility.
+func (s *Store) SetSecret(app, key string, enc []byte) error {
+	_, err := s.db.Exec(
+		`INSERT INTO secrets (app, key, value) VALUES (?, ?, ?)
+		 ON CONFLICT(app,key) DO UPDATE SET value=excluded.value`,
+		app, key, enc,
+	)
+	if err != nil {
+		return fmt.Errorf("set secret: %w", err)
+	}
+	return nil
+}
+
+// GetSecret returns the encrypted secret blob for (app, key), or (nil, nil) if absent.
+func (s *Store) GetSecret(app, key string) ([]byte, error) {
+	row := s.db.QueryRow(`SELECT value FROM secrets WHERE app = ? AND key = ?`, app, key)
+	var value []byte
+	switch err := row.Scan(&value); err {
+	case nil:
+		return value, nil
+	case sql.ErrNoRows:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("get secret: %w", err)
+	}
+}
+
+// ListSecretKeys returns the keys for a given app, sorted ascending.
+func (s *Store) ListSecretKeys(app string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT key FROM secrets WHERE app = ? ORDER BY key ASC`, app)
+	if err != nil {
+		return nil, fmt.Errorf("list secret keys: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, fmt.Errorf("scan secret key: %w", err)
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// DeleteSecret removes the secret at (app, key).
+func (s *Store) DeleteSecret(app, key string) error {
+	_, err := s.db.Exec(`DELETE FROM secrets WHERE app = ? AND key = ?`, app, key)
+	if err != nil {
+		return fmt.Errorf("delete secret: %w", err)
+	}
+	return nil
 }

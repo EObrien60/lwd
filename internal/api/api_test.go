@@ -8,25 +8,42 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
 	"lwd/internal/router"
+	"lwd/internal/secrets"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
 
+// testSecretResolver builds a real (but throwaway) secrets.Store for tests
+// that need a reconciler.SecretResolver — the reconciler's tests already
+// cover a fake resolver's fail-closed behavior, so wiring the real store
+// here exercises the actual integration.
+func testSecretResolver(t *testing.T, s *store.Store, dir string) *secrets.Store {
+	t.Helper()
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	return secrets.NewStore(cipher, s)
+}
+
 func newTestServer(t *testing.T) (*httptest.Server, *node.Fake) {
 	t.Helper()
 	f := node.NewFake()
-	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
 	rt := router.NewFakeRouter()
-	srv := New(reconciler.New(f, rt, s), s, f, rt)
+	secStore := testSecretResolver(t, s, dir)
+	srv := New(reconciler.New(f, rt, s, secStore), s, f, rt, secStore)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f
@@ -38,13 +55,15 @@ func newTestServer(t *testing.T) (*httptest.Server, *node.Fake) {
 func newTestServerWithRouter(t *testing.T) (*httptest.Server, *node.Fake, *router.FakeRouter) {
 	t.Helper()
 	f := node.NewFake()
-	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
 	rt := router.NewFakeRouter()
-	srv := New(reconciler.New(f, rt, s), s, f, rt)
+	secStore := testSecretResolver(t, s, dir)
+	srv := New(reconciler.New(f, rt, s, secStore), s, f, rt, secStore)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f, rt
@@ -274,5 +293,90 @@ func TestDeleteEndpointRemovesRoute(t *testing.T) {
 
 	if _, ok := rt.Routes["blog.example.com"]; ok {
 		t.Fatalf("expected route for blog.example.com to be removed after rm, got %+v", rt.Routes)
+	}
+}
+
+func TestSecretSetAndList(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	body, _ := json.Marshal(map[string]string{"key": "DB", "value": "pg://x"})
+	resp, err := http.Post(ts.URL+"/apps/blog/secrets", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST secrets: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+
+	resp, err = http.Get(ts.URL + "/apps/blog/secrets")
+	if err != nil {
+		t.Fatalf("GET secrets: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if strings.Contains(string(b), "pg://x") {
+		t.Fatalf("response body leaked secret value: %s", b)
+	}
+	var names []string
+	if err := json.Unmarshal(b, &names); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(names) != 1 || names[0] != "DB" {
+		t.Fatalf("names = %+v, want [DB]", names)
+	}
+}
+
+func TestSecretDelete(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	body, _ := json.Marshal(map[string]string{"key": "DB", "value": "pg://x"})
+	resp, err := http.Post(ts.URL+"/apps/blog/secrets", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST secrets: %v", err)
+	}
+	resp.Body.Close()
+
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/apps/blog/secrets/DB", nil)
+	delResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE secrets: %v", err)
+	}
+	defer delResp.Body.Close()
+	if delResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", delResp.StatusCode)
+	}
+
+	resp, err = http.Get(ts.URL + "/apps/blog/secrets")
+	if err != nil {
+		t.Fatalf("GET secrets: %v", err)
+	}
+	defer resp.Body.Close()
+	var names []string
+	if err := json.NewDecoder(resp.Body).Decode(&names); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(names) != 0 {
+		t.Fatalf("names = %+v, want empty", names)
+	}
+}
+
+func TestSecretSetMissingKey(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	body, _ := json.Marshal(map[string]string{"key": "", "value": "x"})
+	resp, err := http.Post(ts.URL+"/apps/blog/secrets", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST secrets: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 }

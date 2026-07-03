@@ -158,3 +158,55 @@ func (c *Client) Remove(ctx context.Context, name string) error {
 	}
 	return nil
 }
+
+// SetSecret sets (or overwrites) a secret value for app. The value never
+// appears in any response.
+func (c *Client) SetSecret(ctx context.Context, app, key, value string) error {
+	body, err := json.Marshal(map[string]string{"key": key, "value": value})
+	if err != nil {
+		return err
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.url("/apps/"+app+"/secrets"), bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return decodeErr(resp)
+	}
+	return nil
+}
+
+// ListSecrets returns the secret names set for app (never values).
+func (c *Client) ListSecrets(ctx context.Context, app string) ([]string, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/apps/"+app+"/secrets"), nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, decodeErr(resp)
+	}
+	var names []string
+	if err := json.NewDecoder(resp.Body).Decode(&names); err != nil {
+		return nil, err
+	}
+	return names, nil
+}
+
+// DeleteSecret removes a secret from app.
+func (c *Client) DeleteSecret(ctx context.Context, app, key string) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, c.url("/apps/"+app+"/secrets/"+key), nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return decodeErr(resp)
+	}
+	return nil
+}

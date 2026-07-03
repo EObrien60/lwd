@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,7 +17,32 @@ import (
 // shortTimeout keeps failure-path tests (which must poll to a deadline) fast.
 const shortTimeout = 150 * time.Millisecond
 
+// fakeResolver is a test double for SecretResolver: it either returns a
+// canned error (simulating a fail-closed resolve failure) or looks up each
+// requested name in vals (defaulting to "" for names not present, matching
+// the brief's fake).
+type fakeResolver struct {
+	vals map[string]string
+	err  error
+}
+
+func (f *fakeResolver) Resolve(app string, names []string) (map[string]string, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := map[string]string{}
+	for _, n := range names {
+		out[n] = f.vals[n]
+	}
+	return out, nil
+}
+
 func newTestReconciler(t *testing.T) (*Reconciler, *node.Fake, *router.FakeRouter, *store.Store) {
+	t.Helper()
+	return newTestReconcilerWithResolver(t, &fakeResolver{vals: map[string]string{}})
+}
+
+func newTestReconcilerWithResolver(t *testing.T, sec SecretResolver) (*Reconciler, *node.Fake, *router.FakeRouter, *store.Store) {
 	t.Helper()
 	f := node.NewFake()
 	fr := router.NewFakeRouter()
@@ -25,7 +51,7 @@ func newTestReconciler(t *testing.T) (*Reconciler, *node.Fake, *router.FakeRoute
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	return New(f, fr, s), f, fr, s
+	return New(f, fr, s, sec), f, fr, s
 }
 
 func testApp() *spec.App {
@@ -173,7 +199,7 @@ func TestApplyDockerHealthcheck(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s)
+	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}})
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -199,7 +225,7 @@ func TestApplyDockerHealthcheckUnhealthyFails(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s)
+	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}})
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -361,7 +387,7 @@ func TestApplyDockerHealthStartingThenHealthy(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s)
+	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}})
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -452,6 +478,79 @@ func TestRollbackNoHistory(t *testing.T) {
 	_, err := r.Rollback(context.Background(), "blog")
 	if err == nil {
 		t.Fatal("want error when there is no previous deployment")
+	}
+}
+
+func TestApplyInjectsSecrets(t *testing.T) {
+	r, f, fr, _ := newTestReconcilerWithResolver(t, &fakeResolver{vals: map[string]string{"DB": "secret"}})
+	app := testApp()
+	app.Env = map[string]string{"A": "1"}
+	app.Secrets = []string{"DB"}
+	fr.ProbeStatus = 200
+
+	_, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	env := f.LastRunSpec.Env
+	if env["A"] != "1" {
+		t.Errorf("env[A] = %q, want 1", env["A"])
+	}
+	if env["DB"] != "secret" {
+		t.Errorf("env[DB] = %q, want secret", env["DB"])
+	}
+}
+
+func TestSecretOverridesEnv(t *testing.T) {
+	r, f, fr, _ := newTestReconcilerWithResolver(t, &fakeResolver{vals: map[string]string{"K": "secret"}})
+	app := testApp()
+	app.Env = map[string]string{"K": "plain"}
+	app.Secrets = []string{"K"}
+	fr.ProbeStatus = 200
+
+	_, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if got := f.LastRunSpec.Env["K"]; got != "secret" {
+		t.Errorf("env[K] = %q, want secret (secrets must win over plain env)", got)
+	}
+}
+
+func TestApplyFailsClosedOnResolveError(t *testing.T) {
+	r, f, _, s := newTestReconcilerWithResolver(t, &fakeResolver{err: fmt.Errorf("boom")})
+	app := testApp()
+	app.Secrets = []string{"DB"}
+
+	_, err := r.Apply(context.Background(), app)
+	if err == nil {
+		t.Fatal("want error when secret resolution fails")
+	}
+
+	for _, c := range f.Calls {
+		if strings.HasPrefix(c, "RunContainer:") {
+			t.Errorf("want no RunContainer call when secrets fail closed, calls: %v", f.Calls)
+		}
+	}
+
+	history, err := s.DeploymentsForApp(app.Name)
+	if err != nil {
+		t.Fatalf("DeploymentsForApp: %v", err)
+	}
+	var sawFailed bool
+	for _, d := range history {
+		if d.Status == store.StatusFailed {
+			sawFailed = true
+		}
+	}
+	if !sawFailed {
+		t.Errorf("want a StatusFailed deployment recorded, history: %+v", history)
+	}
+
+	if cur, _ := s.CurrentDeployment("blog"); cur != nil {
+		t.Errorf("want no running deployment, got %+v", cur)
 	}
 }
 

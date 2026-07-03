@@ -16,6 +16,11 @@ type Fake struct {
 	items map[string]Container // keyed by container ID
 	Calls []string
 
+	// LastRunSpec captures the RunSpec passed to the most recent RunContainer
+	// call, so tests can assert on things RunContainer doesn't otherwise
+	// surface via Container (e.g. injected env vars).
+	LastRunSpec RunSpec
+
 	EnsureErr error
 	HealthErr error
 	RunErr    error
@@ -63,6 +68,7 @@ func (f *Fake) RunContainer(ctx context.Context, spec RunSpec) (Container, error
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("RunContainer:" + spec.Name)
+	f.LastRunSpec = spec
 	if f.RunErr != nil {
 		return Container{}, f.RunErr
 	}

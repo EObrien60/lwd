@@ -17,6 +17,7 @@ import (
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
 	"lwd/internal/router"
+	"lwd/internal/secrets"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -28,6 +29,17 @@ const appLabel = "e2e-whoami"
 // domain is a .localhost domain, which router.UseInternalTLS treats as
 // internal — Caddy serves it with a self-signed cert, no ACME involved.
 const domain = "whoami.localhost"
+
+// secretAppLabel and failClosedAppLabel are the lwd.app label values used by
+// TestEndToEndSecretInjection, kept distinct from appLabel so the two tests'
+// cleanup and assertions never collide with each other.
+const secretAppLabel = "e2e-secret-whoami"
+const failClosedAppLabel = "e2e-failclosed-whoami"
+
+// secretDomain and failClosedDomain are the .localhost domains used by
+// TestEndToEndSecretInjection.
+const secretDomain = "secret-whoami.localhost"
+const failClosedDomain = "failclosed-whoami.localhost"
 
 // caddyContainerName mirrors router.caddyContainerName (unexported), needed
 // here only for best-effort cleanup via the docker CLI.
@@ -61,13 +73,18 @@ func TestEndToEndBlueGreenRollback(t *testing.T) {
 	defer s.Close()
 
 	rtr := router.NewCaddyRouter(n, dir)
-	rec := reconciler.New(n, rtr, s)
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	secStore := secrets.NewStore(cipher, s)
+	rec := reconciler.New(n, rtr, s, secStore)
 
 	// Cleanup runs regardless of how the test ends (pass, fail, or panic via
 	// t.Fatal) and is best-effort: each step's error is logged, not fatal, so
 	// a failure partway through doesn't stop the rest of the teardown.
 	t.Cleanup(func() {
-		cleanupLWDResources(t)
+		cleanupLWDResources(t, appLabel)
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -175,6 +192,134 @@ func TestEndToEndBlueGreenRollback(t *testing.T) {
 	assertReachable(t, client, "after rollback")
 }
 
+// TestEndToEndSecretInjection drives the real stack with a real
+// secrets.Store (secrets.NewCipher backed by a temp key file, wrapping the
+// test's own store.Store) wired into the reconciler, and exercises two
+// scenarios end to end against real Docker:
+//
+//  1. Injection: a secret is set via secStore.Set, the app declares it in
+//     Secrets, and after a successful Apply the surface container's actual
+//     environment (inspected via `docker inspect`, not the whoami HTTP
+//     response) contains it.
+//  2. Fail-closed: an app declares a secret that was never set; Apply must
+//     return an error and must not leave any surface container running (in
+//     fact, per the reconciler's contract, none should ever be created,
+//     since secrets are resolved before the container is started).
+//
+// Run with: LWD_DOCKER_TEST=1 go test ./test/ -v
+func TestEndToEndSecretInjection(t *testing.T) {
+	if os.Getenv("LWD_DOCKER_TEST") == "" {
+		t.Skip("set LWD_DOCKER_TEST=1 to run the end-to-end test against real Docker")
+	}
+
+	dir := t.TempDir()
+
+	n, err := node.NewLocal()
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+
+	rtr := router.NewCaddyRouter(n, dir)
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	secStore := secrets.NewStore(cipher, s)
+	rec := reconciler.New(n, rtr, s, secStore)
+
+	t.Cleanup(func() {
+		cleanupLWDResources(t, secretAppLabel, failClosedAppLabel)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := rtr.EnsureUp(ctx); err != nil {
+		if portsInUse(t) {
+			t.Skipf("ports 80/443 appear to be in use and EnsureUp failed: %v", err)
+		}
+		t.Fatalf("EnsureUp: %v", err)
+	}
+
+	// --- Scenario 1: injection ---
+	if err := secStore.Set(secretAppLabel, "LWD_TEST_SECRET", "s3cr3t"); err != nil {
+		t.Fatalf("secStore.Set: %v", err)
+	}
+
+	app := &spec.App{
+		Name:    secretAppLabel,
+		Image:   "traefik/whoami:latest",
+		Domain:  secretDomain,
+		Port:    80,
+		Node:    "local",
+		Secrets: []string{"LWD_TEST_SECRET"},
+	}
+	app.Health.Path = "/"
+	app.Health.Timeout = 30 * time.Second
+
+	applyCtx, applyCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	dep, err := rec.Apply(applyCtx, app)
+	applyCancel()
+	if err != nil {
+		t.Fatalf("Apply (injection): %v", err)
+	}
+	if dep.Status != store.StatusRunning {
+		t.Fatalf("injection deploy status = %q, want running", dep.Status)
+	}
+	if dep.ContainerID == "" {
+		t.Fatal("injection deploy has no ContainerID")
+	}
+
+	envOut, err := exec.Command("docker", "inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}", dep.ContainerID).CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker inspect %s: %v: %s", dep.ContainerID, err, envOut)
+	}
+	if !containsLine(splitLines(string(envOut)), "LWD_TEST_SECRET=s3cr3t") {
+		t.Fatalf("container %s env does not contain LWD_TEST_SECRET=s3cr3t; got:\n%s", dep.ContainerID, envOut)
+	}
+
+	// --- Scenario 2: fail-closed on an unset secret ---
+	failApp := &spec.App{
+		Name:    failClosedAppLabel,
+		Image:   "traefik/whoami:latest",
+		Domain:  failClosedDomain,
+		Port:    80,
+		Node:    "local",
+		Secrets: []string{"UNSET_SECRET"},
+	}
+	failApp.Health.Path = "/"
+	failApp.Health.Timeout = 30 * time.Second
+
+	failCtx, failCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	failDep, err := rec.Apply(failCtx, failApp)
+	failCancel()
+	if err == nil {
+		t.Fatalf("Apply (fail-closed) unexpectedly succeeded: %+v", failDep)
+	}
+
+	failContainers, err := n.ListContainers(context.Background(), map[string]string{"lwd.app": failClosedAppLabel})
+	if err != nil {
+		t.Fatalf("ListContainers (fail-closed): %v", err)
+	}
+	if len(failContainers) != 0 {
+		t.Fatalf("fail-closed deploy left %d container(s) labeled lwd.app=%s: %+v", len(failContainers), failClosedAppLabel, failContainers)
+	}
+}
+
+// containsLine reports whether lines contains an exact match for target.
+func containsLine(lines []string, target string) bool {
+	for _, l := range lines {
+		if l == target {
+			return true
+		}
+	}
+	return false
+}
+
 // zeroDowntimeMonitor repeatedly probes the app's endpoint in the background
 // and records every non-200 result, so a caller can assert zero downtime
 // across some operation (e.g. a blue-green swap) that runs concurrently.
@@ -263,25 +408,28 @@ func portsInUse(t *testing.T) bool {
 	return false
 }
 
-// cleanupLWDResources removes every container labeled lwd.app=<appLabel>,
-// the lwd-caddy container, and the lwd network, then asserts none of the
-// three remain: no stray lwd.app=<appLabel> surface containers, no
-// lwd-caddy container, and no lwd network. It shells out to the docker CLI
-// directly (rather than node.Node, which has no remove-network/remove-caddy
-// helpers) since this is test-only teardown, not product code.
+// cleanupLWDResources removes every container labeled lwd.app=<label> for
+// each of appLabels, the lwd-caddy container, and the lwd network, then
+// asserts none remain: no stray lwd.app=<label> surface containers for any
+// label passed, no lwd-caddy container, and no lwd network. It shells out to
+// the docker CLI directly (rather than node.Node, which has no
+// remove-network/remove-caddy helpers) since this is test-only teardown, not
+// product code.
 //
 // The removal steps are best-effort (errors are logged, not fatal, so a
 // failure partway through doesn't stop the rest of the teardown), but the
-// final verification steps are real assertions: this test is the only one
-// that manages the shared lwd/lwd-caddy resources, so once its own cleanup
-// has run, both must be gone.
-func cleanupLWDResources(t *testing.T) {
+// final verification steps are real assertions: each e2e test that calls
+// this owns the shared lwd/lwd-caddy resources for the duration of its own
+// run, so once its own cleanup has run, both must be gone.
+func cleanupLWDResources(t *testing.T, appLabels ...string) {
 	t.Helper()
 
-	out, err := exec.Command("docker", "ps", "-aq", "--filter", "label=lwd.app="+appLabel).CombinedOutput()
-	if err != nil {
-		t.Logf("cleanup: docker ps (lwd.app=%s) failed: %v: %s", appLabel, err, out)
-	} else {
+	for _, label := range appLabels {
+		out, err := exec.Command("docker", "ps", "-aq", "--filter", "label=lwd.app="+label).CombinedOutput()
+		if err != nil {
+			t.Logf("cleanup: docker ps (lwd.app=%s) failed: %v: %s", label, err, out)
+			continue
+		}
 		for _, id := range splitLines(string(out)) {
 			if rmOut, rmErr := exec.Command("docker", "rm", "-f", id).CombinedOutput(); rmErr != nil {
 				t.Logf("cleanup: docker rm -f %s failed: %v: %s", id, rmErr, rmOut)
@@ -297,12 +445,15 @@ func cleanupLWDResources(t *testing.T) {
 		t.Logf("cleanup: docker network rm %s: %v: %s", lwdNetwork, rmErr, rmOut)
 	}
 
-	// Verify no stray lwd.app=<appLabel> surface containers remain.
-	verifyOut, err := exec.Command("docker", "ps", "-aq", "--filter", "label=lwd.app="+appLabel).CombinedOutput()
-	if err != nil {
-		t.Errorf("cleanup verification: docker ps failed: %v: %s", err, verifyOut)
-	} else if remaining := splitLines(string(verifyOut)); len(remaining) > 0 {
-		t.Errorf("cleanup verification: %d stray container(s) labeled lwd.app=%s remain: %v", len(remaining), appLabel, remaining)
+	// Verify no stray lwd.app=<label> surface containers remain for any
+	// label this test owns.
+	for _, label := range appLabels {
+		verifyOut, err := exec.Command("docker", "ps", "-aq", "--filter", "label=lwd.app="+label).CombinedOutput()
+		if err != nil {
+			t.Errorf("cleanup verification: docker ps failed: %v: %s", err, verifyOut)
+		} else if remaining := splitLines(string(verifyOut)); len(remaining) > 0 {
+			t.Errorf("cleanup verification: %d stray container(s) labeled lwd.app=%s remain: %v", len(remaining), label, remaining)
+		}
 	}
 
 	// Verify the lwd-caddy container is gone. This test is the only one that
