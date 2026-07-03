@@ -5,31 +5,14 @@ import (
 	"fmt"
 	"os"
 
+	"lwd/internal/cli"
 	"lwd/internal/version"
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
-	}
-	switch os.Args[1] {
-	case "version":
+	if len(os.Args) >= 2 && os.Args[1] == "version" {
 		fmt.Println("lwd", version.String)
-	default:
-		usage()
-		os.Exit(2)
+		return
 	}
-}
-
-func usage() {
-	fmt.Fprintln(os.Stderr, `usage: lwd <command> [args]
-
-commands:
-  daemon            run the lwd daemon
-  apply <dir>       deploy the app defined in <dir>/lwd.toml
-  ls                list apps and status
-  logs <app> [-f]   stream an app's logs
-  rm <app>          stop and deregister an app
-  version           print version`)
+	os.Exit(cli.Run(os.Args[1:]))
 }
