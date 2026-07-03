@@ -264,10 +264,17 @@ func portsInUse(t *testing.T) bool {
 }
 
 // cleanupLWDResources removes every container labeled lwd.app=<appLabel>,
-// the lwd-caddy container, and the lwd network, then asserts no stray
-// lwd.app=<appLabel> surface containers remain. It shells out to the docker
-// CLI directly (rather than node.Node, which has no remove-network/
-// remove-caddy helpers) since this is test-only teardown, not product code.
+// the lwd-caddy container, and the lwd network, then asserts none of the
+// three remain: no stray lwd.app=<appLabel> surface containers, no
+// lwd-caddy container, and no lwd network. It shells out to the docker CLI
+// directly (rather than node.Node, which has no remove-network/remove-caddy
+// helpers) since this is test-only teardown, not product code.
+//
+// The removal steps are best-effort (errors are logged, not fatal, so a
+// failure partway through doesn't stop the rest of the teardown), but the
+// final verification steps are real assertions: this test is the only one
+// that manages the shared lwd/lwd-caddy resources, so once its own cleanup
+// has run, both must be gone.
 func cleanupLWDResources(t *testing.T) {
 	t.Helper()
 
@@ -294,10 +301,27 @@ func cleanupLWDResources(t *testing.T) {
 	verifyOut, err := exec.Command("docker", "ps", "-aq", "--filter", "label=lwd.app="+appLabel).CombinedOutput()
 	if err != nil {
 		t.Errorf("cleanup verification: docker ps failed: %v: %s", err, verifyOut)
-		return
-	}
-	if remaining := splitLines(string(verifyOut)); len(remaining) > 0 {
+	} else if remaining := splitLines(string(verifyOut)); len(remaining) > 0 {
 		t.Errorf("cleanup verification: %d stray container(s) labeled lwd.app=%s remain: %v", len(remaining), appLabel, remaining)
+	}
+
+	// Verify the lwd-caddy container is gone. This test is the only one that
+	// manages lwd-caddy, so it must not survive its own teardown.
+	caddyOut, err := exec.Command("docker", "ps", "-a", "--filter", "name=^/"+caddyContainerName+"$", "--format", "{{.Names}}").CombinedOutput()
+	if err != nil {
+		t.Errorf("cleanup verification: docker ps (name=%s) failed: %v: %s", caddyContainerName, err, caddyOut)
+	} else if remaining := splitLines(string(caddyOut)); len(remaining) > 0 {
+		t.Errorf("cleanup verification: %s container still present after cleanup: %v", caddyContainerName, remaining)
+	}
+
+	// Verify the lwd network is gone. Scoped to run only after this test's
+	// own cleanup, since this is the only e2e test that creates/manages the
+	// lwd network — no other test relies on it surviving.
+	netOut, err := exec.Command("docker", "network", "ls", "--filter", "name=^"+lwdNetwork+"$", "--format", "{{.Name}}").CombinedOutput()
+	if err != nil {
+		t.Errorf("cleanup verification: docker network ls (name=%s) failed: %v: %s", lwdNetwork, err, netOut)
+	} else if remaining := splitLines(string(netOut)); len(remaining) > 0 {
+		t.Errorf("cleanup verification: %s network still present after cleanup: %v", lwdNetwork, remaining)
 	}
 }
 

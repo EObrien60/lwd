@@ -115,6 +115,10 @@ path used for every other deploy.
   internal CA instead and work fully offline.
 - Building lwd requires **Go 1.25+** (a transitive dependency of the Docker
   SDK raises the floor above the 1.22 language baseline).
+- Every domain is served over both HTTP and HTTPS with no automatic
+  HTTP→HTTPS redirect. Public domains still get Let's Encrypt certificates,
+  but plaintext HTTP is not upgraded — forced-HTTPS for public domains is a
+  later enhancement.
 
 ## Testing
 

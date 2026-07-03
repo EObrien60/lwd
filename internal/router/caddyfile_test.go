@@ -25,6 +25,18 @@ func TestGenerateCaddyfileSortedWithTLS(t *testing.T) {
 	if !strings.Contains(out, "tls internal") {
 		t.Error("a.localhost should use internal TLS")
 	}
+	// Every route must claim BOTH the plain-http and https addresses for its
+	// domain (not a bare-domain block), so Caddy's automatic HTTP->HTTPS
+	// redirect never kicks in — see the comment in GenerateCaddyfile. A
+	// regression to a bare "b.example.com {" block would silently reintroduce
+	// the redirect and break plain-HTTP health probes; this substring check
+	// catches that here, without needing the Docker-gated e2e test.
+	if !strings.Contains(out, "http://b.example.com, https://b.example.com {") {
+		t.Error("b.example.com route must bind both http:// and https:// addresses")
+	}
+	if !strings.Contains(out, "http://a.localhost, https://a.localhost {") {
+		t.Error("a.localhost route must bind both http:// and https:// addresses")
+	}
 }
 
 func TestGenerateCaddyfileEmpty(t *testing.T) {
