@@ -106,25 +106,36 @@ Key properties (upgraded from Phase 1's recreate):
   the domain never points anywhere but a healthy container.
 - **Idempotent.** Re-applying an unchanged spec (same digest + config) is a no-op.
 
-## Health check — probe through Caddy
+## Health check — layered fallback, probed through Caddy
 
 With host ports gone, the daemon (on the host) generally cannot reach a surface
-container directly (notably on Docker Desktop). lwd health-checks the new container
-**through the Caddy container**, which is already on the network:
+container directly (notably on Docker Desktop). All HTTP probing therefore goes
+**through the Caddy container** (host → `127.0.0.1:80` → container over the network),
+which is portable and needs no `curl`/`wget` inside the app image. The mechanism:
+lwd adds a temporary **staging route** (`stage-<deployid>.lwd.internal →
+<new-container>:<port>`), reloads Caddy, probes via `GET http://127.0.0.1:80<path>`
+with `Host: stage-<deployid>.lwd.internal`, then either flips the real domain (on
+pass) or drops the staging route and removes the container (on fail).
 
-1. lwd adds a temporary **staging route** to Caddy:
-   `stage-<deployid>.lwd.internal → <new-container>:<port>`, reload.
-2. lwd issues `GET http://127.0.0.1:80<health.path>` with
-   `Host: stage-<deployid>.lwd.internal`, expecting HTTP 2xx (or a TCP-style 200 on
-   `/` if no path). The `127.0.0.1:80` hop is always reachable from the host; the
-   Caddy→container hop rides the network.
-3. On success, flip the real domain and drop the staging route. On failure, drop
-   the staging route and remove the container.
+Because custom software often declares no health information at all, lwd resolves
+health in a **layered fallback**, so *something* sensible always gates the cutover:
 
-This is portable (works on Linux and Docker Desktop) and image-agnostic (the app
-image needs no `curl`/`wget`, unlike a Docker-native `HEALTHCHECK`). Cost: health is
-coupled to the router being up — acceptable, since routing is the whole point of
-this phase and `EnsureCaddy` runs first.
+1. **`[health] path` declared → strict readiness.** GET the path through Caddy;
+   require HTTP **2xx**. (Encouraged in docs — this is the only true readiness gate.)
+2. **No path, but the image defines a Docker `HEALTHCHECK` → honor it.** Poll the
+   container's Docker health status (`State.Health.Status`) until `healthy` or
+   timeout. Respects image authors who declared one; entirely optional.
+3. **Neither → liveness fallback.** The container must stay `running` through a short
+   settle window (i.e. not crash-loop) **and** answer a request through Caddy — any
+   response that is *not* a Caddy-generated 502/503 (bad gateway) proves the app is
+   listening and accepting connections.
+
+Only layer 2 touches Docker health metadata, and its absence simply falls through to
+layer 3 — lwd never *requires* a Docker `HEALTHCHECK`. Health is coupled to Caddy
+being up, which is acceptable since routing is the point of this phase and
+`EnsureCaddy` runs first. A new `node` method exposes container run-state + Docker
+health status (`ContainerHealth(ctx, id) (state string, dockerHealth string, err error)`)
+to drive layers 2 and 3.
 
 ## Rollback
 
@@ -182,16 +193,15 @@ Secrets injection (Phase 3), compose apps + surfaces/pinned backing services
 router ops are added to the `Node`/router seams so a remote node can implement them
 later.
 
-## Open decisions (assumed defaults — confirm or change)
+## Decisions (resolved with the user)
 
-These four were batched to the user, who stepped away; the spec assumes the
-recommended default for each and is easy to revise:
-
-1. **Caddy lifecycle:** managed container *(assumed)* vs. external/user-managed vs.
-   embedded-in-binary.
-2. **Health-check mechanism:** probe-through-Caddy *(assumed)* vs. Docker-native
-   HEALTHCHECK vs. host-side network probe. This most affects the reconciler/router
-   tasks.
-3. **Rollback scope:** in Phase 2 *(assumed)* vs. split to Phase 3.
-4. **Local TLS:** auto (ACME in prod, internal certs locally) *(assumed)* vs. always
-   attempt real HTTPS.
+1. **Caddy lifecycle:** **managed container.** Chosen deliberately as the more
+   suckless option — lwd composes Caddy rather than embedding a web server (which
+   would bloat the binary and pull ACME/HTTP/TLS code into lwd's surface). Cost is
+   one image + one process, the irreducible price of automatic HTTPS routing.
+2. **Health-check mechanism:** **layered fallback, probed through Caddy** —
+   `[health] path` (2xx) → honor Docker `HEALTHCHECK` if present → liveness+listening
+   fallback. Does not depend on a Docker `HEALTHCHECK` existing.
+3. **Rollback scope:** **in Phase 2.**
+4. **Local TLS:** **auto** — Let's Encrypt for public/resolvable domains, Caddy
+   `internal` (self-signed) certs for local/`.localhost`/non-resolvable domains.
