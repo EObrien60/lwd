@@ -22,6 +22,10 @@ type FakeRouter struct {
 
 	// EnsureErr, if set, is returned by EnsureUp.
 	EnsureErr error
+
+	// SetRouteErr, if set, is returned by SetRoute instead of installing the
+	// route into Routes.
+	SetRouteErr error
 }
 
 // NewFakeRouter returns a ready-to-use FakeRouter.
@@ -47,11 +51,15 @@ func (f *FakeRouter) EnsureUp(ctx context.Context) error {
 	return f.EnsureErr
 }
 
-// SetRoute installs r into Routes.
+// SetRoute installs r into Routes, unless SetRouteErr is set, in which case
+// it returns that error without touching Routes.
 func (f *FakeRouter) SetRoute(ctx context.Context, r Route) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("SetRoute:" + r.Domain)
+	if f.SetRouteErr != nil {
+		return f.SetRouteErr
+	}
 	f.Routes[r.Domain] = r
 	return nil
 }

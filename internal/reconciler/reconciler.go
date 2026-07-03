@@ -141,22 +141,12 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 	}
 
 	if healthErr := r.checkHealth(ctx, app, stageHost, c.ID); healthErr != nil {
-		_ = r.router.RemoveStaging(ctx, stageHost)
-		_ = r.node.RemoveContainer(ctx, c.ID)
-
 		// The prior running deployment (if any) is left completely untouched:
 		// its container keeps running and the live domain/route still points
 		// at it. Blue-green means a failed candidate never affects what's
 		// currently serving traffic, so we must not retire or otherwise mutate
 		// that row here.
-		_, _ = r.store.RecordDeployment(store.Deployment{
-			App:         app.Name,
-			Image:       app.Image,
-			ContainerID: c.ID,
-			Status:      store.StatusFailed,
-			CreatedAt:   time.Now(),
-			Spec:        string(specJSON),
-		})
+		r.recordFailedCandidate(ctx, app, stageHost, c.ID, specJSON)
 		return nil, fmt.Errorf("health check failed: %w", healthErr)
 	}
 
@@ -167,10 +157,12 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 		TLSInternal: router.UseInternalTLS(app.Domain),
 	}); err != nil {
 		// The flip itself failed: undo the staging state and the new
-		// container. The live domain (still pointing at the old container,
-		// or unset if this is the first deploy) is unaffected.
-		_ = r.router.RemoveStaging(ctx, stageHost)
-		_ = r.node.RemoveContainer(ctx, c.ID)
+		// container, and record the attempt as failed (same isolation
+		// guarantee as the health-failure branch above — the live domain,
+		// still pointing at the old container or unset if this is the first
+		// deploy, is unaffected, and the prior running deployment row is left
+		// untouched).
+		r.recordFailedCandidate(ctx, app, stageHost, c.ID, specJSON)
 		return nil, fmt.Errorf("set route: %w", err)
 	}
 	_ = r.router.RemoveStaging(ctx, stageHost)
@@ -195,6 +187,28 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 	}
 	dep.ID = id
 	return &dep, nil
+}
+
+// recordFailedCandidate tears down a failed candidate deployment: it removes
+// the staging route (a no-op if already removed) and the new container, then
+// records a StatusFailed deployment carrying the attempt's Spec snapshot.
+// Errors from cleanup and from recording are intentionally swallowed here —
+// the caller always returns its own wrapped error for the actual failure
+// cause. The prior running deployment/route is never touched by this helper,
+// preserving blue-green's isolation guarantee: a failed candidate, however it
+// failed, never affects what's currently serving traffic.
+func (r *Reconciler) recordFailedCandidate(ctx context.Context, app *spec.App, stageHost, containerID string, specJSON []byte) {
+	_ = r.router.RemoveStaging(ctx, stageHost)
+	_ = r.node.RemoveContainer(ctx, containerID)
+
+	_, _ = r.store.RecordDeployment(store.Deployment{
+		App:         app.Name,
+		Image:       app.Image,
+		ContainerID: containerID,
+		Status:      store.StatusFailed,
+		CreatedAt:   time.Now(),
+		Spec:        string(specJSON),
+	})
 }
 
 // checkHealth gates the blue-green cutover using lwd's layered health policy,

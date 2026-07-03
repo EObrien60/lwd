@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -43,7 +44,7 @@ func TestApplyStagesProbesFlips(t *testing.T) {
 		t.Fatalf("Apply: %v", err)
 	}
 
-	if !containsInOrder(f.Calls, "RunContainer:lwd-blog-1", "RunContainer:lwd-blog-1") {
+	if !contains(f.Calls, "RunContainer:lwd-blog-1") {
 		t.Fatalf("sanity: RunContainer not called, calls: %v", f.Calls)
 	}
 	if !containsInOrder(fr.Calls, "SetStaging:stage-1.lwd.internal", "ProbeThroughCaddy:stage-1.lwd.internal") {
@@ -294,6 +295,89 @@ func TestApplyRedeployHealthFailKeepsOldServing(t *testing.T) {
 	}
 }
 
+func TestApplySetRouteFailureRecordsFailedAndKeepsOld(t *testing.T) {
+	r, f, fr, s := newTestReconciler(t)
+	ctx := context.Background()
+	app := testApp()
+	app.Health.Path = "/healthz"
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	v1, err := r.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("v1 Apply: %v", err)
+	}
+
+	fr.SetRouteErr = fmt.Errorf("boom")
+	v2, err := r.Apply(ctx, app)
+	if err == nil {
+		t.Fatal("want error when SetRoute fails")
+	}
+	if v2 != nil {
+		t.Errorf("want nil deployment on failure, got %+v", v2)
+	}
+
+	// The prior running deployment must still be current: SetRoute failing
+	// after a passing health check must not touch the old, live deployment.
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || cur.ID != v1.ID || cur.ContainerID != v1.ContainerID || cur.Status != store.StatusRunning {
+		t.Fatalf("want v1 still the current running deployment, got %+v (v1=%+v)", cur, v1)
+	}
+
+	// The v2 container must have been removed.
+	if !contains(f.Calls, "RemoveContainer:fake-2") {
+		t.Errorf("expected the new (v2) container to be removed, calls: %v", f.Calls)
+	}
+	if contains(f.Calls, "RemoveContainer:"+v1.ContainerID) {
+		t.Errorf("v1 container must not be removed on v2 SetRoute failure, calls: %v", f.Calls)
+	}
+
+	// A StatusFailed row must have been recorded for the v2 attempt — unlike
+	// every other failure path, this one used to vanish from history.
+	history, err := s.DeploymentsForApp(app.Name)
+	if err != nil {
+		t.Fatalf("DeploymentsForApp: %v", err)
+	}
+	var sawFailed bool
+	for _, d := range history {
+		if d.Status == store.StatusFailed && d.ContainerID == "fake-2" {
+			sawFailed = true
+		}
+	}
+	if !sawFailed {
+		t.Errorf("want a StatusFailed deployment recorded for the failed SetRoute attempt, history: %+v", history)
+	}
+}
+
+func TestApplyDockerHealthStartingThenHealthy(t *testing.T) {
+	f := node.NewFake()
+	f.DockerHealthSeq = []string{"starting", "starting", "healthy"}
+	fr := router.NewFakeRouter()
+	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	r := New(f, fr, s)
+
+	app := testApp()
+	app.Health.Timeout = shortTimeout
+
+	dep, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if dep.Status != store.StatusRunning {
+		t.Errorf("status = %q, want running", dep.Status)
+	}
+	if _, ok := fr.Routes["blog.example.com"]; !ok {
+		t.Errorf("want route set once docker health flips to healthy")
+	}
+}
+
 func TestApplyRejectsInvalidSpec(t *testing.T) {
 	r, f, fr, _ := newTestReconciler(t)
 	_, err := r.Apply(context.Background(), &spec.App{Name: "x"}) // missing image/port
@@ -327,5 +411,5 @@ func containsInOrder(xs []string, a, b string) bool {
 			bi = i
 		}
 	}
-	return ai != -1 && bi != -1 && ai <= bi
+	return ai != -1 && bi != -1 && ai < bi
 }

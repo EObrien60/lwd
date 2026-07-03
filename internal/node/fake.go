@@ -25,6 +25,13 @@ type Fake struct {
 	// unless overridden.
 	HealthState  string
 	DockerHealth string
+
+	// DockerHealthSeq, if non-empty, overrides DockerHealth: each call to
+	// ContainerHealth consumes the next entry, holding on the last entry once
+	// exhausted. Lets tests simulate a Docker HEALTHCHECK that starts out
+	// "starting" and later flips to "healthy" (or "unhealthy").
+	DockerHealthSeq  []string
+	dockerHealthCall int
 }
 
 // NewFake returns a ready-to-use Fake node.
@@ -135,7 +142,17 @@ func (f *Fake) ContainerHealth(ctx context.Context, id string) (string, string, 
 			state = "running"
 		}
 	}
-	return state, f.DockerHealth, nil
+
+	dockerHealth := f.DockerHealth
+	if len(f.DockerHealthSeq) > 0 {
+		idx := f.dockerHealthCall
+		if idx >= len(f.DockerHealthSeq) {
+			idx = len(f.DockerHealthSeq) - 1
+		}
+		dockerHealth = f.DockerHealthSeq[idx]
+		f.dockerHealthCall++
+	}
+	return state, dockerHealth, nil
 }
 
 func matches(have, want map[string]string) bool {
