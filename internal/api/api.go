@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
@@ -40,6 +41,7 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /apply", srv.handleApply)
 	mux.HandleFunc("GET /apps", srv.handleApps)
 	mux.HandleFunc("GET /apps/{name}/logs", srv.handleLogs)
+	mux.HandleFunc("POST /apps/{name}/rollback", srv.handleRollback)
 	mux.HandleFunc("DELETE /apps/{name}", srv.handleDelete)
 	return mux
 }
@@ -68,6 +70,20 @@ func (srv *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 	dep, err := srv.rec.Apply(r.Context(), &app)
 	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, dep)
+}
+
+func (srv *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	dep, err := srv.rec.Rollback(r.Context(), name)
+	if err != nil {
+		if strings.Contains(err.Error(), "no previous deployment") {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}

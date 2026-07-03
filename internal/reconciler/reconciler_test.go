@@ -392,6 +392,69 @@ func TestApplyRejectsInvalidSpec(t *testing.T) {
 	}
 }
 
+func TestRollbackRedeploysPrevious(t *testing.T) {
+	r, _, fr, s := newTestReconciler(t)
+	ctx := context.Background()
+	app := testApp()
+	app.Image = "img:a"
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	v1, err := r.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("v1 Apply: %v", err)
+	}
+
+	app2 := testApp()
+	app2.Image = "img:b"
+	app2.Health.Timeout = shortTimeout
+	v2, err := r.Apply(ctx, app2)
+	if err != nil {
+		t.Fatalf("v2 Apply: %v", err)
+	}
+	if v2.Image != "img:b" {
+		t.Fatalf("sanity: v2.Image = %q, want img:b", v2.Image)
+	}
+
+	back, err := r.Rollback(ctx, "blog")
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if back.Image != "img:a" {
+		t.Errorf("Rollback image = %q, want img:a", back.Image)
+	}
+	if back.Status != store.StatusRunning {
+		t.Errorf("Rollback status = %q, want running", back.Status)
+	}
+	if back.ContainerID == v1.ContainerID || back.ContainerID == v2.ContainerID {
+		t.Errorf("Rollback should start a fresh container, got %q (v1=%q v2=%q)", back.ContainerID, v1.ContainerID, v2.ContainerID)
+	}
+
+	route, ok := fr.Routes["blog.example.com"]
+	if !ok {
+		t.Fatalf("Routes[blog.example.com] not set after rollback")
+	}
+	if route.Upstream != back.ContainerID && route.Upstream != containerName(app, 3) {
+		t.Errorf("route.Upstream = %q, want it to point at the rolled-back container", route.Upstream)
+	}
+
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || cur.ID != back.ID || cur.Image != "img:a" {
+		t.Fatalf("want current deployment to be the rollback, got %+v", cur)
+	}
+}
+
+func TestRollbackNoHistory(t *testing.T) {
+	r, _, _, _ := newTestReconciler(t)
+	_, err := r.Rollback(context.Background(), "blog")
+	if err == nil {
+		t.Fatal("want error when there is no previous deployment")
+	}
+}
+
 func contains(xs []string, want string) bool {
 	for _, x := range xs {
 		if x == want {

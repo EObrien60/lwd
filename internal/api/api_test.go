@@ -84,6 +84,49 @@ func TestAppsEndpoint(t *testing.T) {
 	}
 }
 
+func TestRollbackEndpoint(t *testing.T) {
+	ts, _ := newTestServer(t)
+	body1, _ := json.Marshal(spec.App{Name: "blog", Image: "img:a", Port: 8080, Node: "local"})
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body1))
+	if err != nil {
+		t.Fatalf("POST /apply v1: %v", err)
+	}
+	resp.Body.Close()
+
+	body2, _ := json.Marshal(spec.App{Name: "blog", Image: "img:b", Port: 8080, Node: "local"})
+	resp, err = http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body2))
+	if err != nil {
+		t.Fatalf("POST /apply v2: %v", err)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Post(ts.URL+"/apps/blog/rollback", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST rollback: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, b)
+	}
+	var dep store.Deployment
+	if err := json.NewDecoder(resp.Body).Decode(&dep); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if dep.Image != "img:a" {
+		t.Errorf("rollback image = %q, want img:a", dep.Image)
+	}
+
+	resp2, err := http.Post(ts.URL+"/apps/unknown/rollback", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST rollback unknown: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != 404 {
+		t.Fatalf("status = %d, want 404", resp2.StatusCode)
+	}
+}
+
 func TestDeleteEndpoint(t *testing.T) {
 	ts, f := newTestServer(t)
 	body, _ := json.Marshal(spec.App{Name: "blog", Image: "img:1", Port: 8080, Node: "local"})

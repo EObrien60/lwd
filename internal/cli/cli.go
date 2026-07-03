@@ -36,6 +36,8 @@ func Run(args []string) int {
 		return runLogs(args[1:])
 	case "rm":
 		return runRm(args[1:])
+	case "rollback":
+		return runRollback(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
 		return 2
@@ -132,6 +134,20 @@ func runLogs(args []string) int {
 		fmt.Fprintln(os.Stderr, "logs:", err)
 		return 1
 	}
+	return 0
+}
+
+func runRollback(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: lwd rollback <app>")
+		return 2
+	}
+	dep, err := newClient().Rollback(context.Background(), args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "rollback:", err)
+		return 1
+	}
+	fmt.Printf("rolled back %s to %s (container %s)\n", dep.App, dep.Image, dep.ContainerID)
 	return 0
 }
 

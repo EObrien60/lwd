@@ -189,6 +189,41 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 	return &dep, nil
 }
 
+// Rollback redeploys the most recent retired ("previous") deployment for app,
+// restoring its exact image via a fresh blue-green Apply — so a rollback is
+// itself zero-downtime and health-gated like any other deploy. It reads the
+// previous deployment's stored Spec snapshot (captured at the time that
+// deployment was originally applied) rather than re-resolving lwd.toml, so it
+// restores precisely what was running before, even if the local spec file has
+// since changed.
+//
+// Rollback does not hold r.mu itself: it only reads from the store and
+// unmarshals JSON before delegating to Apply, which takes the lock. Locking
+// here too would deadlock against Apply's own Lock/Unlock.
+func (r *Reconciler) Rollback(ctx context.Context, app string) (*store.Deployment, error) {
+	prev, err := r.store.PreviousDeployment(app)
+	if err != nil {
+		return nil, fmt.Errorf("load previous deployment: %w", err)
+	}
+	if prev == nil {
+		return nil, fmt.Errorf("no previous deployment for %q", app)
+	}
+
+	var restored spec.App
+	if prev.Spec == "" {
+		return nil, fmt.Errorf("no spec snapshot recorded for previous deployment of %q", app)
+	}
+	if err := json.Unmarshal([]byte(prev.Spec), &restored); err != nil {
+		return nil, fmt.Errorf("unmarshal spec snapshot for %q: %w", app, err)
+	}
+	// Pin the image to exactly what that deployment recorded, guaranteeing
+	// the same digest/ref is restored even if the snapshot's Image field
+	// somehow diverged from it.
+	restored.Image = prev.Image
+
+	return r.Apply(ctx, &restored)
+}
+
 // recordFailedCandidate tears down a failed candidate deployment: it removes
 // the staging route (a no-op if already removed) and the new container, then
 // records a StatusFailed deployment carrying the attempt's Spec snapshot.

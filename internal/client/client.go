@@ -71,6 +71,25 @@ func (c *Client) Apply(ctx context.Context, app *spec.App) (*store.Deployment, e
 	return &dep, nil
 }
 
+// Rollback redeploys the previous deployment for name and returns the
+// resulting deployment.
+func (c *Client) Rollback(ctx context.Context, name string) (*store.Deployment, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.url("/apps/"+name+"/rollback"), nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, decodeErr(resp)
+	}
+	var dep store.Deployment
+	if err := json.NewDecoder(resp.Body).Decode(&dep); err != nil {
+		return nil, err
+	}
+	return &dep, nil
+}
+
 // Apps lists apps and their statuses.
 func (c *Client) Apps(ctx context.Context) ([]api.AppStatus, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/apps"), nil)
