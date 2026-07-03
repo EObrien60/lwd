@@ -240,6 +240,60 @@ func TestApplyBlueGreenRetiresOld(t *testing.T) {
 	}
 }
 
+func TestApplyRedeployHealthFailKeepsOldServing(t *testing.T) {
+	r, f, fr, s := newTestReconciler(t)
+	ctx := context.Background()
+	app := testApp()
+	app.Health.Path = "/healthz"
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	v1, err := r.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("v1 Apply: %v", err)
+	}
+
+	routeBefore, ok := fr.Routes["blog.example.com"]
+	if !ok {
+		t.Fatalf("Routes[blog.example.com] not set after v1, routes: %+v", fr.Routes)
+	}
+
+	fr.ProbeStatus = 502
+	v2, err := r.Apply(ctx, app)
+	if err == nil {
+		t.Fatal("want error when v2 health probe never succeeds")
+	}
+	if v2 != nil {
+		t.Errorf("want nil deployment on failure, got %+v", v2)
+	}
+
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || cur.ID != v1.ID || cur.ContainerID != v1.ContainerID || cur.Status != store.StatusRunning {
+		t.Fatalf("want v1 still the current running deployment, got %+v (v1=%+v)", cur, v1)
+	}
+
+	if contains(f.Calls, "RemoveContainer:"+v1.ContainerID) {
+		t.Errorf("v1 container must not be removed on v2 health failure, calls: %v", f.Calls)
+	}
+	if !contains(f.Calls, "RemoveContainer:fake-2") {
+		t.Errorf("expected the new (v2) container to be removed, calls: %v", f.Calls)
+	}
+
+	routeAfter, ok := fr.Routes["blog.example.com"]
+	if !ok {
+		t.Fatalf("Routes[blog.example.com] must remain set after failed redeploy, routes: %+v", fr.Routes)
+	}
+	if routeAfter.Upstream != routeBefore.Upstream {
+		t.Errorf("route.Upstream changed on failed redeploy: before=%q after=%q", routeBefore.Upstream, routeAfter.Upstream)
+	}
+	if routeAfter.Upstream != "lwd-blog-1" {
+		t.Errorf("route.Upstream = %q, want still pointing at v1's container name", routeAfter.Upstream)
+	}
+}
+
 func TestApplyRejectsInvalidSpec(t *testing.T) {
 	r, f, fr, _ := newTestReconciler(t)
 	_, err := r.Apply(context.Background(), &spec.App{Name: "x"}) // missing image/port

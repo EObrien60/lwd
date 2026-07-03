@@ -144,14 +144,11 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 		_ = r.router.RemoveStaging(ctx, stageHost)
 		_ = r.node.RemoveContainer(ctx, c.ID)
 
-		// Retire any prior running deployment row so the store never claims a
-		// version is "running" once a newer attempt has been recorded against
-		// this app, even though (per the design) the live domain/route itself
-		// is left completely untouched and the old container keeps serving.
-		if prev, perr := r.store.CurrentDeployment(app.Name); perr == nil && prev != nil {
-			_ = r.store.SetStatus(prev.ID, store.StatusRetired)
-		}
-
+		// The prior running deployment (if any) is left completely untouched:
+		// its container keeps running and the live domain/route still points
+		// at it. Blue-green means a failed candidate never affects what's
+		// currently serving traffic, so we must not retire or otherwise mutate
+		// that row here.
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:         app.Name,
 			Image:       app.Image,
