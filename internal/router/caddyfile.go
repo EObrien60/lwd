@@ -26,7 +26,17 @@ func GenerateCaddyfile(adminAddr string, routes []Route) string {
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Domain < sorted[j].Domain })
 
 	for _, r := range sorted {
-		fmt.Fprintf(&b, "%s {\n", r.Domain)
+		// Every route is bound to BOTH the plain-http and https addresses for
+		// its domain. Caddy's automatic HTTPS only auto-generates an
+		// HTTP->HTTPS redirect for a domain when nothing else is explicitly
+		// bound to it on port 80; listing "http://domain" ourselves claims
+		// that slot so the reverse_proxy handler serves plain HTTP directly
+		// (no redirect) on :80, in addition to TLS on :443 — required so
+		// lwd's health probes and the CLI/API's "through Caddy" checks, which
+		// all talk plain HTTP to 127.0.0.1:80 with a Host header, see the
+		// app's real response instead of a 3xx redirect to a host that has
+		// no DNS entry.
+		fmt.Fprintf(&b, "http://%s, https://%s {\n", r.Domain, r.Domain)
 		if r.TLSInternal {
 			b.WriteString("\ttls internal\n")
 		}

@@ -20,9 +20,16 @@ const networkName = "lwd"
 // caddyContainerName is the name of the system Caddy container lwd manages.
 const caddyContainerName = "lwd-caddy"
 
-// adminAddr is the address Caddy's admin API listens on, bound to loopback
-// only (see node.RunContainer's host-port binding rules for non-80/443 ports).
-const adminAddr = "127.0.0.1:2019"
+// adminAddr is the address Caddy's admin API listens on INSIDE the container.
+// It must bind all interfaces (not 127.0.0.1): Docker's port publishing
+// delivers host-published traffic to the container's external-facing
+// address, not to a loopback-bound socket in the container's network
+// namespace, so a loopback bind here would make the admin API unreachable
+// even from the host despite the port being published. Loopback-only access
+// from the host is instead enforced one layer up, by node.RunContainer's
+// host-port binding rules for non-80/443 ports (see defaultCaddyAdminBaseURL
+// below, which the host process itself connects through).
+const adminAddr = "0.0.0.0:2019"
 
 // defaultCaddyAdminBaseURL is the default base URL for Caddy's admin API.
 const defaultCaddyAdminBaseURL = "http://127.0.0.1:2019"
@@ -109,10 +116,28 @@ func (c *CaddyRouter) EnsureUp(ctx context.Context) error {
 		if err := c.node.EnsureImage(ctx, "caddy:2"); err != nil {
 			return fmt.Errorf("router: ensure caddy image: %w", err)
 		}
+		// The stock caddy:2 image boots with its own baked-in default
+		// Caddyfile, whose admin API binds to "localhost:2019" — reachable
+		// only from inside the container's own network namespace. Docker's
+		// port publishing delivers host traffic to the container's
+		// external-facing address, not to that loopback socket, so with the
+		// image's default config the admin API would be unreachable from the
+		// host even though its port is published — a chicken-and-egg problem,
+		// since reaching the admin API is normally how we'd fix its bind
+		// address. To break that, the container is started with a command
+		// that first writes a minimal bootstrap Caddyfile (admin already
+		// bound to adminAddr, i.e. all interfaces) to disk, then execs caddy
+		// against it — so the admin API is reachable via the published port
+		// from the very first instant the container runs, before Reload ever
+		// POSTs the real route config to it.
+		bootstrap := GenerateCaddyfile(adminAddr, nil)
 		_, err := c.node.RunContainer(ctx, node.RunSpec{
 			Name:    caddyContainerName,
 			Image:   "caddy:2",
 			Network: networkName,
+			Env:     map[string]string{"LWD_BOOTSTRAP_CADDYFILE": bootstrap},
+			Cmd: []string{"sh", "-c",
+				`printf '%s' "$LWD_BOOTSTRAP_CADDYFILE" > /etc/caddy/Caddyfile && exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile`},
 			Publish: []node.PortMapping{
 				{HostPort: 80, ContainerPort: 80},
 				{HostPort: 443, ContainerPort: 443},

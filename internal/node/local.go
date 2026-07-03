@@ -88,6 +88,9 @@ func (l *Local) RunContainer(ctx context.Context, spec RunSpec) (Container, erro
 		Env:    env,
 		Labels: spec.Labels,
 	}
+	if len(spec.Cmd) > 0 {
+		cfg.Cmd = spec.Cmd
+	}
 	hostCfg := &container.HostConfig{}
 	cfg.ExposedPorts = nat.PortSet{}
 	if spec.Port != 0 {

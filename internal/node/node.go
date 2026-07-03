@@ -25,6 +25,11 @@ type RunSpec struct {
 	Port    int           // app's primary container port; exposed on the network but NOT auto-published to the host
 	Network string        // network to attach to; "" = default (no explicit network)
 	Publish []PortMapping // host<->container ports to publish; nil = publish nothing
+	// Cmd overrides the image's default command when non-empty. Used by the
+	// router to make the Caddy container write a bootstrap config to disk
+	// before exec'ing caddy, so the admin API binds correctly from the first
+	// instant the container runs (see router.EnsureUp).
+	Cmd []string
 }
 
 // Container describes a container known to a node.
