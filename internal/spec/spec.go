@@ -33,9 +33,9 @@ type App struct {
 
 // Health describes how the reconciler decides a container is up.
 type Health struct {
-	Path    string        `toml:"path"`
-	Timeout time.Duration `toml:"-"`
-	RawTimeout string     `toml:"timeout"`
+	Path       string        `toml:"path"`
+	Timeout    time.Duration `toml:"-"`
+	RawTimeout string        `toml:"timeout"`
 }
 
 // Build describes build-from-source (not yet supported in this plan).
