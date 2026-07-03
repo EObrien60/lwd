@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 
 	"lwd/internal/api"
 	"lwd/internal/client"
@@ -42,6 +44,8 @@ func Run(args []string) int {
 		return runRollback(args[1:])
 	case "history":
 		return runHistory(args[1:])
+	case "secret":
+		return runSecret(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
 		return 2
@@ -94,7 +98,7 @@ func runDaemon() int {
 	}
 	secStore := secrets.NewStore(cipher, s)
 
-	srv := api.New(reconciler.New(n, r, s, secStore), s, n, r)
+	srv := api.New(reconciler.New(n, r, s, secStore), s, n, r, secStore)
 
 	sock := config.SocketPath()
 	_ = os.Remove(sock) // clean stale socket
@@ -271,5 +275,73 @@ func runRm(args []string) int {
 		return 1
 	}
 	fmt.Println("removed", args[0])
+	return 0
+}
+
+func runSecret(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: lwd secret <set|ls|rm> ...")
+		return 2
+	}
+	switch args[0] {
+	case "set":
+		return runSecretSet(args[1:])
+	case "ls":
+		return runSecretLs(args[1:])
+	case "rm":
+		return runSecretRm(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown secret command %q\n", args[0])
+		return 2
+	}
+}
+
+func runSecretSet(args []string) int {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: lwd secret set <app> <KEY> (value read from stdin)")
+		return 2
+	}
+	app, key := args[0], args[1]
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "secret set:", err)
+		return 1
+	}
+	value := strings.TrimSuffix(strings.TrimSuffix(string(raw), "\n"), "\r")
+	if err := newClient().SetSecret(context.Background(), app, key, value); err != nil {
+		fmt.Fprintln(os.Stderr, "secret set:", err)
+		return 1
+	}
+	fmt.Printf("secret %s set for %s; redeploy to apply\n", key, app)
+	return 0
+}
+
+func runSecretLs(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: lwd secret ls <app>")
+		return 2
+	}
+	names, err := newClient().ListSecrets(context.Background(), args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "secret ls:", err)
+		return 1
+	}
+	for _, n := range names {
+		fmt.Println(n)
+	}
+	return 0
+}
+
+func runSecretRm(args []string) int {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: lwd secret rm <app> <KEY>")
+		return 2
+	}
+	app, key := args[0], args[1]
+	if err := newClient().DeleteSecret(context.Background(), app, key); err != nil {
+		fmt.Fprintln(os.Stderr, "secret rm:", err)
+		return 1
+	}
+	fmt.Printf("removed secret %s from %s\n", key, app)
 	return 0
 }

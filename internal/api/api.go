@@ -12,16 +12,19 @@ import (
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
 	"lwd/internal/router"
+	"lwd/internal/secrets"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
 
-// Server wires HTTP routes to the reconciler, store, node, and router.
+// Server wires HTTP routes to the reconciler, store, node, router, and
+// secrets store.
 type Server struct {
-	rec    *reconciler.Reconciler
-	store  *store.Store
-	node   node.Node
-	router router.Router
+	rec     *reconciler.Reconciler
+	store   *store.Store
+	node    node.Node
+	router  router.Router
+	secrets *secrets.Store
 }
 
 // AppStatus is the wire representation of an app's current state.
@@ -34,8 +37,8 @@ type AppStatus struct {
 }
 
 // New returns a Server.
-func New(r *reconciler.Reconciler, s *store.Store, n node.Node, rt router.Router) *Server {
-	return &Server{rec: r, store: s, node: n, router: rt}
+func New(r *reconciler.Reconciler, s *store.Store, n node.Node, rt router.Router, sec *secrets.Store) *Server {
+	return &Server{rec: r, store: s, node: n, router: rt, secrets: sec}
 }
 
 // Handler returns the HTTP handler for all routes.
@@ -47,6 +50,9 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /apps/{name}/history", srv.handleHistory)
 	mux.HandleFunc("POST /apps/{name}/rollback", srv.handleRollback)
 	mux.HandleFunc("DELETE /apps/{name}", srv.handleDelete)
+	mux.HandleFunc("POST /apps/{name}/secrets", srv.handleSecretSet)
+	mux.HandleFunc("GET /apps/{name}/secrets", srv.handleSecretList)
+	mux.HandleFunc("DELETE /apps/{name}/secrets/{key}", srv.handleSecretDelete)
 	return mux
 }
 
@@ -211,4 +217,49 @@ func (srv *Server) removeApp(ctx context.Context, name string) error {
 		return srv.store.SetStatus(cur.ID, store.StatusRetired)
 	}
 	return nil
+}
+
+// secretRequest is the wire body for POST /apps/{name}/secrets. Values never
+// appear in any response — only in this request body.
+type secretRequest struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+func (srv *Server) handleSecretSet(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var req secretRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Key == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("key is required"))
+		return
+	}
+	if err := srv.secrets.Set(name, req.Key, req.Value); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (srv *Server) handleSecretList(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	names, err := srv.secrets.List(name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, names)
+}
+
+func (srv *Server) handleSecretDelete(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	key := r.PathValue("key")
+	if err := srv.secrets.Delete(name, key); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
