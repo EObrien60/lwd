@@ -71,6 +71,7 @@ func (l *Local) RunContainer(ctx context.Context, spec RunSpec) (Container, erro
 		return Container{}, fmt.Errorf("create container: %w", err)
 	}
 	if err := l.cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+		_ = l.cli.ContainerRemove(ctx, created.ID, container.RemoveOptions{Force: true})
 		return Container{}, fmt.Errorf("start container: %w", err)
 	}
 	return Container{
@@ -134,32 +135,48 @@ func (l *Local) ContainerLogs(ctx context.Context, id string, follow bool) (io.R
 	})
 }
 
-// Health polls the container until healthy or the timeout elapses. With a Path
-// it expects an HTTP 2xx on 127.0.0.1:HostPort; otherwise it does a TCP connect.
+// Health polls the container until healthy or the timeout elapses, honoring
+// ctx cancellation. With a Path it expects an HTTP 2xx on 127.0.0.1:HostPort;
+// otherwise it does a TCP connect.
 func (l *Local) Health(ctx context.Context, c Container, h HealthSpec) error {
 	if c.HostPort == 0 {
 		return nil // nothing to probe
+	}
+	if h.Timeout <= 0 {
+		return fmt.Errorf("health check: non-positive timeout %v", h.Timeout)
 	}
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(c.HostPort))
 	deadline := time.Now().Add(h.Timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if h.Path != "" {
-			lastErr = probeHTTP("http://" + addr + h.Path)
+			lastErr = probeHTTP(ctx, "http://"+addr+h.Path)
 		} else {
-			lastErr = probeTCP(addr)
+			lastErr = probeTCP(ctx, addr)
 		}
 		if lastErr == nil {
 			return nil
 		}
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 	return fmt.Errorf("health check timed out: %w", lastErr)
 }
 
-func probeHTTP(url string) error {
-	c := &http.Client{Timeout: 3 * time.Second}
-	resp, err := c.Get(url)
+func probeHTTP(ctx context.Context, url string) error {
+	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -170,8 +187,11 @@ func probeHTTP(url string) error {
 	return nil
 }
 
-func probeTCP(addr string) error {
-	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+func probeTCP(ctx context.Context, addr string) error {
+	dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	var d net.Dialer
+	conn, err := d.DialContext(dialCtx, "tcp", addr)
 	if err != nil {
 		return err
 	}
