@@ -79,6 +79,21 @@ func TestApplyRecreatesRetiringOld(t *testing.T) {
 	}
 }
 
+func TestApplyRedeployFailureLeavesNoRunning(t *testing.T) {
+	r, f, s := newTestReconciler(t)
+	ctx := context.Background()
+	if _, err := r.Apply(ctx, testApp()); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	f.HealthErr = errors.New("unhealthy")
+	if _, err := r.Apply(ctx, testApp()); err == nil {
+		t.Fatal("want error on failed redeploy")
+	}
+	if cur, _ := s.CurrentDeployment("blog"); cur != nil {
+		t.Fatalf("want no running deployment after failed redeploy, got %+v", cur)
+	}
+}
+
 func TestApplyRejectsInvalidSpec(t *testing.T) {
 	r, _, _ := newTestReconciler(t)
 	_, err := r.Apply(context.Background(), &spec.App{Name: "x"}) // missing image/port

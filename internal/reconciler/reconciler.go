@@ -68,6 +68,9 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 	hErr := r.node.Health(ctx, c, node.HealthSpec{Path: app.Health.Path, Timeout: app.Health.Timeout})
 	if hErr != nil {
 		_ = r.node.RemoveContainer(ctx, c.ID)
+		if prev, err := r.store.CurrentDeployment(app.Name); err == nil && prev != nil {
+			_ = r.store.SetStatus(prev.ID, store.StatusRetired)
+		}
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App: app.Name, Image: app.Image, ContainerID: c.ID,
 			Status: store.StatusFailed, CreatedAt: time.Now(),
