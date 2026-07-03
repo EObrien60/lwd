@@ -50,30 +50,53 @@ ref. The "pipe" between them is the local Docker image store (single host today)
 or later a registry / `docker save | ssh | docker load`. We never invent a custom
 handoff protocol.
 
+```mermaid
+flowchart LR
+    ci["CI"] --> ref
+    push["git-push receiver"] --> ref
+    build["build helper<br/>(clone · build · push)"] --> ref
+    reg["registry image<br/>(off-the-shelf app)"] --> ref
+    ref{{"image ref<br/>(the universal pipe)"}} --> lwd["lwd deploy API<br/>(mechanism)"]
+
+    classDef policy fill:#eee,stroke:#999,color:#333;
+    class ci,push,build,reg policy;
+```
+
+Everything on the left is *policy* and optional; only lwd (the mechanism) is core.
+
 ## Architecture
 
 One daemon + one CLI + one embedded web UI, sharing a single HTTP API over a unix
 socket. Internally, a few single-purpose units with clean seams:
 
-```
-        lwd.toml files (source of truth, committed to your repo)
-                    │  apply
-                    ▼
-┌───────────────────────────────────────────────┐
-│  lwd daemon                                     │
-│   API (HTTP over unix socket)                   │
-│        │                                        │
-│   CLI ─┼─► Reconciler ◄─ web UI                 │
-│        │        │                               │
-│        │   ┌────┴──────┬──────────┐             │
-│        │   ▼           ▼          ▼             │
-│        │ Node       Secrets    Router           │
-│        │ (Docker    store      (Caddy config)   │
-│        │  iface)                                 │
-│        │   │  runtime state: SQLite    │        │
-└────────┼───┼───────────────────────────┼───────┘
-         ▼   ▼                           ▼
-     Docker daemon                  Caddy (TLS)
+```mermaid
+flowchart TD
+    files["lwd.toml files<br/>(source of truth, committed to your repo)"]
+
+    subgraph daemon["lwd daemon"]
+        api["API<br/>(HTTP over unix socket)"]
+        rec["Reconciler<br/>(the heart)"]
+        node["Node interface<br/>(Docker ops · federation seam)"]
+        sec["Secrets store"]
+        router["Router<br/>(generates Caddy config)"]
+        db[("SQLite<br/>runtime state")]
+    end
+
+    cli["CLI"]
+    ui["web UI"]
+    docker["Docker daemon"]
+    caddy["Caddy<br/>(automatic TLS)"]
+
+    files -- apply --> api
+    cli --> api
+    ui --> api
+    api --> rec
+    rec --> node
+    rec --> sec
+    rec --> router
+    rec -.records.-> db
+    node --> docker
+    router --> caddy
 ```
 
 ### Units and their single responsibility
@@ -127,6 +150,29 @@ Mechanically this collapses to **one deploy mechanism + a pinned-infra concept**
   container) on a shared network; lwd ensures they're up and reconciles them only
   if their definition actually changes (and loudly, because state is at stake).
 
+During a deploy, the surface is swapped while the backing service stays put — both
+old and new surface reach it over the same project network:
+
+```mermaid
+flowchart LR
+    caddy["Caddy"]
+
+    subgraph before["before swap"]
+        old["surface v1<br/>(serving)"]
+        db1[("db<br/>pinned")]
+        old --> db1
+    end
+
+    subgraph after["after swap"]
+        new["surface v2<br/>(serving)"]
+        db2[("db<br/>same instance,<br/>untouched")]
+        new --> db2
+    end
+
+    caddy -. "v1 upstream" .-> old
+    caddy == "swap upstream<br/>after health check" ==> new
+```
+
 Surfaces are stateless *by contract*, so nothing stops you from later pulling a
 backing service out into its own long-lived resource (the 12-factor "attached
 resource" model) — same design, just a different file boundary. That variant is the
@@ -138,20 +184,21 @@ its node with its volume) but is not required now.
 A deploy is one idempotent reconcile pass. Triggered by `lwd apply <dir>`, the web
 UI "Deploy" button, or any API client (e.g. a git-push receiver).
 
-```
-1. Parse & validate lwd.toml            → reject early on bad spec
-2. Ensure image present on node
-     • image ref given? → node.EnsureImage (pull if missing)
-     • [build] present? → a build client already built+pushed; we get an image ref
-3. Ensure backing (pinned) services up  → compose up -d for pinned services
-4. Resolve env: merge secrets store + lwd.toml env
-5. For each surface: start NEW container (old still serving)
-6. Health-check new surface container(s)
-     • pass → continue
-     • fail → stop new, leave old running, report failure (deploy is atomic)
-7. Router: point domain upstream at NEW surface, reload Caddy
-8. Stop & retire OLD surface container (recorded for rollback)
-9. Record deployment in SQLite (image digest, timestamp, status)
+```mermaid
+flowchart TD
+    start([apply]) --> parse["Parse &amp; validate lwd.toml"]
+    parse -->|invalid| reject([reject early])
+    parse -->|valid| img["Ensure image present on node<br/>(pull if missing / built by client)"]
+    img --> backing["Ensure backing (pinned) services up"]
+    backing --> env["Resolve env: secrets store + lwd.toml env"]
+    env --> newc["Start NEW surface container<br/>(old still serving)"]
+    newc --> health{"Health check<br/>new surface?"}
+    health -->|fail| fail["Stop new · leave old running · report"]
+    fail --> done([deploy failed — app still up])
+    health -->|pass| swap["Router: point domain at NEW surface<br/>reload Caddy"]
+    swap --> retire["Stop &amp; retire OLD surface<br/>(recorded for rollback)"]
+    retire --> record["Record deployment in SQLite<br/>(image digest, timestamp, status)"]
+    record --> ok([deploy succeeded])
 ```
 
 **Properties:**
