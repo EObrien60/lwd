@@ -11,6 +11,7 @@ import (
 	"lwd/internal/api"
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
+	"lwd/internal/router"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -25,7 +26,8 @@ func startUnixServer(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	srv := api.New(reconciler.New(f, s), s, f)
+	rt := router.NewFakeRouter()
+	srv := api.New(reconciler.New(f, rt, s), s, f, rt)
 
 	ln, err := net.Listen("unix", sock)
 	if err != nil {

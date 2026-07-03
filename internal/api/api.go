@@ -7,18 +7,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
+	"lwd/internal/router"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
 
-// Server wires HTTP routes to the reconciler, store, and node.
+// Server wires HTTP routes to the reconciler, store, node, and router.
 type Server struct {
-	rec   *reconciler.Reconciler
-	store *store.Store
-	node  node.Node
+	rec    *reconciler.Reconciler
+	store  *store.Store
+	node   node.Node
+	router router.Router
 }
 
 // AppStatus is the wire representation of an app's current state.
@@ -27,11 +30,12 @@ type AppStatus struct {
 	Image       string `json:"image"`
 	ContainerID string `json:"container_id"`
 	Status      string `json:"status"`
+	Domain      string `json:"domain"`
 }
 
 // New returns a Server.
-func New(r *reconciler.Reconciler, s *store.Store, n node.Node) *Server {
-	return &Server{rec: r, store: s, node: n}
+func New(r *reconciler.Reconciler, s *store.Store, n node.Node, rt router.Router) *Server {
+	return &Server{rec: r, store: s, node: n, router: rt}
 }
 
 // Handler returns the HTTP handler for all routes.
@@ -40,6 +44,8 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /apply", srv.handleApply)
 	mux.HandleFunc("GET /apps", srv.handleApps)
 	mux.HandleFunc("GET /apps/{name}/logs", srv.handleLogs)
+	mux.HandleFunc("GET /apps/{name}/history", srv.handleHistory)
+	mux.HandleFunc("POST /apps/{name}/rollback", srv.handleRollback)
 	mux.HandleFunc("DELETE /apps/{name}", srv.handleDelete)
 	return mux
 }
@@ -74,6 +80,20 @@ func (srv *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, dep)
 }
 
+func (srv *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	dep, err := srv.rec.Rollback(r.Context(), name)
+	if err != nil {
+		if strings.Contains(err.Error(), "no previous deployment") {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, dep)
+}
+
 func (srv *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 	names, err := srv.store.ListApps()
 	if err != nil {
@@ -92,6 +112,10 @@ func (srv *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 			st.Image = cur.Image
 			st.ContainerID = cur.ContainerID
 			st.Status = cur.Status
+			var a spec.App
+			if err := json.Unmarshal([]byte(cur.Spec), &a); err == nil {
+				st.Domain = a.Domain
+			}
 		}
 		out = append(out, st)
 	}
@@ -134,6 +158,16 @@ func (srv *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (srv *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	deps, err := srv.store.DeploymentsForApp(name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, deps)
+}
+
 func (srv *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := srv.removeApp(r.Context(), name); err != nil {
@@ -144,6 +178,18 @@ func (srv *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (srv *Server) removeApp(ctx context.Context, name string) error {
+	cur, err := srv.store.CurrentDeployment(name)
+	if err != nil {
+		return err
+	}
+	var domain string
+	if cur != nil && cur.Spec != "" {
+		var a spec.App
+		if err := json.Unmarshal([]byte(cur.Spec), &a); err == nil {
+			domain = a.Domain
+		}
+	}
+
 	containers, err := srv.node.ListContainers(ctx, map[string]string{"lwd.app": name})
 	if err != nil {
 		return err
@@ -153,10 +199,14 @@ func (srv *Server) removeApp(ctx context.Context, name string) error {
 			return err
 		}
 	}
-	cur, err := srv.store.CurrentDeployment(name)
-	if err != nil {
-		return err
+
+	if domain != "" {
+		// Best-effort: a failure here shouldn't stop the app from being
+		// retired (its containers are already gone), but it does mean the
+		// domain may keep 502ing until a later reload/rm fixes it up.
+		_ = srv.router.RemoveRoute(ctx, domain)
 	}
+
 	if cur != nil {
 		return srv.store.SetStatus(cur.ID, store.StatusRetired)
 	}

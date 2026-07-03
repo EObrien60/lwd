@@ -19,6 +19,19 @@ type Fake struct {
 	EnsureErr error
 	HealthErr error
 	RunErr    error
+
+	// HealthState and DockerHealth are returned by ContainerHealth for any
+	// container ID. HealthState defaults to "running" for created containers
+	// unless overridden.
+	HealthState  string
+	DockerHealth string
+
+	// DockerHealthSeq, if non-empty, overrides DockerHealth: each call to
+	// ContainerHealth consumes the next entry, holding on the last entry once
+	// exhausted. Lets tests simulate a Docker HEALTHCHECK that starts out
+	// "starting" and later flips to "healthy" (or "unhealthy").
+	DockerHealthSeq  []string
+	dockerHealthCall int
 }
 
 // NewFake returns a ready-to-use Fake node.
@@ -37,6 +50,15 @@ func (f *Fake) EnsureImage(ctx context.Context, imageRef string) error {
 	return f.EnsureErr
 }
 
+// EnsureNetwork records the call and always succeeds; the Fake has no real
+// networking to create.
+func (f *Fake) EnsureNetwork(ctx context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("EnsureNetwork:" + name)
+	return nil
+}
+
 func (f *Fake) RunContainer(ctx context.Context, spec RunSpec) (Container, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -45,13 +67,28 @@ func (f *Fake) RunContainer(ctx context.Context, spec RunSpec) (Container, error
 		return Container{}, f.RunErr
 	}
 	f.seq++
+	var hostPort int
+	for _, pm := range spec.Publish {
+		if pm.ContainerPort == spec.Port {
+			hostPort = pm.HostPort
+			break
+		}
+	}
+	if hostPort == 0 && len(spec.Publish) > 0 {
+		hostPort = spec.Publish[0].HostPort
+	}
+	var ip string
+	if spec.Network != "" {
+		ip = fmt.Sprintf("10.42.0.%d", (f.seq%254)+1)
+	}
 	c := Container{
 		ID:       fmt.Sprintf("fake-%d", f.seq),
 		Name:     spec.Name,
 		Image:    spec.Image,
 		State:    "running",
 		Labels:   spec.Labels,
-		HostPort: spec.Port,
+		HostPort: hostPort,
+		IP:       ip,
 	}
 	f.items[c.ID] = c
 	return c, nil
@@ -90,6 +127,32 @@ func (f *Fake) Health(ctx context.Context, c Container, h HealthSpec) error {
 	defer f.mu.Unlock()
 	f.record("Health:" + c.ID)
 	return f.HealthErr
+}
+
+// ContainerHealth returns the configured HealthState/DockerHealth for any
+// container ID, defaulting HealthState to "running" for containers the Fake
+// created.
+func (f *Fake) ContainerHealth(ctx context.Context, id string) (string, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("ContainerHealth:" + id)
+	state := f.HealthState
+	if state == "" {
+		if _, ok := f.items[id]; ok {
+			state = "running"
+		}
+	}
+
+	dockerHealth := f.DockerHealth
+	if len(f.DockerHealthSeq) > 0 {
+		idx := f.dockerHealthCall
+		if idx >= len(f.DockerHealthSeq) {
+			idx = len(f.DockerHealthSeq) - 1
+		}
+		dockerHealth = f.DockerHealthSeq[idx]
+		f.dockerHealthCall++
+	}
+	return state, dockerHealth, nil
 }
 
 func matches(have, want map[string]string) bool {

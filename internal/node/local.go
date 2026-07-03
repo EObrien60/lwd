@@ -13,6 +13,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 )
@@ -54,7 +55,28 @@ func (l *Local) EnsureImage(ctx context.Context, imageRef string) error {
 	return nil
 }
 
-// RunContainer creates and starts a container, publishing Port to the same host port.
+// EnsureNetwork makes sure a private bridge network named name exists,
+// creating it if absent. Idempotent.
+func (l *Local) EnsureNetwork(ctx context.Context, name string) error {
+	if _, err := l.cli.NetworkInspect(ctx, name, network.InspectOptions{}); err == nil {
+		return nil
+	} else if !client.IsErrNotFound(err) {
+		return fmt.Errorf("inspect network %s: %w", name, err)
+	}
+	if _, err := l.cli.NetworkCreate(ctx, name, network.CreateOptions{Driver: "bridge"}); err != nil {
+		// Another caller may have created it concurrently; treat that as success.
+		if _, inspectErr := l.cli.NetworkInspect(ctx, name, network.InspectOptions{}); inspectErr == nil {
+			return nil
+		}
+		return fmt.Errorf("create network %s: %w", name, err)
+	}
+	return nil
+}
+
+// RunContainer creates and starts a container. It exposes Port on the
+// network, attaches to spec.Network (if set), and publishes only the host
+// ports listed in spec.Publish. Ports 80/443 bind to 0.0.0.0; every other
+// published host port binds to 127.0.0.1 only.
 func (l *Local) RunContainer(ctx context.Context, spec RunSpec) (Container, error) {
 	var env []string
 	for k, v := range spec.Env {
@@ -66,16 +88,50 @@ func (l *Local) RunContainer(ctx context.Context, spec RunSpec) (Container, erro
 		Env:    env,
 		Labels: spec.Labels,
 	}
+	if len(spec.Cmd) > 0 {
+		cfg.Cmd = spec.Cmd
+	}
 	hostCfg := &container.HostConfig{}
+	cfg.ExposedPorts = nat.PortSet{}
 	if spec.Port != 0 {
 		p := nat.Port(strconv.Itoa(spec.Port) + "/tcp")
-		cfg.ExposedPorts = nat.PortSet{p: struct{}{}}
-		hostCfg.PortBindings = nat.PortMap{
-			p: []nat.PortBinding{{HostIP: "127.0.0.1", HostPort: strconv.Itoa(spec.Port)}},
+		cfg.ExposedPorts[p] = struct{}{}
+	}
+
+	var primaryHostPort int
+	if len(spec.Publish) > 0 {
+		portBindings := nat.PortMap{}
+		for _, pm := range spec.Publish {
+			hostIP := "127.0.0.1"
+			if pm.HostPort == 80 || pm.HostPort == 443 {
+				hostIP = "0.0.0.0"
+			}
+			cp := nat.Port(strconv.Itoa(pm.ContainerPort) + "/tcp")
+			cfg.ExposedPorts[cp] = struct{}{}
+			portBindings[cp] = append(portBindings[cp], nat.PortBinding{
+				HostIP:   hostIP,
+				HostPort: strconv.Itoa(pm.HostPort),
+			})
+			if pm.ContainerPort == spec.Port {
+				primaryHostPort = pm.HostPort
+			}
+		}
+		if primaryHostPort == 0 {
+			primaryHostPort = spec.Publish[0].HostPort
+		}
+		hostCfg.PortBindings = portBindings
+	}
+
+	var netCfg *network.NetworkingConfig
+	if spec.Network != "" {
+		netCfg = &network.NetworkingConfig{
+			EndpointsConfig: map[string]*network.EndpointSettings{
+				spec.Network: {},
+			},
 		}
 	}
 
-	created, err := l.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, spec.Name)
+	created, err := l.cli.ContainerCreate(ctx, cfg, hostCfg, netCfg, nil, spec.Name)
 	if err != nil {
 		return Container{}, fmt.Errorf("create container: %w", err)
 	}
@@ -83,13 +139,32 @@ func (l *Local) RunContainer(ctx context.Context, spec RunSpec) (Container, erro
 		_ = l.cli.ContainerRemove(ctx, created.ID, container.RemoveOptions{Force: true})
 		return Container{}, fmt.Errorf("start container: %w", err)
 	}
+
+	ip := ""
+	if inspect, inspectErr := l.cli.ContainerInspect(ctx, created.ID); inspectErr == nil && inspect.NetworkSettings != nil {
+		if spec.Network != "" {
+			if ep, ok := inspect.NetworkSettings.Networks[spec.Network]; ok {
+				ip = ep.IPAddress
+			}
+		}
+		if ip == "" {
+			for _, ep := range inspect.NetworkSettings.Networks {
+				if ep.IPAddress != "" {
+					ip = ep.IPAddress
+					break
+				}
+			}
+		}
+	}
+
 	return Container{
 		ID:       created.ID,
 		Name:     spec.Name,
 		Image:    spec.Image,
 		State:    "running",
 		Labels:   spec.Labels,
-		HostPort: spec.Port,
+		HostPort: primaryHostPort,
+		IP:       ip,
 	}, nil
 }
 
@@ -206,6 +281,23 @@ func probeTCP(ctx context.Context, addr string) error {
 	}
 	_ = conn.Close()
 	return nil
+}
+
+// ContainerHealth inspects a container and returns its Docker state and, if
+// the image declares a HEALTHCHECK, the Docker health status.
+func (l *Local) ContainerHealth(ctx context.Context, id string) (string, string, error) {
+	inspect, err := l.cli.ContainerInspect(ctx, id)
+	if err != nil {
+		return "", "", fmt.Errorf("inspect container %s: %w", id, err)
+	}
+	if inspect.State == nil {
+		return "", "", nil
+	}
+	dockerHealth := ""
+	if inspect.State.Health != nil {
+		dockerHealth = inspect.State.Health.Status
+	}
+	return inspect.State.Status, dockerHealth, nil
 }
 
 // Compile-time assertion that Local implements Node.
