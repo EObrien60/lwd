@@ -47,20 +47,31 @@ const livenessSettle = 50 * time.Millisecond
 // spec.App directly, e.g. tests or the API, may leave it zero).
 const defaultHealthTimeout = 30 * time.Second
 
+// SecretResolver resolves an app's declared secret names to their plaintext
+// values at deploy time. It is expected to fail closed: Resolve must return
+// an error (naming the offending secret) rather than silently omitting or
+// substituting a value for any name it cannot resolve. secrets.Store
+// satisfies this interface.
+type SecretResolver interface {
+	Resolve(app string, names []string) (map[string]string, error)
+}
+
 // Reconciler applies desired app specs against a node and a router, recording
 // history in the store. A single mutex serializes all Apply calls: blue-green
 // swaps involve multiple external side effects (container, staging route,
 // live route) that must not interleave across concurrent deploys.
 type Reconciler struct {
-	node   node.Node
-	router router.Router
-	store  *store.Store
-	mu     sync.Mutex
+	node    node.Node
+	router  router.Router
+	store   *store.Store
+	secrets SecretResolver
+	mu      sync.Mutex
 }
 
-// New returns a Reconciler bound to a node, a router, and a store.
-func New(n node.Node, r router.Router, s *store.Store) *Reconciler {
-	return &Reconciler{node: n, router: r, store: s}
+// New returns a Reconciler bound to a node, a router, a store, and a secret
+// resolver used to inject an app's declared secrets into its container env.
+func New(n node.Node, r router.Router, s *store.Store, sec SecretResolver) *Reconciler {
+	return &Reconciler{node: n, router: r, store: s, secrets: sec}
 }
 
 // containerName returns the name of the surface container for one blue-green
@@ -119,10 +130,34 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 		return nil, fmt.Errorf("marshal spec snapshot: %w", err)
 	}
 
+	// Resolve declared secrets BEFORE starting anything. This must fail
+	// closed: if any named secret can't be resolved, we record the failed
+	// attempt and return without touching the node, the router, or the
+	// currently running (old) deployment — there is no new container yet to
+	// remove, and the live route/domain is left exactly as it was.
+	secretVals, err := r.secrets.Resolve(app.Name, app.Secrets)
+	if err != nil {
+		_, _ = r.store.RecordDeployment(store.Deployment{
+			App:       app.Name,
+			Image:     app.Image,
+			Status:    store.StatusFailed,
+			CreatedAt: time.Now(),
+			Spec:      string(specJSON),
+		})
+		return nil, fmt.Errorf("resolve secrets: %w", err)
+	}
+	env := make(map[string]string, len(app.Env)+len(secretVals))
+	for k, v := range app.Env {
+		env[k] = v
+	}
+	for k, v := range secretVals {
+		env[k] = v // secrets win on key collision with plain env
+	}
+
 	c, err := r.node.RunContainer(ctx, node.RunSpec{
 		Name:  name,
 		Image: app.Image,
-		Env:   app.Env,
+		Env:   env,
 		Labels: map[string]string{
 			"lwd.app":    app.Name,
 			"lwd.role":   "surface",

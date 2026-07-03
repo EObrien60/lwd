@@ -12,6 +12,7 @@ import (
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
 	"lwd/internal/router"
+	"lwd/internal/secrets"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -27,7 +28,12 @@ func startUnixServer(t *testing.T) string {
 		t.Fatalf("store.Open: %v", err)
 	}
 	rt := router.NewFakeRouter()
-	srv := api.New(reconciler.New(f, rt, s), s, f, rt)
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	secStore := secrets.NewStore(cipher, s)
+	srv := api.New(reconciler.New(f, rt, s, secStore), s, f, rt)
 
 	ln, err := net.Listen("unix", sock)
 	if err != nil {

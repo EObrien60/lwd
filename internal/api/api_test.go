@@ -13,20 +13,35 @@ import (
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
 	"lwd/internal/router"
+	"lwd/internal/secrets"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
 
+// testSecretResolver builds a real (but throwaway) secrets.Store for tests
+// that need a reconciler.SecretResolver — the reconciler's tests already
+// cover a fake resolver's fail-closed behavior, so wiring the real store
+// here exercises the actual integration.
+func testSecretResolver(t *testing.T, s *store.Store, dir string) *secrets.Store {
+	t.Helper()
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	return secrets.NewStore(cipher, s)
+}
+
 func newTestServer(t *testing.T) (*httptest.Server, *node.Fake) {
 	t.Helper()
 	f := node.NewFake()
-	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
 	rt := router.NewFakeRouter()
-	srv := New(reconciler.New(f, rt, s), s, f, rt)
+	srv := New(reconciler.New(f, rt, s, testSecretResolver(t, s, dir)), s, f, rt)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f
@@ -38,13 +53,14 @@ func newTestServer(t *testing.T) (*httptest.Server, *node.Fake) {
 func newTestServerWithRouter(t *testing.T) (*httptest.Server, *node.Fake, *router.FakeRouter) {
 	t.Helper()
 	f := node.NewFake()
-	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
 	rt := router.NewFakeRouter()
-	srv := New(reconciler.New(f, rt, s), s, f, rt)
+	srv := New(reconciler.New(f, rt, s, testSecretResolver(t, s, dir)), s, f, rt)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f, rt

@@ -17,6 +17,7 @@ import (
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
 	"lwd/internal/router"
+	"lwd/internal/secrets"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -61,7 +62,12 @@ func TestEndToEndBlueGreenRollback(t *testing.T) {
 	defer s.Close()
 
 	rtr := router.NewCaddyRouter(n, dir)
-	rec := reconciler.New(n, rtr, s)
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	secStore := secrets.NewStore(cipher, s)
+	rec := reconciler.New(n, rtr, s, secStore)
 
 	// Cleanup runs regardless of how the test ends (pass, fail, or panic via
 	// t.Fatal) and is best-effort: each step's error is logged, not fatal, so

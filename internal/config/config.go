@@ -22,3 +22,6 @@ func DBPath() string { return filepath.Join(DataDir(), "lwd.db") }
 
 // CaddyfilePath returns the path to the generated Caddyfile.
 func CaddyfilePath() string { return filepath.Join(DataDir(), "Caddyfile") }
+
+// KeyPath returns the path to the secret-encryption key file.
+func KeyPath() string { return filepath.Join(DataDir(), "secret.key") }

@@ -16,6 +16,7 @@ import (
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
 	"lwd/internal/router"
+	"lwd/internal/secrets"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -85,7 +86,15 @@ func runDaemon() int {
 		fmt.Fprintln(os.Stderr, "router: failed to bring up Caddy:", err)
 		return 1
 	}
-	srv := api.New(reconciler.New(n, r, s), s, n, r)
+
+	cipher, err := secrets.NewCipher(config.KeyPath())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "secrets: failed to load encryption key:", err)
+		return 1
+	}
+	secStore := secrets.NewStore(cipher, s)
+
+	srv := api.New(reconciler.New(n, r, s, secStore), s, n, r)
 
 	sock := config.SocketPath()
 	_ = os.Remove(sock) // clean stale socket
