@@ -60,3 +60,50 @@ func TestFakeLogs(t *testing.T) {
 
 // Compile-time assertion that Fake implements Node.
 var _ Node = (*Fake)(nil)
+
+func TestFakeEnsureNetwork(t *testing.T) {
+	f := NewFake()
+	if err := f.EnsureNetwork(context.Background(), "lwd"); err != nil {
+		t.Fatalf("EnsureNetwork: %v", err)
+	}
+	if !contains(f.Calls, "EnsureNetwork:lwd") {
+		t.Errorf("calls = %v", f.Calls)
+	}
+}
+
+func TestFakeRunRecordsNetworkAndNoPublish(t *testing.T) {
+	f := NewFake()
+	c, err := f.RunContainer(context.Background(), RunSpec{
+		Name: "lwd-blog-1", Image: "img:1", Network: "lwd", Port: 8080,
+		Labels: map[string]string{"lwd.app": "blog"},
+	})
+	if err != nil {
+		t.Fatalf("RunContainer: %v", err)
+	}
+	if c.Name != "lwd-blog-1" {
+		t.Errorf("name = %q", c.Name)
+	}
+}
+
+func TestFakeContainerHealth(t *testing.T) {
+	f := NewFake()
+	c, _ := f.RunContainer(context.Background(), RunSpec{Name: "x", Image: "i", Labels: map[string]string{"lwd.app": "x"}})
+	f.HealthState = "running"
+	f.DockerHealth = "healthy"
+	state, dh, err := f.ContainerHealth(context.Background(), c.ID)
+	if err != nil {
+		t.Fatalf("ContainerHealth: %v", err)
+	}
+	if state != "running" || dh != "healthy" {
+		t.Errorf("state=%q dockerHealth=%q", state, dh)
+	}
+}
+
+func contains(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}
