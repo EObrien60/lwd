@@ -1,9 +1,12 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 func openTemp(t *testing.T) *Store {
@@ -189,5 +192,86 @@ func TestMigrationIdempotentAcrossReopens(t *testing.T) {
 		if err := s2.Close(); err != nil {
 			t.Fatalf("Close (reopen %d): %v", i, err)
 		}
+	}
+}
+
+func TestMigrationFromPreSpecSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lwd.db")
+
+	// Step 1: Create a pre-Phase-2 DB with the old schema (no spec column).
+	// Use raw sql.Open to bypass Open() which would create the new schema.
+	rawDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+
+	// Create the old Phase-1 deployments table without the spec column.
+	oldSchema := `
+	CREATE TABLE deployments (
+		id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		app          TEXT    NOT NULL,
+		image        TEXT    NOT NULL,
+		container_id TEXT    NOT NULL,
+		status       TEXT    NOT NULL,
+		created_at   INTEGER NOT NULL
+	);
+	CREATE INDEX idx_deployments_app ON deployments(app);
+	`
+	if _, err := rawDB.Exec(oldSchema); err != nil {
+		rawDB.Close()
+		t.Fatalf("create old schema: %v", err)
+	}
+
+	// Insert one legacy row.
+	if _, err := rawDB.Exec(
+		`INSERT INTO deployments (app, image, container_id, status, created_at) VALUES (?, ?, ?, ?, ?)`,
+		"legacy", "img:0", "c0", StatusRunning, time.Now().Unix(),
+	); err != nil {
+		rawDB.Close()
+		t.Fatalf("insert legacy row: %v", err)
+	}
+
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close raw DB: %v", err)
+	}
+
+	// Step 2: Open via the package's Open(), which runs migrateAddSpecColumn.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (migrated): %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	// Step 3: Verify the legacy row was preserved and Spec defaulted to "".
+	cur, err := s.CurrentDeployment("legacy")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil {
+		t.Fatalf("CurrentDeployment returned nil, want legacy row")
+	}
+	if cur.App != "legacy" || cur.Image != "img:0" || cur.ContainerID != "c0" {
+		t.Fatalf("CurrentDeployment data mismatch: got %+v", cur)
+	}
+	if cur.Spec != "" {
+		t.Fatalf("CurrentDeployment.Spec = %q, want empty string for migrated row", cur.Spec)
+	}
+
+	// Step 4: Record a new deployment with a non-empty Spec and verify it works.
+	newSpec := `{"image":"img:new","env":{"FOO":"bar"}}`
+	if _, err := s.RecordDeployment(Deployment{
+		App: "legacy", Image: "img:new", ContainerID: "c1",
+		Status: StatusRunning, CreatedAt: time.Now(), Spec: newSpec,
+	}); err != nil {
+		t.Fatalf("RecordDeployment (new spec): %v", err)
+	}
+
+	// The new deployment should be current and have the correct Spec.
+	cur2, err := s.CurrentDeployment("legacy")
+	if err != nil {
+		t.Fatalf("CurrentDeployment (after new): %v", err)
+	}
+	if cur2 == nil || cur2.Spec != newSpec {
+		t.Fatalf("CurrentDeployment (after new) Spec = %q, want %q", cur2.Spec, newSpec)
 	}
 }
