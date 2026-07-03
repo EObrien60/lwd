@@ -6,6 +6,7 @@ package reconciler
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"lwd/internal/node"
@@ -17,6 +18,7 @@ import (
 type Reconciler struct {
 	node  node.Node
 	store *store.Store
+	mu    sync.Mutex
 }
 
 // New returns a Reconciler bound to a node and store.
@@ -31,6 +33,9 @@ func containerName(app *spec.App) string { return "lwd-" + app.Name }
 // the app is left with no running deployment (MVP recreate semantics; blue-green
 // arrives with the router in a later plan).
 func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deployment, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if err := app.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid spec: %w", err)
 	}

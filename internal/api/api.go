@@ -5,7 +5,7 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"io"
+	"fmt"
 	"net/http"
 
 	"lwd/internal/node"
@@ -106,7 +106,7 @@ func (srv *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cur == nil {
-		writeErr(w, http.StatusNotFound, io.EOF)
+		writeErr(w, http.StatusNotFound, fmt.Errorf("app %q not found", name))
 		return
 	}
 	follow := r.URL.Query().Get("follow") == "true"

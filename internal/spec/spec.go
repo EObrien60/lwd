@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/BurntSushi/toml"
 )
+
+var nameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 // App is a single deployable application as declared in lwd.toml.
 type App struct {
@@ -77,6 +80,9 @@ func Load(dir string) (*App, error) {
 func (a *App) Validate() error {
 	if a.Name == "" {
 		return fmt.Errorf("name is required")
+	}
+	if !nameRe.MatchString(a.Name) {
+		return fmt.Errorf("name %q is invalid: must match [a-zA-Z0-9][a-zA-Z0-9_.-]*", a.Name)
 	}
 	if a.Compose != "" {
 		return fmt.Errorf("compose apps are not supported yet")

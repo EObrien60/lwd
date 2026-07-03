@@ -53,6 +53,17 @@ lwd rm blog           # stop and deregister
 - `compose`, `[build]`, and `surfaces` in `lwd.toml` are parsed but rejected with
   a clear error until their milestones land.
 
+### Known limitations (this milestone)
+
+- Mutable image tags (e.g. `:latest`) are re-pulled on every `apply` when the
+  registry is reachable; if the pull fails but the image exists locally, the
+  local copy is used.
+- The `domain` and `secrets` fields in `lwd.toml` are **parsed but not yet
+  applied** in this milestone (routing/TLS and secret injection arrive in
+  later milestones). Do not rely on `secrets` being injected yet.
+- Building lwd requires **Go 1.25+** (a transitive dependency of the Docker
+  SDK raises the floor above the 1.22 language baseline).
+
 ## Testing
 
 ```bash

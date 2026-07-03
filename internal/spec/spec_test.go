@@ -85,3 +85,12 @@ func TestValidateAcceptsGoodSpec(t *testing.T) {
 		t.Fatalf("Validate: %v", err)
 	}
 }
+
+func TestValidateRejectsBadName(t *testing.T) {
+	for _, bad := range []string{"has space", "bad/slash", "-leading", "café"} {
+		a := &App{Name: bad, Image: "y", Port: 80}
+		if err := a.Validate(); err == nil {
+			t.Errorf("name %q: want invalid-name error", bad)
+		}
+	}
+}

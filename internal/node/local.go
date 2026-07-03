@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -30,18 +31,26 @@ func NewLocal() (*Local, error) {
 	return &Local{cli: cli}, nil
 }
 
-// EnsureImage pulls the image if it is not already present locally.
+// EnsureImage makes the image available for RunContainer. Pinned digests
+// (@sha256:...) are immutable, so a present copy is used as-is. For mutable
+// refs (tags like :latest) it re-pulls so a moved tag is picked up; if the
+// pull fails but a local copy exists (e.g. a locally-built image), that copy
+// is used rather than failing the deploy.
 func (l *Local) EnsureImage(ctx context.Context, imageRef string) error {
-	_, _, err := l.cli.ImageInspectWithRaw(ctx, imageRef)
-	if err == nil {
-		return nil // already present
+	_, _, inspectErr := l.cli.ImageInspectWithRaw(ctx, imageRef)
+	present := inspectErr == nil
+	if present && strings.Contains(imageRef, "@sha256:") {
+		return nil
 	}
 	rc, err := l.cli.ImagePull(ctx, imageRef, image.PullOptions{})
 	if err != nil {
+		if present {
+			return nil // registry unreachable but we have a local copy
+		}
 		return fmt.Errorf("pull %s: %w", imageRef, err)
 	}
 	defer rc.Close()
-	_, _ = io.Copy(io.Discard, rc) // drain to completion
+	_, _ = io.Copy(io.Discard, rc)
 	return nil
 }
 

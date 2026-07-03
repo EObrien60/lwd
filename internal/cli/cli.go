@@ -67,6 +67,10 @@ func runDaemon() int {
 		fmt.Fprintln(os.Stderr, "listen:", err)
 		return 1
 	}
+	if err := os.Chmod(sock, 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, "chmod socket:", err)
+		return 1
+	}
 	fmt.Println("lwd daemon listening on", sock)
 	httpSrv := &http.Server{Handler: srv.Handler()}
 	if err := httpSrv.Serve(ln); err != nil {

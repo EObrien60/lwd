@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -83,7 +84,7 @@ func TestAppsEndpoint(t *testing.T) {
 }
 
 func TestDeleteEndpoint(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, f := newTestServer(t)
 	body, _ := json.Marshal(spec.App{Name: "blog", Image: "img:1", Port: 8080, Node: "local"})
 	http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
 
@@ -95,5 +96,24 @@ func TestDeleteEndpoint(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != 204 {
 		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+
+	// side effect: containers for the app removed from the node
+	got, _ := f.ListContainers(context.Background(), map[string]string{"lwd.app": "blog"})
+	if len(got) != 0 {
+		t.Fatalf("want no containers after delete, got %+v", got)
+	}
+	// side effect: deployment retired -> /apps reports it no longer running
+	resp2, err := http.Get(ts.URL + "/apps")
+	if err != nil {
+		t.Fatalf("GET /apps: %v", err)
+	}
+	defer resp2.Body.Close()
+	var apps []AppStatus
+	json.NewDecoder(resp2.Body).Decode(&apps)
+	for _, a := range apps {
+		if a.Name == "blog" && a.Status == store.StatusRunning {
+			t.Fatalf("blog still running after delete: %+v", a)
+		}
 	}
 }
