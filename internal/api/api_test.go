@@ -12,6 +12,7 @@ import (
 
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
+	"lwd/internal/router"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -24,7 +25,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *node.Fake) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	srv := New(reconciler.New(f, s), s, f)
+	srv := New(reconciler.New(f, router.NewFakeRouter(), s), s, f)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f

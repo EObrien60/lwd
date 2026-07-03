@@ -158,6 +158,41 @@ func TestDeploymentsForAppNewestFirst(t *testing.T) {
 	}
 }
 
+func TestNextDeployIDStartsAtOneAndIncrements(t *testing.T) {
+	s := openTemp(t)
+	id, err := s.NextDeployID()
+	if err != nil {
+		t.Fatalf("NextDeployID: %v", err)
+	}
+	if id != 1 {
+		t.Fatalf("NextDeployID (empty store) = %d, want 1", id)
+	}
+
+	if _, err := s.RecordDeployment(Deployment{App: "blog", Image: "img:1", ContainerID: "c1", Status: StatusRunning, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("RecordDeployment: %v", err)
+	}
+	id2, err := s.NextDeployID()
+	if err != nil {
+		t.Fatalf("NextDeployID (after one row): %v", err)
+	}
+	if id2 != 2 {
+		t.Fatalf("NextDeployID (after one row) = %d, want 2", id2)
+	}
+
+	// Adding rows for a different app still advances the single shared
+	// counter: deploy ids are unique across the whole store, not per-app.
+	if _, err := s.RecordDeployment(Deployment{App: "other", Image: "img:2", ContainerID: "c2", Status: StatusRunning, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("RecordDeployment (other app): %v", err)
+	}
+	id3, err := s.NextDeployID()
+	if err != nil {
+		t.Fatalf("NextDeployID (after two rows): %v", err)
+	}
+	if id3 != 3 {
+		t.Fatalf("NextDeployID (after two rows) = %d, want 3", id3)
+	}
+}
+
 func TestMigrationIdempotentAcrossReopens(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lwd.db")
 

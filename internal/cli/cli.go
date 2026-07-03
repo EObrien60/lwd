@@ -14,6 +14,7 @@ import (
 	"lwd/internal/config"
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
+	"lwd/internal/router"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -58,7 +59,8 @@ func runDaemon() int {
 	}
 	defer s.Close()
 
-	srv := api.New(reconciler.New(n, s), s, n)
+	r := router.NewCaddyRouter(n, config.DataDir())
+	srv := api.New(reconciler.New(n, r, s), s, n)
 
 	sock := config.SocketPath()
 	_ = os.Remove(sock) // clean stale socket

@@ -12,6 +12,7 @@ import (
 	"lwd/internal/api"
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
+	"lwd/internal/router"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -34,7 +35,8 @@ func TestEndToEndDeploy(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	defer s.Close()
-	srv := api.New(reconciler.New(n, s), s, n)
+	rtr := router.NewCaddyRouter(n, dir)
+	srv := api.New(reconciler.New(n, rtr, s), s, n)
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -56,7 +58,7 @@ func TestEndToEndDeploy(t *testing.T) {
 	app.Health.Path = "/"
 	app.Health.Timeout = 30 * time.Second
 
-	rec := reconciler.New(n, s)
+	rec := reconciler.New(n, rtr, s)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	dep, err := rec.Apply(ctx, app)

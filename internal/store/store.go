@@ -203,6 +203,24 @@ func (s *Store) DeploymentsForApp(app string) ([]Deployment, error) {
 	return out, rows.Err()
 }
 
+// NextDeployID returns the next monotonically increasing deploy id, used by
+// the reconciler to name blue-green containers/staging hosts uniquely and in
+// increasing order (e.g. lwd-<app>-<deployid>). It is one greater than the
+// highest deployment id ever recorded (across all apps), starting at 1 for an
+// empty store. Deploy ids are allocated before the corresponding deployment
+// row is inserted (the row doesn't exist yet — its own id would be circular),
+// so this is a small dedicated counter derived from the table rather than the
+// row id itself. Callers must serialize Apply (the reconciler holds a mutex
+// across the whole call) so concurrent callers cannot race this read.
+func (s *Store) NextDeployID() (int64, error) {
+	row := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) + 1 FROM deployments`)
+	var next int64
+	if err := row.Scan(&next); err != nil {
+		return 0, fmt.Errorf("next deploy id: %w", err)
+	}
+	return next, nil
+}
+
 // SetStatus updates a deployment's status.
 func (s *Store) SetStatus(id int64, status string) error {
 	_, err := s.db.Exec(`UPDATE deployments SET status = ? WHERE id = ?`, status, id)
