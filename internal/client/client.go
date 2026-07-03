@@ -108,6 +108,24 @@ func (c *Client) Apps(ctx context.Context) ([]api.AppStatus, error) {
 	return apps, nil
 }
 
+// History returns all recorded deployments for name, newest first.
+func (c *Client) History(ctx context.Context, name string) ([]store.Deployment, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/apps/"+name+"/history"), nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, decodeErr(resp)
+	}
+	var deps []store.Deployment
+	if err := json.NewDecoder(resp.Body).Decode(&deps); err != nil {
+		return nil, err
+	}
+	return deps, nil
+}
+
 // Logs streams an app's logs to w.
 func (c *Client) Logs(ctx context.Context, name string, follow bool, w io.Writer) error {
 	u := c.url("/apps/" + name + "/logs")

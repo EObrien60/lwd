@@ -28,6 +28,7 @@ type AppStatus struct {
 	Image       string `json:"image"`
 	ContainerID string `json:"container_id"`
 	Status      string `json:"status"`
+	Domain      string `json:"domain"`
 }
 
 // New returns a Server.
@@ -41,6 +42,7 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /apply", srv.handleApply)
 	mux.HandleFunc("GET /apps", srv.handleApps)
 	mux.HandleFunc("GET /apps/{name}/logs", srv.handleLogs)
+	mux.HandleFunc("GET /apps/{name}/history", srv.handleHistory)
 	mux.HandleFunc("POST /apps/{name}/rollback", srv.handleRollback)
 	mux.HandleFunc("DELETE /apps/{name}", srv.handleDelete)
 	return mux
@@ -108,6 +110,10 @@ func (srv *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 			st.Image = cur.Image
 			st.ContainerID = cur.ContainerID
 			st.Status = cur.Status
+			var a spec.App
+			if err := json.Unmarshal([]byte(cur.Spec), &a); err == nil {
+				st.Domain = a.Domain
+			}
 		}
 		out = append(out, st)
 	}
@@ -148,6 +154,16 @@ func (srv *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func (srv *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	deps, err := srv.store.DeploymentsForApp(name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, deps)
 }
 
 func (srv *Server) handleDelete(w http.ResponseWriter, r *http.Request) {

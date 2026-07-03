@@ -127,6 +127,74 @@ func TestRollbackEndpoint(t *testing.T) {
 	}
 }
 
+func TestHistoryEndpoint(t *testing.T) {
+	ts, _ := newTestServer(t)
+	body1, _ := json.Marshal(spec.App{Name: "blog", Image: "img:a", Port: 8080, Node: "local"})
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body1))
+	if err != nil {
+		t.Fatalf("POST /apply v1: %v", err)
+	}
+	resp.Body.Close()
+
+	body2, _ := json.Marshal(spec.App{Name: "blog", Image: "img:b", Port: 8080, Node: "local"})
+	resp, err = http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body2))
+	if err != nil {
+		t.Fatalf("POST /apply v2: %v", err)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Get(ts.URL + "/apps/blog/history")
+	if err != nil {
+		t.Fatalf("GET /apps/blog/history: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, b)
+	}
+	var deps []store.Deployment
+	if err := json.NewDecoder(resp.Body).Decode(&deps); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(deps) < 2 {
+		t.Fatalf("history = %+v, want >= 2 entries", deps)
+	}
+	if deps[0].Image != "img:b" {
+		t.Errorf("deps[0].Image = %q, want img:b (newest first)", deps[0].Image)
+	}
+	if deps[1].Image != "img:a" {
+		t.Errorf("deps[1].Image = %q, want img:a", deps[1].Image)
+	}
+	for _, d := range deps {
+		if d.App != "blog" {
+			t.Errorf("deployment app = %q, want blog", d.App)
+		}
+	}
+}
+
+func TestAppsIncludesDomain(t *testing.T) {
+	ts, _ := newTestServer(t)
+	body, _ := json.Marshal(spec.App{Name: "blog", Image: "img:1", Port: 8080, Node: "local", Domain: "blog.example.com"})
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /apply: %v", err)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Get(ts.URL + "/apps")
+	if err != nil {
+		t.Fatalf("GET /apps: %v", err)
+	}
+	defer resp.Body.Close()
+	var apps []AppStatus
+	if err := json.NewDecoder(resp.Body).Decode(&apps); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(apps) != 1 || apps[0].Domain != "blog.example.com" {
+		t.Fatalf("apps = %+v, want domain blog.example.com", apps)
+	}
+}
+
 func TestDeleteEndpoint(t *testing.T) {
 	ts, f := newTestServer(t)
 	body, _ := json.Marshal(spec.App{Name: "blog", Image: "img:1", Port: 8080, Node: "local"})

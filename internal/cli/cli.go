@@ -38,6 +38,8 @@ func Run(args []string) int {
 		return runRm(args[1:])
 	case "rollback":
 		return runRollback(args[1:])
+	case "history":
+		return runHistory(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
 		return 2
@@ -62,6 +64,10 @@ func runDaemon() int {
 	defer s.Close()
 
 	r := router.NewCaddyRouter(n, config.DataDir())
+	if err := r.EnsureUp(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, "router: failed to bring up Caddy:", err)
+		return 1
+	}
 	srv := api.New(reconciler.New(n, r, s), s, n)
 
 	sock := config.SocketPath()
@@ -111,9 +117,26 @@ func runLs() int {
 		fmt.Fprintln(os.Stderr, "ls:", err)
 		return 1
 	}
-	fmt.Printf("%-20s %-10s %s\n", "APP", "STATUS", "IMAGE")
+	fmt.Printf("%-20s %-10s %-30s %s\n", "APP", "STATUS", "DOMAIN", "IMAGE")
 	for _, a := range apps {
-		fmt.Printf("%-20s %-10s %s\n", a.Name, a.Status, a.Image)
+		fmt.Printf("%-20s %-10s %-30s %s\n", a.Name, a.Status, a.Domain, a.Image)
+	}
+	return 0
+}
+
+func runHistory(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: lwd history <app>")
+		return 2
+	}
+	deps, err := newClient().History(context.Background(), args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "history:", err)
+		return 1
+	}
+	fmt.Printf("%-6s %-10s %-30s %s\n", "ID", "STATUS", "IMAGE", "CREATED")
+	for _, d := range deps {
+		fmt.Printf("%-6d %-10s %-30s %s\n", d.ID, d.Status, d.Image, d.CreatedAt.Format("2006-01-02 15:04:05"))
 	}
 	return 0
 }
