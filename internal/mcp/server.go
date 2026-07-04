@@ -66,6 +66,10 @@ func (s *Server) registerTools(srv *sdk.Server) {
 	s.registerLwdStatus(srv)
 	s.registerLwdLogs(srv)
 	s.registerLwdHistory(srv)
+	s.registerLwdApply(srv)
+	s.registerLwdDeployGit(srv)
+	s.registerLwdRollback(srv)
+	s.registerLwdRemove(srv)
 }
 
 // Serve runs the MCP server over stdio until the client disconnects or ctx

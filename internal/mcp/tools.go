@@ -10,6 +10,7 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"lwd/internal/api"
+	"lwd/internal/spec"
 	"lwd/internal/store"
 )
 
@@ -175,5 +176,205 @@ func (s *Server) registerLwdList(srv *sdk.Server) {
 			return nil, lwdListOutput{}, err
 		}
 		return nil, lwdListOutput{Apps: apps}, nil
+	})
+}
+
+// lwdDeploymentOutput is the structured result shared by every tool that
+// triggers or reports a deployment (lwd_apply, lwd_deploy_git,
+// lwd_rollback): the essentials a caller needs to know the outcome, without
+// the internal Spec/Compose snapshots store.Deployment carries for rollback.
+type lwdDeploymentOutput struct {
+	Name        string `json:"name"`
+	Image       string `json:"image"`
+	Status      string `json:"status"`
+	ContainerID string `json:"container_id"`
+}
+
+func deploymentOutput(d *store.Deployment) lwdDeploymentOutput {
+	return lwdDeploymentOutput{
+		Name:        d.App,
+		Image:       d.Image,
+		Status:      d.Status,
+		ContainerID: d.ContainerID,
+	}
+}
+
+// lwdApplyInput is the input of lwd_apply. Exactly one of Dir or Toml must
+// be set.
+type lwdApplyInput struct {
+	Dir  string `json:"dir,omitempty" jsonschema:"local directory containing an lwd.toml to deploy (mutually exclusive with toml)"`
+	Toml string `json:"toml,omitempty" jsonschema:"inline lwd.toml document to deploy (mutually exclusive with dir)"`
+}
+
+// registerLwdApply adds the lwd_apply tool: deploy an app from either a
+// local directory's lwd.toml or an inline toml document. This mutates live
+// state (it calls the daemon's Apply), so the MCP host should confirm with
+// the user before invoking it.
+func (s *Server) registerLwdApply(srv *sdk.Server) {
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_apply",
+		Description: "Deploy an app from an lwd.toml, either read from a local directory (dir) or supplied inline (toml). Exactly one of dir or toml is required.",
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdApplyInput) (*sdk.CallToolResult, lwdDeploymentOutput, error) {
+		haveDir := in.Dir != ""
+		haveToml := in.Toml != ""
+		if haveDir == haveToml {
+			return nil, lwdDeploymentOutput{}, fmt.Errorf("exactly one of dir or toml is required")
+		}
+
+		var (
+			app *spec.App
+			err error
+		)
+		if haveToml {
+			app, err = spec.Parse([]byte(in.Toml))
+		} else {
+			app, err = spec.Load(in.Dir)
+		}
+		if err != nil {
+			return nil, lwdDeploymentOutput{}, err
+		}
+		if err := app.Validate(); err != nil {
+			return nil, lwdDeploymentOutput{}, err
+		}
+
+		dep, err := s.client.Apply(ctx, app)
+		if err != nil {
+			return nil, lwdDeploymentOutput{}, err
+		}
+		return nil, deploymentOutput(dep), nil
+	})
+}
+
+// lwdDeployGitServiceInput mirrors spec.Service for the lwd_deploy_git tool's
+// services argument.
+type lwdDeployGitServiceInput struct {
+	Name    string            `json:"name" jsonschema:"the service name"`
+	Image   string            `json:"image" jsonschema:"the service's container image"`
+	Command string            `json:"command,omitempty" jsonschema:"override command for the service's container"`
+	Env     map[string]string `json:"env,omitempty" jsonschema:"plain (non-secret) environment variables for the service"`
+	Secrets []string          `json:"secrets,omitempty" jsonschema:"names of previously-set secrets to inject as environment variables"`
+	Volume  string            `json:"volume,omitempty" jsonschema:"named volume to mount for persistent data"`
+}
+
+// lwdDeployGitInput is the input of lwd_deploy_git.
+type lwdDeployGitInput struct {
+	URL        string                     `json:"url" jsonschema:"the git remote URL to build from"`
+	Ref        string                     `json:"ref,omitempty" jsonschema:"the git ref (branch, tag, or commit) to build; defaults to main"`
+	Dockerfile string                     `json:"dockerfile,omitempty" jsonschema:"path to the Dockerfile within the repo; defaults to Dockerfile"`
+	Name       string                     `json:"name" jsonschema:"the app name"`
+	Domain     string                     `json:"domain" jsonschema:"the domain to route to this app"`
+	Port       int                        `json:"port" jsonschema:"the container port the app listens on"`
+	Services   []lwdDeployGitServiceInput `json:"services,omitempty" jsonschema:"optional backing services (e.g. a database) to deploy alongside the app"`
+}
+
+const (
+	defaultGitRef        = "main"
+	defaultGitDockerfile = "Dockerfile"
+)
+
+// registerLwdDeployGit adds the lwd_deploy_git tool: build a spec.App for a
+// git-sourced deploy from discrete fields (rather than requiring the caller
+// to hand-author an lwd.toml), validate it, and apply it. This mutates live
+// state (it calls the daemon's Apply), so the MCP host should confirm with
+// the user before invoking it.
+func (s *Server) registerLwdDeployGit(srv *sdk.Server) {
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_deploy_git",
+		Description: "Deploy an app built from a git repository: clone url at ref, build dockerfile, and route domain:port. Optionally deploy backing services alongside it.",
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdDeployGitInput) (*sdk.CallToolResult, lwdDeploymentOutput, error) {
+		ref := in.Ref
+		if ref == "" {
+			ref = defaultGitRef
+		}
+		dockerfile := in.Dockerfile
+		if dockerfile == "" {
+			dockerfile = defaultGitDockerfile
+		}
+
+		var services []spec.Service
+		for _, svc := range in.Services {
+			services = append(services, spec.Service{
+				Name:    svc.Name,
+				Image:   svc.Image,
+				Command: svc.Command,
+				Env:     svc.Env,
+				Secrets: svc.Secrets,
+				Volume:  svc.Volume,
+			})
+		}
+
+		app := &spec.App{
+			Name:   in.Name,
+			Domain: in.Domain,
+			Port:   in.Port,
+			Git: &spec.Git{
+				URL: in.URL,
+				Ref: ref,
+			},
+			Build: &spec.Build{
+				Dockerfile: dockerfile,
+			},
+			Services: services,
+		}
+		if err := app.Validate(); err != nil {
+			return nil, lwdDeploymentOutput{}, err
+		}
+
+		dep, err := s.client.Apply(ctx, app)
+		if err != nil {
+			return nil, lwdDeploymentOutput{}, err
+		}
+		return nil, deploymentOutput(dep), nil
+	})
+}
+
+// lwdRollbackInput is the input of lwd_rollback.
+type lwdRollbackInput struct {
+	Name string `json:"name" jsonschema:"the app name"`
+}
+
+// registerLwdRollback adds the lwd_rollback tool: revert an app to its
+// previous deployment. This mutates live state (it calls the daemon's
+// Rollback), so the MCP host should confirm with the user before invoking
+// it.
+func (s *Server) registerLwdRollback(srv *sdk.Server) {
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_rollback",
+		Description: "Roll back a lwd-managed app to its previous deployment.",
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdRollbackInput) (*sdk.CallToolResult, lwdDeploymentOutput, error) {
+		dep, err := s.client.Rollback(ctx, in.Name)
+		if err != nil {
+			return nil, lwdDeploymentOutput{}, err
+		}
+		return nil, deploymentOutput(dep), nil
+	})
+}
+
+// lwdRemoveInput is the input of lwd_remove.
+type lwdRemoveInput struct {
+	Name string `json:"name" jsonschema:"the app name"`
+}
+
+// lwdRemoveOutput is the structured result of lwd_remove.
+type lwdRemoveOutput struct {
+	Name    string `json:"name"`
+	Removed bool   `json:"removed"`
+}
+
+// registerLwdRemove adds the lwd_remove tool: permanently stop and remove a
+// lwd-managed app. Annotated destructiveHint so the MCP host prompts for
+// confirmation before calling it; unlike the read tools, it is NOT annotated
+// readOnlyHint.
+func (s *Server) registerLwdRemove(srv *sdk.Server) {
+	destructive := true
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_remove",
+		Description: "Permanently stop and remove a lwd-managed app. This cannot be undone.",
+		Annotations: &sdk.ToolAnnotations{DestructiveHint: &destructive},
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdRemoveInput) (*sdk.CallToolResult, lwdRemoveOutput, error) {
+		if err := s.client.Remove(ctx, in.Name); err != nil {
+			return nil, lwdRemoveOutput{}, err
+		}
+		return nil, lwdRemoveOutput{Name: in.Name, Removed: true}, nil
 	})
 }

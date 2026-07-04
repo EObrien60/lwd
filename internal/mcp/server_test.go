@@ -3,6 +3,9 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -269,5 +272,249 @@ func TestServerConstructs(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("srv.Run: %v", err)
+	}
+}
+
+const validSingleServiceToml = `
+name = "web"
+image = "nginx:latest"
+domain = "web.example.com"
+port = 8080
+`
+
+func TestToolApplyToml(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	// Valid single-service toml: Apply is called with the parsed app.
+	res := callTool(t, cs, "lwd_apply", map[string]any{"toml": validSingleServiceToml})
+	if res.IsError {
+		t.Fatalf("lwd_apply(valid toml) returned tool error: %+v", res.Content)
+	}
+	if len(fc.applied) != 1 {
+		t.Fatalf("expected Apply called once, got %d", len(fc.applied))
+	}
+	got := fc.applied[0]
+	if got.Name != "web" || got.Image != "nginx:latest" || got.Domain != "web.example.com" || got.Port != 8080 {
+		t.Errorf("unexpected applied app: %+v", got)
+	}
+	var out lwdDeploymentOutput
+	decodeStructured(t, res, &out)
+	if out.Name != "web" || out.Image != "nginx:latest" || out.Status != store.StatusRunning {
+		t.Errorf("unexpected apply output: %+v", out)
+	}
+
+	// Invalid (malformed) toml -> tool error, Apply not called again.
+	res = callTool(t, cs, "lwd_apply", map[string]any{"toml": "this is not [ valid toml"})
+	if !res.IsError {
+		t.Errorf("lwd_apply(malformed toml) should be a tool error, got %+v", res)
+	}
+	if len(fc.applied) != 1 {
+		t.Errorf("Apply should not have been called for malformed toml, got %d calls", len(fc.applied))
+	}
+
+	// Valid toml syntax but missing image+port -> Validate error, tool error.
+	res = callTool(t, cs, "lwd_apply", map[string]any{"toml": `name = "web"`})
+	if !res.IsError {
+		t.Errorf("lwd_apply(missing image/port) should be a tool error, got %+v", res)
+	}
+	if len(fc.applied) != 1 {
+		t.Errorf("Apply should not have been called for an invalid app, got %d calls", len(fc.applied))
+	}
+
+	// Both dir and toml -> tool error.
+	res = callTool(t, cs, "lwd_apply", map[string]any{"toml": validSingleServiceToml, "dir": "/tmp/whatever"})
+	if !res.IsError {
+		t.Errorf("lwd_apply(dir+toml) should be a tool error, got %+v", res)
+	}
+
+	// Neither dir nor toml -> tool error.
+	res = callTool(t, cs, "lwd_apply", map[string]any{})
+	if !res.IsError {
+		t.Errorf("lwd_apply(neither) should be a tool error, got %+v", res)
+	}
+
+	if len(fc.applied) != 1 {
+		t.Errorf("Apply should have been called exactly once overall, got %d", len(fc.applied))
+	}
+}
+
+func TestToolApplyDir(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "lwd.toml"), []byte(validSingleServiceToml), 0o644); err != nil {
+		t.Fatalf("write lwd.toml: %v", err)
+	}
+
+	res := callTool(t, cs, "lwd_apply", map[string]any{"dir": dir})
+	if res.IsError {
+		t.Fatalf("lwd_apply(dir) returned tool error: %+v", res.Content)
+	}
+	if len(fc.applied) != 1 || fc.applied[0].Name != "web" {
+		t.Fatalf("expected Apply called once with the loaded app, got %+v", fc.applied)
+	}
+
+	// A directory with no lwd.toml -> tool error.
+	res = callTool(t, cs, "lwd_apply", map[string]any{"dir": t.TempDir()})
+	if !res.IsError {
+		t.Errorf("lwd_apply(dir without lwd.toml) should be a tool error, got %+v", res)
+	}
+}
+
+func TestToolDeployGit(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	lr, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	if tool := findTool(lr.Tools, "lwd_deploy_git"); tool == nil {
+		t.Fatalf("lwd_deploy_git tool not registered; got %+v", lr.Tools)
+	}
+
+	res := callTool(t, cs, "lwd_deploy_git", map[string]any{
+		"url":    "https://github.com/example/app.git",
+		"name":   "app",
+		"domain": "app.example.com",
+		"port":   3000,
+		"services": []map[string]any{
+			{
+				"name":  "redis",
+				"image": "redis:7",
+				"env":   map[string]any{"FOO": "bar"},
+			},
+		},
+	})
+	if res.IsError {
+		t.Fatalf("lwd_deploy_git(valid) returned tool error: %+v", res.Content)
+	}
+	if len(fc.applied) != 1 {
+		t.Fatalf("expected Apply called once, got %d", len(fc.applied))
+	}
+	got := fc.applied[0]
+	if got.Git == nil || got.Git.URL != "https://github.com/example/app.git" {
+		t.Errorf("expected Git.URL set, got %+v", got.Git)
+	}
+	if got.Git.Ref != "main" {
+		t.Errorf("expected Git.Ref to default to \"main\", got %q", got.Git.Ref)
+	}
+	if got.Build == nil || got.Build.Dockerfile != "Dockerfile" {
+		t.Errorf("expected Build.Dockerfile to default to \"Dockerfile\", got %+v", got.Build)
+	}
+	if got.Domain != "app.example.com" || got.Port != 3000 || got.Name != "app" {
+		t.Errorf("unexpected app fields: %+v", got)
+	}
+	if len(got.Services) != 1 || got.Services[0].Name != "redis" || got.Services[0].Image != "redis:7" || got.Services[0].Env["FOO"] != "bar" {
+		t.Errorf("unexpected services: %+v", got.Services)
+	}
+
+	// Invalid: command-executing git transport -> Validate rejects before Apply.
+	res = callTool(t, cs, "lwd_deploy_git", map[string]any{
+		"url":    "ext::sh -c 'touch pwned'",
+		"name":   "evil",
+		"domain": "evil.example.com",
+		"port":   80,
+	})
+	if !res.IsError {
+		t.Errorf("lwd_deploy_git(ext:: url) should be a tool error, got %+v", res)
+	}
+	if len(fc.applied) != 1 {
+		t.Errorf("Apply should not have been called for an invalid git spec, got %d calls", len(fc.applied))
+	}
+
+	// Invalid: missing domain -> Validate rejects before Apply.
+	res = callTool(t, cs, "lwd_deploy_git", map[string]any{
+		"url":  "https://github.com/example/app.git",
+		"name": "nodomain",
+		"port": 80,
+	})
+	if !res.IsError {
+		t.Errorf("lwd_deploy_git(missing domain) should be a tool error, got %+v", res)
+	}
+	if len(fc.applied) != 1 {
+		t.Errorf("Apply should not have been called for a missing domain, got %d calls", len(fc.applied))
+	}
+}
+
+func TestToolDeployGitCustomRefAndDockerfile(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	res := callTool(t, cs, "lwd_deploy_git", map[string]any{
+		"url":        "https://github.com/example/app.git",
+		"ref":        "release/v2",
+		"dockerfile": "docker/Dockerfile.prod",
+		"name":       "app",
+		"domain":     "app.example.com",
+		"port":       3000,
+	})
+	if res.IsError {
+		t.Fatalf("lwd_deploy_git(custom ref/dockerfile) returned tool error: %+v", res.Content)
+	}
+	got := fc.applied[0]
+	if got.Git.Ref != "release/v2" {
+		t.Errorf("expected Git.Ref %q, got %q", "release/v2", got.Git.Ref)
+	}
+	if got.Build.Dockerfile != "docker/Dockerfile.prod" {
+		t.Errorf("expected Build.Dockerfile %q, got %q", "docker/Dockerfile.prod", got.Build.Dockerfile)
+	}
+}
+
+func TestToolRollback(t *testing.T) {
+	fc := newFakeClient()
+	fc.rollbackResult = &store.Deployment{App: "web", Image: "nginx:1.24", Status: store.StatusRunning, ContainerID: "abc123"}
+	cs := connectTestServer(t, fc)
+
+	res := callTool(t, cs, "lwd_rollback", map[string]any{"name": "web"})
+	if res.IsError {
+		t.Fatalf("lwd_rollback(web) returned tool error: %+v", res.Content)
+	}
+	var out lwdDeploymentOutput
+	decodeStructured(t, res, &out)
+	if out.Name != "web" || out.Image != "nginx:1.24" || out.Status != store.StatusRunning || out.ContainerID != "abc123" {
+		t.Errorf("unexpected rollback output: %+v", out)
+	}
+
+	fc.rollbackErr = fmt.Errorf("rollback failed")
+	res = callTool(t, cs, "lwd_rollback", map[string]any{"name": "web"})
+	if !res.IsError {
+		t.Errorf("lwd_rollback should surface a daemon error as a tool error, got %+v", res)
+	}
+}
+
+func TestToolRemove(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	lr, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	tool := findTool(lr.Tools, "lwd_remove")
+	if tool == nil {
+		t.Fatalf("lwd_remove tool not registered; got %+v", lr.Tools)
+	}
+	if tool.Annotations == nil || tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint {
+		t.Errorf("lwd_remove should be annotated destructiveHint=true, got %+v", tool.Annotations)
+	}
+	if tool.Annotations.ReadOnlyHint {
+		t.Errorf("lwd_remove must not be annotated readOnlyHint=true, got %+v", tool.Annotations)
+	}
+
+	res := callTool(t, cs, "lwd_remove", map[string]any{"name": "web"})
+	if res.IsError {
+		t.Fatalf("lwd_remove(web) returned tool error: %+v", res.Content)
+	}
+	if len(fc.removed) != 1 || fc.removed[0] != "web" {
+		t.Fatalf("expected Remove called with \"web\", got %+v", fc.removed)
+	}
+
+	fc.removeErr = fmt.Errorf("remove failed")
+	res = callTool(t, cs, "lwd_remove", map[string]any{"name": "missing"})
+	if !res.IsError {
+		t.Errorf("lwd_remove should surface a daemon error as a tool error, got %+v", res)
 	}
 }
