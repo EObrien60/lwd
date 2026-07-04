@@ -161,6 +161,15 @@ func (f *Fake) ContainerHealth(ctx context.Context, id string) (string, string, 
 	return state, dockerHealth, nil
 }
 
+// ConnectContainerToNetwork records the call and always succeeds; the Fake has
+// no real networking to manage. It is idempotent by design.
+func (f *Fake) ConnectContainerToNetwork(ctx context.Context, containerID, network string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("ConnectContainerToNetwork:" + containerID + ":" + network)
+	return nil
+}
+
 func matches(have, want map[string]string) bool {
 	for k, v := range want {
 		if have[k] != v {

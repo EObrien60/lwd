@@ -300,5 +300,21 @@ func (l *Local) ContainerHealth(ctx context.Context, id string) (string, string,
 	return inspect.State.Status, dockerHealth, nil
 }
 
+// ConnectContainerToNetwork attaches a container to a network. Idempotent: if
+// the container is already on the network, the "already exists" or "endpoint
+// already exists in network" error is treated as success.
+func (l *Local) ConnectContainerToNetwork(ctx context.Context, containerID, network string) error {
+	err := l.cli.NetworkConnect(ctx, network, containerID, nil)
+	if err == nil {
+		return nil
+	}
+	// Treat "endpoint already exists in this network" as idempotent success.
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "already exists") || strings.Contains(errMsg, "endpoint already exists") {
+		return nil
+	}
+	return fmt.Errorf("connect container %s to network %s: %w", containerID, network, err)
+}
+
 // Compile-time assertion that Local implements Node.
 var _ Node = (*Local)(nil)
