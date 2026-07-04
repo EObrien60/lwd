@@ -352,19 +352,258 @@
     <!-- Deploy modal                                                      -->
     <!-- ================================================================ -->
     <div class="modal-veil" x-show="deploy.open" x-cloak x-transition @keydown.escape.window="closeDeploy()">
-      <div class="modal" @click.outside="closeDeploy()" role="dialog" aria-modal="true" aria-label="Deploy">
+      <div class="modal" :class="{ 'modal--wide': deploy.mode === 'create' && deploy.tab !== 'paste' }" @click.outside="closeDeploy()" role="dialog" aria-modal="true" aria-label="Deploy">
         <div class="modal__head">
           <h2 x-text="deploy.mode === 'edit' ? 'Edit &amp; apply' : 'Deploy an app'"></h2>
           <button type="button" class="icon-btn" @click="closeDeploy()" aria-label="Close">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5l10 10M15 5 5 15"/></svg>
           </button>
         </div>
-        <p class="hint">Paste an <code>lwd.toml</code> document. Single-service apps deploy fully from here; compose apps also need their compose file present on the daemon host.</p>
-        <textarea x-model="deploy.toml" spellcheck="false" placeholder="name = &quot;my-app&quot;&#10;image = &quot;ghcr.io/me/my-app:latest&quot;&#10;domain = &quot;my-app.example.com&quot;&#10;port = 8080" :disabled="deploy.busy"></textarea>
+
+        <!-- Source tabs (create mode only — "Edit & apply" always pastes raw toml) -->
+        <nav class="tabs" x-show="deploy.mode === 'create'" x-cloak>
+          <button type="button" class="tab" :class="{ active: deploy.tab === 'git' }" @click="deploy.tab = 'git'">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="M10 3v2.2M10 14.8V17M3 10h2.2M14.8 10H17"/></svg>
+            From Git
+          </button>
+          <button type="button" class="tab" :class="{ active: deploy.tab === 'builder' }" @click="deploy.tab = 'builder'">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="6" width="13" height="10" rx="1.5"/><path d="M7 6V4.5A1.5 1.5 0 0 1 8.5 3h3A1.5 1.5 0 0 1 13 4.5V6"/></svg>
+            Builder
+          </button>
+          <button type="button" class="tab" :class="{ active: deploy.tab === 'paste' }" @click="deploy.tab = 'paste'">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5h6l3 3v10a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1v-12a1 1 0 0 1 1-1z"/><path d="M7.5 9h5M7.5 12h5"/></svg>
+            Paste
+          </button>
+        </nav>
+
+        <!-- From Git -->
+        <template x-if="deploy.mode === 'create' && deploy.tab === 'git'">
+          <div class="modal__body-split">
+            <div class="modal__form">
+              <div class="subhead">Source</div>
+              <div class="field">
+                <label for="git-url">Git URL</label>
+                <input id="git-url" x-model="deploy.git.url" placeholder="https://github.com/me/myapp" autocomplete="off" :disabled="deploy.busy">
+              </div>
+              <div class="form-row">
+                <div class="field">
+                  <label for="git-ref">Ref</label>
+                  <input id="git-ref" x-model="deploy.git.ref" placeholder="main" autocomplete="off" :disabled="deploy.busy">
+                </div>
+                <div class="field">
+                  <label for="git-subdir">Subdir (optional)</label>
+                  <input id="git-subdir" x-model="deploy.git.subdir" placeholder="." autocomplete="off" :disabled="deploy.busy">
+                </div>
+              </div>
+              <div class="field">
+                <label for="git-dockerfile">Dockerfile</label>
+                <input id="git-dockerfile" x-model="deploy.git.dockerfile" placeholder="Dockerfile" autocomplete="off" :disabled="deploy.busy">
+              </div>
+
+              <div class="subhead">App</div>
+              <div class="field">
+                <label for="git-name">Name</label>
+                <input id="git-name" x-model="deploy.git.name" placeholder="myapp" autocomplete="off" :disabled="deploy.busy" required>
+              </div>
+              <div class="form-row">
+                <div class="field" style="flex:2;">
+                  <label for="git-domain">Domain</label>
+                  <input id="git-domain" x-model="deploy.git.domain" placeholder="myapp.example.com" autocomplete="off" :disabled="deploy.busy" required>
+                </div>
+                <div class="field">
+                  <label for="git-port">Port</label>
+                  <input id="git-port" type="number" min="1" max="65535" x-model="deploy.git.port" placeholder="8080" :disabled="deploy.busy" required>
+                </div>
+              </div>
+
+              <div class="subhead">Environment</div>
+              <template x-for="(row, i) in deploy.git.env" :key="i">
+                <div class="kv-row">
+                  <input x-model="row.key" placeholder="KEY" autocomplete="off" :disabled="deploy.busy">
+                  <input x-model="row.value" placeholder="value" autocomplete="off" :disabled="deploy.busy">
+                  <button type="button" class="row-remove" @click="deploy.git.env.splice(i, 1)" aria-label="Remove env var">×</button>
+                </div>
+              </template>
+              <button type="button" class="btn btn-ghost btn-sm add-row-btn" @click="deploy.git.env.push(newEnvRow())" :disabled="deploy.busy">+ Add env var</button>
+
+              <div class="subhead">Secrets</div>
+              <template x-for="(name, i) in deploy.git.secrets" :key="i">
+                <div class="kv-row">
+                  <input x-model="deploy.git.secrets[i]" placeholder="SECRET_NAME" autocomplete="off" :disabled="deploy.busy">
+                  <button type="button" class="row-remove" @click="deploy.git.secrets.splice(i, 1)" aria-label="Remove secret">×</button>
+                </div>
+              </template>
+              <button type="button" class="btn btn-ghost btn-sm add-row-btn" @click="deploy.git.secrets.push('')" :disabled="deploy.busy">+ Add secret</button>
+
+              <div class="subhead">Backing services</div>
+              <p class="hint" style="margin:0 0 10px;">Pinned containers (Postgres, Redis, MinIO…) started alongside this app — never blue-greened or torn down on redeploy.</p>
+              <template x-for="(svc, si) in deploy.git.services" :key="si">
+                <div class="service-card">
+                  <div class="service-card__head">
+                    <span x-text="svc.name ? svc.name : ('Backing service #' + (si + 1))"></span>
+                    <button type="button" class="row-remove" @click="deploy.git.services.splice(si, 1)" aria-label="Remove service">×</button>
+                  </div>
+                  <div class="form-row">
+                    <div class="field">
+                      <label>Name</label>
+                      <input x-model="svc.name" placeholder="db" autocomplete="off" :disabled="deploy.busy">
+                    </div>
+                    <div class="field">
+                      <label>Image</label>
+                      <input x-model="svc.image" placeholder="postgres:16" autocomplete="off" :disabled="deploy.busy">
+                    </div>
+                  </div>
+                  <div class="form-row">
+                    <div class="field">
+                      <label>Command (optional)</label>
+                      <input x-model="svc.command" placeholder="server /data" autocomplete="off" :disabled="deploy.busy">
+                    </div>
+                    <div class="field">
+                      <label>Volume (optional)</label>
+                      <input x-model="svc.volume" placeholder="db-data:/var/lib/postgresql/data" autocomplete="off" :disabled="deploy.busy">
+                    </div>
+                  </div>
+                  <div class="subhead subhead-sm">Env</div>
+                  <template x-for="(row, ei) in svc.env" :key="ei">
+                    <div class="kv-row">
+                      <input x-model="row.key" placeholder="KEY" autocomplete="off" :disabled="deploy.busy">
+                      <input x-model="row.value" placeholder="value" autocomplete="off" :disabled="deploy.busy">
+                      <button type="button" class="row-remove" @click="svc.env.splice(ei, 1)" aria-label="Remove env var">×</button>
+                    </div>
+                  </template>
+                  <button type="button" class="btn btn-ghost btn-sm add-row-btn" @click="svc.env.push(newEnvRow())" :disabled="deploy.busy">+ Add env var</button>
+                  <div class="subhead subhead-sm">Secrets</div>
+                  <template x-for="(name, ei) in svc.secrets" :key="ei">
+                    <div class="kv-row">
+                      <input x-model="svc.secrets[ei]" placeholder="SECRET_NAME" autocomplete="off" :disabled="deploy.busy">
+                      <button type="button" class="row-remove" @click="svc.secrets.splice(ei, 1)" aria-label="Remove secret">×</button>
+                    </div>
+                  </template>
+                  <button type="button" class="btn btn-ghost btn-sm add-row-btn" @click="svc.secrets.push('')" :disabled="deploy.busy">+ Add secret</button>
+                </div>
+              </template>
+              <button type="button" class="btn btn-ghost add-row-btn" @click="deploy.git.services.push(newServiceRow())" :disabled="deploy.busy">+ Add backing service</button>
+            </div>
+            <div class="modal__preview">
+              <div class="subhead" style="margin-top:0; padding-top:0; border-top:none;">lwd.toml preview</div>
+              <pre class="code-block" x-text="gitPreviewToml"></pre>
+            </div>
+          </div>
+        </template>
+
+        <!-- Builder -->
+        <template x-if="deploy.mode === 'create' && deploy.tab === 'builder'">
+          <div class="modal__body-split">
+            <div class="modal__form">
+              <div class="subhead">Image</div>
+              <div class="field">
+                <label for="builder-image">Image</label>
+                <input id="builder-image" x-model="deploy.builder.image" placeholder="ghcr.io/me/my-app:latest" autocomplete="off" :disabled="deploy.busy">
+              </div>
+
+              <div class="subhead">App</div>
+              <div class="field">
+                <label for="builder-name">Name</label>
+                <input id="builder-name" x-model="deploy.builder.name" placeholder="myapp" autocomplete="off" :disabled="deploy.busy" required>
+              </div>
+              <div class="form-row">
+                <div class="field" style="flex:2;">
+                  <label for="builder-domain">Domain</label>
+                  <input id="builder-domain" x-model="deploy.builder.domain" placeholder="myapp.example.com" autocomplete="off" :disabled="deploy.busy" required>
+                </div>
+                <div class="field">
+                  <label for="builder-port">Port</label>
+                  <input id="builder-port" type="number" min="1" max="65535" x-model="deploy.builder.port" placeholder="8080" :disabled="deploy.busy" required>
+                </div>
+              </div>
+
+              <div class="subhead">Environment</div>
+              <template x-for="(row, i) in deploy.builder.env" :key="i">
+                <div class="kv-row">
+                  <input x-model="row.key" placeholder="KEY" autocomplete="off" :disabled="deploy.busy">
+                  <input x-model="row.value" placeholder="value" autocomplete="off" :disabled="deploy.busy">
+                  <button type="button" class="row-remove" @click="deploy.builder.env.splice(i, 1)" aria-label="Remove env var">×</button>
+                </div>
+              </template>
+              <button type="button" class="btn btn-ghost btn-sm add-row-btn" @click="deploy.builder.env.push(newEnvRow())" :disabled="deploy.busy">+ Add env var</button>
+
+              <div class="subhead">Secrets</div>
+              <template x-for="(name, i) in deploy.builder.secrets" :key="i">
+                <div class="kv-row">
+                  <input x-model="deploy.builder.secrets[i]" placeholder="SECRET_NAME" autocomplete="off" :disabled="deploy.busy">
+                  <button type="button" class="row-remove" @click="deploy.builder.secrets.splice(i, 1)" aria-label="Remove secret">×</button>
+                </div>
+              </template>
+              <button type="button" class="btn btn-ghost btn-sm add-row-btn" @click="deploy.builder.secrets.push('')" :disabled="deploy.busy">+ Add secret</button>
+
+              <div class="subhead">Backing services</div>
+              <p class="hint" style="margin:0 0 10px;">Pinned containers (Postgres, Redis, MinIO…) started alongside this app — never blue-greened or torn down on redeploy.</p>
+              <template x-for="(svc, si) in deploy.builder.services" :key="si">
+                <div class="service-card">
+                  <div class="service-card__head">
+                    <span x-text="svc.name ? svc.name : ('Backing service #' + (si + 1))"></span>
+                    <button type="button" class="row-remove" @click="deploy.builder.services.splice(si, 1)" aria-label="Remove service">×</button>
+                  </div>
+                  <div class="form-row">
+                    <div class="field">
+                      <label>Name</label>
+                      <input x-model="svc.name" placeholder="db" autocomplete="off" :disabled="deploy.busy">
+                    </div>
+                    <div class="field">
+                      <label>Image</label>
+                      <input x-model="svc.image" placeholder="postgres:16" autocomplete="off" :disabled="deploy.busy">
+                    </div>
+                  </div>
+                  <div class="form-row">
+                    <div class="field">
+                      <label>Command (optional)</label>
+                      <input x-model="svc.command" placeholder="server /data" autocomplete="off" :disabled="deploy.busy">
+                    </div>
+                    <div class="field">
+                      <label>Volume (optional)</label>
+                      <input x-model="svc.volume" placeholder="db-data:/var/lib/postgresql/data" autocomplete="off" :disabled="deploy.busy">
+                    </div>
+                  </div>
+                  <div class="subhead subhead-sm">Env</div>
+                  <template x-for="(row, ei) in svc.env" :key="ei">
+                    <div class="kv-row">
+                      <input x-model="row.key" placeholder="KEY" autocomplete="off" :disabled="deploy.busy">
+                      <input x-model="row.value" placeholder="value" autocomplete="off" :disabled="deploy.busy">
+                      <button type="button" class="row-remove" @click="svc.env.splice(ei, 1)" aria-label="Remove env var">×</button>
+                    </div>
+                  </template>
+                  <button type="button" class="btn btn-ghost btn-sm add-row-btn" @click="svc.env.push(newEnvRow())" :disabled="deploy.busy">+ Add env var</button>
+                  <div class="subhead subhead-sm">Secrets</div>
+                  <template x-for="(name, ei) in svc.secrets" :key="ei">
+                    <div class="kv-row">
+                      <input x-model="svc.secrets[ei]" placeholder="SECRET_NAME" autocomplete="off" :disabled="deploy.busy">
+                      <button type="button" class="row-remove" @click="svc.secrets.splice(ei, 1)" aria-label="Remove secret">×</button>
+                    </div>
+                  </template>
+                  <button type="button" class="btn btn-ghost btn-sm add-row-btn" @click="svc.secrets.push('')" :disabled="deploy.busy">+ Add secret</button>
+                </div>
+              </template>
+              <button type="button" class="btn btn-ghost add-row-btn" @click="deploy.builder.services.push(newServiceRow())" :disabled="deploy.busy">+ Add backing service</button>
+            </div>
+            <div class="modal__preview">
+              <div class="subhead" style="margin-top:0; padding-top:0; border-top:none;">lwd.toml preview</div>
+              <pre class="code-block" x-text="builderPreviewToml"></pre>
+            </div>
+          </div>
+        </template>
+
+        <!-- Paste (also used for "Edit & apply") -->
+        <template x-if="deploy.mode === 'edit' || deploy.tab === 'paste'">
+          <div>
+            <p class="hint">Paste an <code>lwd.toml</code> document. Single-service apps deploy fully from here; compose apps also need their compose file present on the daemon host.</p>
+            <textarea x-model="deploy.toml" spellcheck="false" placeholder="name = &quot;my-app&quot;&#10;image = &quot;ghcr.io/me/my-app:latest&quot;&#10;domain = &quot;my-app.example.com&quot;&#10;port = 8080" :disabled="deploy.busy"></textarea>
+          </div>
+        </template>
+
         <div class="modal__error" x-show="deploy.error" x-cloak x-text="deploy.error"></div>
         <div class="modal__foot">
           <button type="button" class="btn btn-ghost" @click="closeDeploy()">Cancel</button>
-          <button type="button" class="btn btn-signal" @click="submitDeploy()" :disabled="deploy.busy || !deploy.toml.trim()">
+          <button type="button" class="btn btn-signal" @click="submitDeploy()" :disabled="deploySubmitDisabled">
             <span x-text="deploy.busy ? 'Applying…' : 'Apply'"></span>
           </button>
         </div>
