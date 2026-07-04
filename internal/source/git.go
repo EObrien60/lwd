@@ -86,7 +86,7 @@ func (c *CLI) Clone(ctx context.Context, url, ref, dir string) (sha string, err 
 // arbitrary host command supplied via the url — the core of the host-RCE
 // finding this hardens against.
 func gitEnv() []string {
-	return append(os.Environ(), "GIT_ALLOW_PROTOCOL=https:git:ssh:file")
+	return append(os.Environ(), "GIT_ALLOW_PROTOCOL=https:http:git:ssh:file")
 }
 
 // run executes name with args using exec.CommandContext, returning trimmed
