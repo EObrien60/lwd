@@ -169,3 +169,93 @@ func TestLoginSetsCookie(t *testing.T) {
 		t.Fatalf("expected 401 for wrong password, got %d", rec.Code)
 	}
 }
+
+func TestIsSecureRequest(t *testing.T) {
+	key := []byte("test-signing-key")
+	auth := NewAuthenticator(key, "hunter2")
+
+	loginCookie := func(t *testing.T, forwardedProto string) *http.Cookie {
+		t.Helper()
+		form := url.Values{}
+		form.Set("password", "hunter2")
+		req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if forwardedProto != "" {
+			req.Header.Set("X-Forwarded-Proto", forwardedProto)
+		}
+		rec := httptest.NewRecorder()
+		auth.Login(rec, req)
+
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == sessionCookieName {
+				return c
+			}
+		}
+		t.Fatalf("expected lwd_session cookie to be set")
+		return nil
+	}
+
+	// Behind a TLS-terminating proxy (Caddy) that sets X-Forwarded-Proto:
+	// https, the cookie must be marked Secure even though r.TLS is nil.
+	if c := loginCookie(t, "https"); !c.Secure {
+		t.Fatalf("expected Secure=true with X-Forwarded-Proto: https")
+	}
+
+	// Case-insensitive match.
+	if c := loginCookie(t, "HTTPS"); !c.Secure {
+		t.Fatalf("expected Secure=true with X-Forwarded-Proto: HTTPS")
+	}
+
+	// No TLS, no forwarded-proto header (plain-HTTP / SSH-tunnel mode):
+	// Secure must stay off or browsers would refuse to send the cookie.
+	if c := loginCookie(t, ""); c.Secure {
+		t.Fatalf("expected Secure=false without TLS or X-Forwarded-Proto")
+	}
+
+	// Logout must apply the same logic when clearing the cookie.
+	logoutCookie := func(t *testing.T, forwardedProto string) *http.Cookie {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/logout", nil)
+		if forwardedProto != "" {
+			req.Header.Set("X-Forwarded-Proto", forwardedProto)
+		}
+		rec := httptest.NewRecorder()
+		auth.Logout(rec, req)
+
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == sessionCookieName {
+				return c
+			}
+		}
+		t.Fatalf("expected lwd_session cookie to be cleared")
+		return nil
+	}
+
+	if c := logoutCookie(t, "https"); !c.Secure {
+		t.Fatalf("expected Secure=true on logout with X-Forwarded-Proto: https")
+	}
+	if c := logoutCookie(t, ""); c.Secure {
+		t.Fatalf("expected Secure=false on logout without TLS or X-Forwarded-Proto")
+	}
+}
+
+func TestLoadConfigRejectsShortSecret(t *testing.T) {
+	t.Setenv("LWD_WEB_PASSWORD", "hunter2")
+	t.Setenv("LWD_WEB_ADDR", "")
+	t.Setenv("LWD_SOCKET", "")
+
+	t.Setenv("LWD_WEB_SECRET", "short")
+	if _, err := LoadConfig(); err == nil {
+		t.Fatalf("expected error for LWD_WEB_SECRET shorter than 16 bytes")
+	}
+
+	longSecret := "0123456789abcdef" // exactly 16 bytes
+	t.Setenv("LWD_WEB_SECRET", longSecret)
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("expected no error for 16-byte LWD_WEB_SECRET, got %v", err)
+	}
+	if string(cfg.SigningKey) != longSecret {
+		t.Fatalf("expected signing key to be loaded from env, got %q", cfg.SigningKey)
+	}
+}

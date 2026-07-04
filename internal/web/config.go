@@ -27,7 +27,8 @@ type Config struct {
 //   - LWD_WEB_ADDR: listen address (default "127.0.0.1:8079").
 //   - LWD_WEB_PASSWORD: required admin password; error if unset/empty.
 //   - LWD_WEB_SECRET: cookie signing key; if unset, 32 random bytes are
-//     generated (sessions reset on restart).
+//     generated (sessions reset on restart). If set, it must be at least
+//     16 bytes.
 //   - LWD_SOCKET: overrides the daemon socket path from internal/config.
 func LoadConfig() (Config, error) {
 	password := os.Getenv("LWD_WEB_PASSWORD")
@@ -47,6 +48,9 @@ func LoadConfig() (Config, error) {
 
 	var key []byte
 	if secret := os.Getenv("LWD_WEB_SECRET"); secret != "" {
+		if len(secret) < 16 {
+			return Config{}, errors.New("web: LWD_WEB_SECRET must be at least 16 bytes")
+		}
 		key = []byte(secret)
 	} else {
 		key = make([]byte, 32)

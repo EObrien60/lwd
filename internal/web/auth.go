@@ -25,7 +25,6 @@ var publicPaths = []string{
 	"/login",
 	"/logout",
 	"/static/",
-	"/login.html",
 }
 
 // signSession produces a signed session token encoding the given expiry.
@@ -72,6 +71,14 @@ func verifySession(key []byte, cookie string) bool {
 	return time.Unix(expiryUnix, 0).After(time.Now())
 }
 
+// isSecureRequest reports whether the request should be treated as arriving
+// over HTTPS. lwd-web has no built-in TLS; when fronted by a TLS-terminating
+// reverse proxy (e.g. Caddy, per the README), r.TLS is always nil and the
+// proxy instead sets X-Forwarded-Proto: https.
+func isSecureRequest(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
 // checkPassword reports whether provided matches configured, using a
 // constant-time comparison. Empty inputs never match.
 func checkPassword(configured, provided string) bool {
@@ -116,7 +123,7 @@ func (a *Authenticator) Login(w http.ResponseWriter, r *http.Request) {
 		Expires:  expiry,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
+		Secure:   isSecureRequest(r),
 	})
 
 	http.Redirect(w, r, "/", http.StatusSeeOther)
@@ -131,7 +138,7 @@ func (a *Authenticator) Logout(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
+		Secure:   isSecureRequest(r),
 	})
 
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
