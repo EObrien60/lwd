@@ -311,6 +311,116 @@ func TestMigrationFromPreSpecSchema(t *testing.T) {
 	}
 }
 
+func TestComposeRoundTrip(t *testing.T) {
+	s := openTemp(t)
+	wantCompose := `services:
+  web:
+    image: myapp:latest
+    ports:
+      - "8080:8080"`
+	_, err := s.RecordDeployment(Deployment{
+		App: "blog", Image: "img:1", ContainerID: "c1",
+		Status: StatusRunning, CreatedAt: time.Now(), Compose: wantCompose,
+	})
+	if err != nil {
+		t.Fatalf("RecordDeployment: %v", err)
+	}
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || cur.Compose != wantCompose {
+		t.Fatalf("CurrentDeployment.Compose = %q, want %q", cur.Compose, wantCompose)
+	}
+}
+
+func TestMigrationFromPreComposeSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lwd.db")
+
+	// Step 1: Create a pre-Phase-4 DB with spec but no compose column.
+	// Use raw sql.Open to bypass Open() which would create the new schema.
+	rawDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+
+	// Create the Phase-2/Phase-3 deployments table with spec but without compose.
+	oldSchema := `
+	CREATE TABLE deployments (
+		id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		app          TEXT    NOT NULL,
+		image        TEXT    NOT NULL,
+		container_id TEXT    NOT NULL,
+		status       TEXT    NOT NULL,
+		created_at   INTEGER NOT NULL,
+		spec         TEXT    NOT NULL DEFAULT ''
+	);
+	CREATE INDEX idx_deployments_app ON deployments(app);
+	`
+	if _, err := rawDB.Exec(oldSchema); err != nil {
+		rawDB.Close()
+		t.Fatalf("create old schema: %v", err)
+	}
+
+	// Insert one legacy row with spec but no compose.
+	if _, err := rawDB.Exec(
+		`INSERT INTO deployments (app, image, container_id, status, created_at, spec) VALUES (?, ?, ?, ?, ?, ?)`,
+		"legacy", "img:0", "c0", StatusRunning, time.Now().Unix(), `{"image":"img:0"}`,
+	); err != nil {
+		rawDB.Close()
+		t.Fatalf("insert legacy row: %v", err)
+	}
+
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close raw DB: %v", err)
+	}
+
+	// Step 2: Open via the package's Open(), which runs migrateAddSpecColumn and migrateAddComposeColumn.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (migrated): %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	// Step 3: Verify the legacy row was preserved, Spec persisted, and Compose defaulted to "".
+	cur, err := s.CurrentDeployment("legacy")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil {
+		t.Fatalf("CurrentDeployment returned nil, want legacy row")
+	}
+	if cur.App != "legacy" || cur.Image != "img:0" || cur.ContainerID != "c0" {
+		t.Fatalf("CurrentDeployment data mismatch: got %+v", cur)
+	}
+	if cur.Spec != `{"image":"img:0"}` {
+		t.Fatalf("CurrentDeployment.Spec = %q, want {\"image\":\"img:0\"}", cur.Spec)
+	}
+	if cur.Compose != "" {
+		t.Fatalf("CurrentDeployment.Compose = %q, want empty string for migrated row", cur.Compose)
+	}
+
+	// Step 4: Record a new deployment with non-empty Compose and verify it works.
+	newCompose := `services:
+  web:
+    image: myapp:v1`
+	if _, err := s.RecordDeployment(Deployment{
+		App: "legacy", Image: "img:new", ContainerID: "c1",
+		Status: StatusRunning, CreatedAt: time.Now(), Spec: `{"image":"img:new"}`, Compose: newCompose,
+	}); err != nil {
+		t.Fatalf("RecordDeployment (new compose): %v", err)
+	}
+
+	// The new deployment should be current and have the correct Compose.
+	cur2, err := s.CurrentDeployment("legacy")
+	if err != nil {
+		t.Fatalf("CurrentDeployment (after new): %v", err)
+	}
+	if cur2 == nil || cur2.Compose != newCompose {
+		t.Fatalf("CurrentDeployment (after new) Compose = %q, want %q", cur2.Compose, newCompose)
+	}
+}
+
 func TestSecretSetGetDelete(t *testing.T) {
 	s := openTemp(t)
 	if err := s.SetSecret("blog", "DB", []byte{1, 2, 3}); err != nil {
