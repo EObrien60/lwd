@@ -17,8 +17,10 @@ const sessionCookieName = "lwd_session"
 // defaultTTL is how long a session cookie remains valid after login.
 const defaultTTL = 24 * time.Hour
 
-// publicPaths lists paths that are reachable without a valid session.
-// Task 4 (static asset serving) will extend this as needed.
+// publicPaths lists paths that are reachable without a valid session: the
+// login/logout endpoints, the embedded static assets, and the app-shell
+// root ("/" is handled separately in isPublicPath since it must match only
+// the exact root, not every path as a prefix match would).
 var publicPaths = []string{
 	"/login",
 	"/logout",
@@ -164,6 +166,13 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 }
 
 func isPublicPath(path string) bool {
+	// The app shell is served publicly at exactly "/"; its JS calls the
+	// authed /api endpoints and redirects to /login itself on a 401. This
+	// must be an exact match, not a prefix match (a prefix match on "/"
+	// would make every path public).
+	if path == "/" {
+		return true
+	}
 	for _, p := range publicPaths {
 		if strings.HasSuffix(p, "/") {
 			if strings.HasPrefix(path, p) {

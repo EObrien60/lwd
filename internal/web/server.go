@@ -68,12 +68,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/apps/{name}/secrets/{key}", s.handleSecretDelete)
 	mux.HandleFunc("GET /api/apps/{name}/logs", s.handleLogs)
 
-	// TODO(Task 4/5): serve embedded static assets (index.html, app.css,
-	// app.js, login.html) via go:embed.
-	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("lwd-web"))
-	})
+	// Embedded static assets (placeholder UI; Task 5 replaces the contents
+	// of internal/web/assets/ with the crafted design). "/", "/login", and
+	// "/static/" are public per the auth middleware's allowlist: the app
+	// shell's JS calls the authed /api endpoints and redirects to /login
+	// itself on a 401.
+	mux.HandleFunc("GET /login", s.loginPageHandler)
+	mux.Handle("GET /static/", s.staticHandler())
+	mux.HandleFunc("GET /", s.indexHandler)
 
 	return s.auth.Middleware(mux)
 }
