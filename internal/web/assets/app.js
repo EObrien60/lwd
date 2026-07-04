@@ -164,12 +164,23 @@ function tomlString(v) {
 // `key = value` lines belong to that table.
 
 // envRowsToInline renders [{key,value}, ...] rows into an inline table
-// (`{ K = "V", ... }`), skipping rows with a blank key. Returns '' if no rows
-// have a usable key (the caller omits the `env = ...` line entirely).
+// (`{ "K" = "V", ... }`), skipping rows with a blank key. Returns '' if no
+// rows have a usable key (the caller omits the `env = ...` line entirely).
+//
+// Both the key and the value are passed through tomlString (quoted TOML
+// basic strings). Quoting the key is a security-relevant choice, not just
+// style: a bare/unquoted key is emitted as raw TOML syntax, so a key
+// containing e.g. a newline, `"`, `#`, or `}` could otherwise terminate the
+// inline table early and inject arbitrary top-level TOML (including a new
+// `[[services]]` block) into the generated document, which is then sent to
+// the server's /api/apply endpoint. A quoted TOML basic string can't break
+// out of its own quotes (tomlString uses JSON.stringify, which escapes `"`,
+// `\`, and control characters), so a quoted key is always a single atomic
+// token no matter what characters it contains.
 function envRowsToInline(rows) {
   const entries = (rows || [])
     .filter((r) => r && r.key && r.key.trim() !== '')
-    .map((r) => `${r.key.trim()} = ${tomlString(r.value || '')}`);
+    .map((r) => `${tomlString(r.key.trim())} = ${tomlString(r.value || '')}`);
   if (!entries.length) return '';
   return `{ ${entries.join(', ')} }`;
 }
