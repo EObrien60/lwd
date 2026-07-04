@@ -1,0 +1,23 @@
+name    = "api"
+domain  = "api.example.com"
+port    = 3000
+env     = { NODE_ENV = "production" }
+secrets = ["DATABASE_URL", "SESSION_SECRET"]
+
+[git]
+url = "https://github.com/example/api"
+ref = "main"
+
+[build]
+dockerfile = "Dockerfile"
+
+[health]
+path    = "/healthz"
+timeout = "30s"
+
+[[services]]
+name    = "db"
+image   = "postgres:16"
+env     = { POSTGRES_USER = "app", POSTGRES_DB = "app" }
+secrets = ["POSTGRES_PASSWORD"]
+volume  = "db-data:/var/lib/postgresql/data"

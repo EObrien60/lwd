@@ -1,0 +1,10 @@
+name    = "webapp"
+compose = "docker-compose.yml"
+service = "web"
+domain  = "webapp.example.com"
+port    = 8080
+env     = { LOG_LEVEL = "info" }
+secrets = ["DATABASE_URL"]
+
+[health]
+path = "/healthz"
