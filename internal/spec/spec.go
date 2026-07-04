@@ -13,6 +13,24 @@ import (
 )
 
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+var serviceNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
+// Git describes a git source for building from a repository.
+type Git struct {
+	URL  string `toml:"url"`
+	Ref  string `toml:"ref"`
+	Path string `toml:"path"`
+}
+
+// Service describes a backing service (e.g., database, cache).
+type Service struct {
+	Name    string            `toml:"name"`
+	Image   string            `toml:"image"`
+	Command string            `toml:"command"`
+	Env     map[string]string `toml:"env"`
+	Secrets []string          `toml:"secrets"`
+	Volume  string            `toml:"volume"`
+}
 
 // App is a single deployable application as declared in lwd.toml.
 type App struct {
@@ -28,6 +46,12 @@ type App struct {
 	// Compose apps
 	Compose string `toml:"compose"`
 	Service string `toml:"service"`
+
+	// Git apps
+	Git *Git `toml:"git"`
+
+	// Backing services
+	Services []Service `toml:"services"`
 
 	// Not yet supported — parsed so we can reject them explicitly.
 	Build    *Build   `toml:"build"`
@@ -55,6 +79,9 @@ func Parse(data []byte) (*App, error) {
 	}
 	if a.Node == "" {
 		a.Node = "local"
+	}
+	if a.Git != nil && a.Git.Ref == "" {
+		a.Git.Ref = "main"
 	}
 	if a.Health.RawTimeout != "" {
 		d, err := time.ParseDuration(a.Health.RawTimeout)
@@ -92,7 +119,7 @@ func Load(dir string) (*App, error) {
 
 // Validate returns an error if the App cannot be deployed by this version.
 func (a *App) Validate() error {
-	// Name validation applies to both compose and single-service apps
+	// Name validation applies to all app types
 	if a.Name == "" {
 		return fmt.Errorf("name is required")
 	}
@@ -105,8 +132,28 @@ func (a *App) Validate() error {
 		return fmt.Errorf("surfaces are not supported yet")
 	}
 
-	// Compose app validation
-	if a.Compose != "" {
+	// Git app validation
+	if a.Git != nil {
+		if a.Git.URL == "" {
+			return fmt.Errorf("git url is required")
+		}
+		if a.Build == nil {
+			return fmt.Errorf("build is required for git apps")
+		}
+		if a.Image != "" {
+			return fmt.Errorf("cannot mix git and image")
+		}
+		if a.Compose != "" {
+			return fmt.Errorf("cannot mix git and compose")
+		}
+		if a.Domain == "" {
+			return fmt.Errorf("domain is required for git apps")
+		}
+		if a.Port == 0 {
+			return fmt.Errorf("port is required for git apps")
+		}
+	} else if a.Compose != "" {
+		// Compose app validation
 		if a.Service == "" {
 			return fmt.Errorf("service is required for compose apps")
 		}
@@ -122,18 +169,45 @@ func (a *App) Validate() error {
 		if a.Build != nil {
 			return fmt.Errorf("cannot mix compose and build")
 		}
-		return nil
+	} else {
+		// Single-service app validation
+		if a.Build != nil {
+			return fmt.Errorf("build-from-source is not supported yet")
+		}
+		if a.Image == "" {
+			return fmt.Errorf("image is required")
+		}
+		if a.Port == 0 {
+			return fmt.Errorf("port is required")
+		}
 	}
 
-	// Single-service app validation
-	if a.Build != nil {
-		return fmt.Errorf("build-from-source is not supported yet")
+	// Services validation (allowed on image and git apps, not on compose)
+	if len(a.Services) > 0 {
+		if a.Compose != "" {
+			return fmt.Errorf("services are not allowed on compose apps")
+		}
+
+		// Track service names for uniqueness
+		seenNames := make(map[string]bool)
+
+		for _, svc := range a.Services {
+			if svc.Name == "" {
+				return fmt.Errorf("service name is required")
+			}
+			if !serviceNameRe.MatchString(svc.Name) {
+				return fmt.Errorf("service name %q is invalid: must match [a-z0-9][a-z0-9-]*", svc.Name)
+			}
+			if seenNames[svc.Name] {
+				return fmt.Errorf("duplicate service name %q", svc.Name)
+			}
+			seenNames[svc.Name] = true
+
+			if svc.Image == "" {
+				return fmt.Errorf("service %q requires an image", svc.Name)
+			}
+		}
 	}
-	if a.Image == "" {
-		return fmt.Errorf("image is required")
-	}
-	if a.Port == 0 {
-		return fmt.Errorf("port is required")
-	}
+
 	return nil
 }

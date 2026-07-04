@@ -237,3 +237,266 @@ port = 8080
 		t.Errorf("Compose = %q", a.Compose)
 	}
 }
+
+func TestGitAppValid(t *testing.T) {
+	a := &App{
+		Name:   "myapp",
+		Git:    &Git{URL: "https://github.com/me/myapp"},
+		Build:  &Build{Dockerfile: "Dockerfile"},
+		Domain: "myapp.example.com",
+		Port:   8080,
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestGitAppRequiresBuild(t *testing.T) {
+	a := &App{
+		Name:   "myapp",
+		Git:    &Git{URL: "https://github.com/me/myapp"},
+		Domain: "myapp.example.com",
+		Port:   8080,
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git app without build")
+	}
+}
+
+func TestGitAppRejectsImage(t *testing.T) {
+	a := &App{
+		Name:   "myapp",
+		Git:    &Git{URL: "https://github.com/me/myapp"},
+		Build:  &Build{Dockerfile: "Dockerfile"},
+		Image:  "some-image:latest",
+		Domain: "myapp.example.com",
+		Port:   8080,
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git app with image")
+	}
+}
+
+func TestGitAppRejectsCompose(t *testing.T) {
+	a := &App{
+		Name:    "myapp",
+		Git:     &Git{URL: "https://github.com/me/myapp"},
+		Build:   &Build{Dockerfile: "Dockerfile"},
+		Compose: "docker-compose.yml",
+		Domain:  "myapp.example.com",
+		Port:    8080,
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git app with compose")
+	}
+}
+
+func TestGitAppRequiresDomain(t *testing.T) {
+	a := &App{
+		Name:  "myapp",
+		Git:   &Git{URL: "https://github.com/me/myapp"},
+		Build: &Build{Dockerfile: "Dockerfile"},
+		Port:  8080,
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git app without domain")
+	}
+}
+
+func TestGitAppRequiresPort(t *testing.T) {
+	a := &App{
+		Name:   "myapp",
+		Git:    &Git{URL: "https://github.com/me/myapp"},
+		Build:  &Build{Dockerfile: "Dockerfile"},
+		Domain: "myapp.example.com",
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git app without port")
+	}
+}
+
+func TestServiceWithoutName(t *testing.T) {
+	a := &App{
+		Name:     "myapp",
+		Image:    "myimage:latest",
+		Port:     8080,
+		Services: []Service{{Image: "postgres:16"}},
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for service without name")
+	}
+}
+
+func TestServiceWithoutImage(t *testing.T) {
+	a := &App{
+		Name:     "myapp",
+		Image:    "myimage:latest",
+		Port:     8080,
+		Services: []Service{{Name: "db"}},
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for service without image")
+	}
+}
+
+func TestServiceDuplicateNames(t *testing.T) {
+	a := &App{
+		Name:  "myapp",
+		Image: "myimage:latest",
+		Port:  8080,
+		Services: []Service{
+			{Name: "db", Image: "postgres:16"},
+			{Name: "db", Image: "postgres:16"},
+		},
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for duplicate service names")
+	}
+}
+
+func TestServiceBadName(t *testing.T) {
+	a := &App{
+		Name:  "myapp",
+		Image: "myimage:latest",
+		Port:  8080,
+		Services: []Service{
+			{Name: "Bad_Name", Image: "postgres:16"},
+		},
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for service with invalid name")
+	}
+}
+
+func TestComposeRejectsServices(t *testing.T) {
+	a := &App{
+		Name:    "webapp",
+		Compose: "docker-compose.yml",
+		Service: "web",
+		Domain:  "x.example.com",
+		Port:    8080,
+		Services: []Service{
+			{Name: "db", Image: "postgres:16"},
+		},
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for compose app with services")
+	}
+}
+
+func TestImageAppWithService(t *testing.T) {
+	a := &App{
+		Name:  "myapp",
+		Image: "myimage:latest",
+		Port:  8080,
+		Services: []Service{
+			{Name: "db", Image: "postgres:16"},
+		},
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestParseGitApp(t *testing.T) {
+	toml := `
+name = "myapp"
+domain = "myapp.example.com"
+port = 8080
+
+[git]
+url = "https://github.com/me/myapp"
+ref = "develop"
+path = "."
+
+[build]
+dockerfile = "Dockerfile"
+`
+	a, err := Parse([]byte(toml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.Git == nil {
+		t.Fatal("Git is nil")
+	}
+	if a.Git.URL != "https://github.com/me/myapp" {
+		t.Errorf("Git.URL = %q", a.Git.URL)
+	}
+	if a.Git.Ref != "develop" {
+		t.Errorf("Git.Ref = %q, want develop", a.Git.Ref)
+	}
+	if a.Git.Path != "." {
+		t.Errorf("Git.Path = %q", a.Git.Path)
+	}
+	if a.Build == nil {
+		t.Fatal("Build is nil")
+	}
+	if a.Build.Dockerfile != "Dockerfile" {
+		t.Errorf("Build.Dockerfile = %q", a.Build.Dockerfile)
+	}
+}
+
+func TestParseGitRefDefault(t *testing.T) {
+	toml := `
+name = "myapp"
+domain = "myapp.example.com"
+port = 8080
+
+[git]
+url = "https://github.com/me/myapp"
+
+[build]
+dockerfile = "Dockerfile"
+`
+	a, err := Parse([]byte(toml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.Git == nil {
+		t.Fatal("Git is nil")
+	}
+	if a.Git.Ref != "main" {
+		t.Errorf("Git.Ref = %q, want main (default)", a.Git.Ref)
+	}
+}
+
+func TestParseServices(t *testing.T) {
+	toml := `
+name = "myapp"
+domain = "myapp.example.com"
+port = 8080
+image = "myimage:latest"
+
+[[services]]
+name = "db"
+image = "postgres:16"
+env = { POSTGRES_USER = "app", POSTGRES_DB = "app" }
+
+[[services]]
+name = "cache"
+image = "redis:7"
+command = "redis-server --appendonly yes"
+`
+	a, err := Parse([]byte(toml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(a.Services) != 2 {
+		t.Fatalf("Services count = %d, want 2", len(a.Services))
+	}
+	if a.Services[0].Name != "db" {
+		t.Errorf("Services[0].Name = %q", a.Services[0].Name)
+	}
+	if a.Services[0].Image != "postgres:16" {
+		t.Errorf("Services[0].Image = %q", a.Services[0].Image)
+	}
+	if a.Services[0].Env["POSTGRES_USER"] != "app" {
+		t.Errorf("Services[0].Env[POSTGRES_USER] = %q", a.Services[0].Env["POSTGRES_USER"])
+	}
+	if a.Services[1].Name != "cache" {
+		t.Errorf("Services[1].Name = %q", a.Services[1].Name)
+	}
+	if a.Services[1].Command != "redis-server --appendonly yes" {
+		t.Errorf("Services[1].Command = %q", a.Services[1].Command)
+	}
+}
