@@ -66,8 +66,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/apps/{name}/secrets", s.handleSecretList)
 	mux.HandleFunc("POST /api/apps/{name}/secrets", s.handleSecretSet)
 	mux.HandleFunc("DELETE /api/apps/{name}/secrets/{key}", s.handleSecretDelete)
+	mux.HandleFunc("GET /api/apps/{name}/logs", s.handleLogs)
 
-	// TODO(Task 3): GET /api/apps/{name}/logs — SSE log stream.
 	// TODO(Task 4/5): serve embedded static assets (index.html, app.css,
 	// app.js, login.html) via go:embed.
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
