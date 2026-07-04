@@ -378,3 +378,94 @@ func (s *Server) registerLwdRemove(srv *sdk.Server) {
 		return nil, lwdRemoveOutput{Name: in.Name, Removed: true}, nil
 	})
 }
+
+// lwdSecretSetInput is the input of lwd_secret_set.
+type lwdSecretSetInput struct {
+	App   string `json:"app" jsonschema:"the app name"`
+	Key   string `json:"key" jsonschema:"the secret's name"`
+	Value string `json:"value" jsonschema:"the secret's value"`
+}
+
+// lwdSecretSetOutput is the structured result of lwd_secret_set. It
+// deliberately omits Value: a secret value must never appear in a tool
+// response.
+type lwdSecretSetOutput struct {
+	OK  bool   `json:"ok"`
+	App string `json:"app"`
+	Key string `json:"key"`
+}
+
+// registerLwdSecretSet adds the lwd_secret_set tool: set (or overwrite) a
+// secret value for an app. This mutates live state (it calls the daemon's
+// SetSecret), so the MCP host should confirm with the user before invoking
+// it. The confirmation response never echoes the value.
+func (s *Server) registerLwdSecretSet(srv *sdk.Server) {
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_secret_set",
+		Description: "Set (or overwrite) a secret value for a lwd-managed app. The secret value is never returned in the response.",
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdSecretSetInput) (*sdk.CallToolResult, lwdSecretSetOutput, error) {
+		if err := s.client.SetSecret(ctx, in.App, in.Key, in.Value); err != nil {
+			return nil, lwdSecretSetOutput{}, err
+		}
+		return nil, lwdSecretSetOutput{OK: true, App: in.App, Key: in.Key}, nil
+	})
+}
+
+// lwdSecretListInput is the input of lwd_secret_list.
+type lwdSecretListInput struct {
+	App string `json:"app" jsonschema:"the app name"`
+}
+
+// lwdSecretListOutput is the structured result of lwd_secret_list: secret
+// NAMES only, never values.
+type lwdSecretListOutput struct {
+	Names []string `json:"names"`
+}
+
+// registerLwdSecretList adds the lwd_secret_list tool: the names of secrets
+// set for an app. It never returns secret values, so it is safe to annotate
+// readOnlyHint.
+func (s *Server) registerLwdSecretList(srv *sdk.Server) {
+	readOnly := true
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_secret_list",
+		Description: "List the names of secrets set for a lwd-managed app. Values are never returned.",
+		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: readOnly},
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdSecretListInput) (*sdk.CallToolResult, lwdSecretListOutput, error) {
+		names, err := s.client.ListSecrets(ctx, in.App)
+		if err != nil {
+			return nil, lwdSecretListOutput{}, err
+		}
+		return nil, lwdSecretListOutput{Names: names}, nil
+	})
+}
+
+// lwdSecretDeleteInput is the input of lwd_secret_delete.
+type lwdSecretDeleteInput struct {
+	App string `json:"app" jsonschema:"the app name"`
+	Key string `json:"key" jsonschema:"the secret's name"`
+}
+
+// lwdSecretDeleteOutput is the structured result of lwd_secret_delete.
+type lwdSecretDeleteOutput struct {
+	OK  bool   `json:"ok"`
+	App string `json:"app"`
+	Key string `json:"key"`
+}
+
+// registerLwdSecretDelete adds the lwd_secret_delete tool: remove a secret
+// from an app. Annotated destructiveHint, consistent with lwd_remove, so the
+// MCP host prompts for confirmation before calling it.
+func (s *Server) registerLwdSecretDelete(srv *sdk.Server) {
+	destructive := true
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_secret_delete",
+		Description: "Delete a secret from a lwd-managed app. This cannot be undone.",
+		Annotations: &sdk.ToolAnnotations{DestructiveHint: &destructive},
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdSecretDeleteInput) (*sdk.CallToolResult, lwdSecretDeleteOutput, error) {
+		if err := s.client.DeleteSecret(ctx, in.App, in.Key); err != nil {
+			return nil, lwdSecretDeleteOutput{}, err
+		}
+		return nil, lwdSecretDeleteOutput{OK: true, App: in.App, Key: in.Key}, nil
+	})
+}

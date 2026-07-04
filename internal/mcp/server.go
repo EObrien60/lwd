@@ -70,6 +70,9 @@ func (s *Server) registerTools(srv *sdk.Server) {
 	s.registerLwdDeployGit(srv)
 	s.registerLwdRollback(srv)
 	s.registerLwdRemove(srv)
+	s.registerLwdSecretSet(srv)
+	s.registerLwdSecretList(srv)
+	s.registerLwdSecretDelete(srv)
 }
 
 // Serve runs the MCP server over stdio until the client disconnects or ctx

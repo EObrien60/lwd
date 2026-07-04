@@ -518,3 +518,122 @@ func TestToolRemove(t *testing.T) {
 		t.Errorf("lwd_remove should surface a daemon error as a tool error, got %+v", res)
 	}
 }
+
+// resultText concatenates a tool result's structured content and unstructured
+// text content into a single string, for asserting a secret value never
+// appears anywhere in the response.
+func resultText(t *testing.T, res *sdk.CallToolResult) string {
+	t.Helper()
+	var sb strings.Builder
+	if res.StructuredContent != nil {
+		b, err := json.Marshal(res.StructuredContent)
+		if err != nil {
+			t.Fatalf("marshal StructuredContent: %v", err)
+		}
+		sb.Write(b)
+	}
+	for _, c := range res.Content {
+		if tc, ok := c.(*sdk.TextContent); ok {
+			sb.WriteString(tc.Text)
+		}
+	}
+	return sb.String()
+}
+
+func TestToolSecretSetAndList(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	lr, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	if tool := findTool(lr.Tools, "lwd_secret_set"); tool == nil {
+		t.Fatalf("lwd_secret_set tool not registered; got %+v", lr.Tools)
+	} else if tool.Annotations != nil && tool.Annotations.ReadOnlyHint {
+		t.Errorf("lwd_secret_set must not be annotated readOnlyHint=true, got %+v", tool.Annotations)
+	}
+	listTool := findTool(lr.Tools, "lwd_secret_list")
+	if listTool == nil {
+		t.Fatalf("lwd_secret_list tool not registered; got %+v", lr.Tools)
+	}
+	if listTool.Annotations == nil || !listTool.Annotations.ReadOnlyHint {
+		t.Errorf("lwd_secret_list should be annotated readOnlyHint=true, got %+v", listTool.Annotations)
+	}
+
+	const secretValue = "sup3r-s3cr3t-p4ssw0rd"
+
+	setRes := callTool(t, cs, "lwd_secret_set", map[string]any{"app": "web", "key": "DB_PASSWORD", "value": secretValue})
+	if setRes.IsError {
+		t.Fatalf("lwd_secret_set returned tool error: %+v", setRes.Content)
+	}
+	var setOut lwdSecretSetOutput
+	decodeStructured(t, setRes, &setOut)
+	if !setOut.OK || setOut.App != "web" || setOut.Key != "DB_PASSWORD" {
+		t.Errorf("unexpected lwd_secret_set output: %+v", setOut)
+	}
+	if strings.Contains(resultText(t, setRes), secretValue) {
+		t.Errorf("lwd_secret_set response leaked the secret value: %s", resultText(t, setRes))
+	}
+
+	listRes := callTool(t, cs, "lwd_secret_list", map[string]any{"app": "web"})
+	if listRes.IsError {
+		t.Fatalf("lwd_secret_list returned tool error: %+v", listRes.Content)
+	}
+	var listOut lwdSecretListOutput
+	decodeStructured(t, listRes, &listOut)
+	if len(listOut.Names) != 1 || listOut.Names[0] != "DB_PASSWORD" {
+		t.Errorf("expected lwd_secret_list to show [DB_PASSWORD], got %+v", listOut.Names)
+	}
+	if strings.Contains(resultText(t, listRes), secretValue) {
+		t.Errorf("lwd_secret_list response leaked the secret value: %s", resultText(t, listRes))
+	}
+}
+
+func TestToolSecretDelete(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	lr, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	tool := findTool(lr.Tools, "lwd_secret_delete")
+	if tool == nil {
+		t.Fatalf("lwd_secret_delete tool not registered; got %+v", lr.Tools)
+	}
+	if tool.Annotations == nil || tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint {
+		t.Errorf("lwd_secret_delete should be annotated destructiveHint=true, got %+v", tool.Annotations)
+	}
+
+	callTool(t, cs, "lwd_secret_set", map[string]any{"app": "web", "key": "DB_PASSWORD", "value": "hunter2"})
+
+	listRes := callTool(t, cs, "lwd_secret_list", map[string]any{"app": "web"})
+	var listOut lwdSecretListOutput
+	decodeStructured(t, listRes, &listOut)
+	if len(listOut.Names) != 1 {
+		t.Fatalf("expected secret to be set before delete, got %+v", listOut.Names)
+	}
+
+	delRes := callTool(t, cs, "lwd_secret_delete", map[string]any{"app": "web", "key": "DB_PASSWORD"})
+	if delRes.IsError {
+		t.Fatalf("lwd_secret_delete returned tool error: %+v", delRes.Content)
+	}
+	var delOut lwdSecretDeleteOutput
+	decodeStructured(t, delRes, &delOut)
+	if !delOut.OK || delOut.App != "web" || delOut.Key != "DB_PASSWORD" {
+		t.Errorf("unexpected lwd_secret_delete output: %+v", delOut)
+	}
+
+	listRes = callTool(t, cs, "lwd_secret_list", map[string]any{"app": "web"})
+	decodeStructured(t, listRes, &listOut)
+	if len(listOut.Names) != 0 {
+		t.Errorf("expected no secrets after delete, got %+v", listOut.Names)
+	}
+
+	fc.deleteSecretErr = fmt.Errorf("delete failed")
+	delRes = callTool(t, cs, "lwd_secret_delete", map[string]any{"app": "web", "key": "DB_PASSWORD"})
+	if !delRes.IsError {
+		t.Errorf("lwd_secret_delete should surface a daemon error as a tool error, got %+v", delRes)
+	}
+}
