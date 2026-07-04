@@ -2,13 +2,13 @@
 
 A suckless, self-hosted deployment engine for Docker apps. Point it at an app,
 deploy with one command, get automatic HTTPS and zero-downtime rollouts for
-free. Single static Go binary that is both the daemon and the CLI, plus an
-optional second binary, [`lwd-web`](#web-ui-lwd-web), for a browser
-dashboard.
+free. Single static Go binary that is both the daemon and the CLI, plus two
+optional client binaries: [`lwd-web`](#web-ui-lwd-web) (a browser dashboard)
+and [`lwd-mcp`](#agent-access-lwd-mcp) (an MCP server for coding agents).
 
 > This is the **router + blue-green + secrets + compose apps + web UI + git
-> deploy + backing services** milestone (Phases 1–6). Pinned surfaces (outside
-> compose) arrive in a later milestone.
+> deploy + backing services + agent access** milestone (Phases 1–8). Pinned
+> surfaces (outside compose) arrive in a later milestone.
 
 ## Build
 
@@ -425,6 +425,72 @@ already authenticated) at deploy time; pasting/generating a full `lwd.toml`
 for a single-service, git-built, or backing-service app works fully from the
 UI end to end.
 
+## Agent access (lwd-mcp)
+
+`lwd-mcp` is a **third, optional binary**: a local
+[Model Context Protocol](https://modelcontextprotocol.io) server that lets a
+coding agent (Claude Code, or any other MCP host) drive lwd directly. Like
+`lwd-web`, it is just another client of the daemon's existing unix-socket
+API — it makes **zero changes to the daemon** and can do nothing the daemon
+API doesn't already permit. It speaks MCP over **stdio only**: no network
+listener, no auth of its own (the daemon socket is `0600` and reachable only
+by whoever can already run `lwd`/`lwd-mcp` on the box), and it requires
+`lwd daemon` to already be running.
+
+### Build
+
+```bash
+CGO_ENABLED=0 go build -o lwd-mcp ./cmd/lwd-mcp
+```
+
+### Register with an MCP host
+
+`lwd-mcp` locates the daemon socket the same way the CLI does — `LWD_DATA_DIR`
+(default `/var/lib/lwd`) + `lwd.sock` — so point it at the same
+`LWD_DATA_DIR` the daemon uses if you've customized it. A Claude
+Code-style `.mcp.json` entry:
+
+```json
+{
+  "mcpServers": {
+    "lwd": {
+      "command": "/path/to/lwd-mcp",
+      "args": [],
+      "env": {
+        "LWD_DATA_DIR": "/var/lib/lwd"
+      }
+    }
+  }
+}
+```
+
+### Tools
+
+All tool names, inputs, and outputs are stable, plain JSON (no secret value is
+ever returned by any tool):
+
+| Tool | Description |
+| --- | --- |
+| `lwd_list` | List all lwd-managed apps with their current status, image, and domain. |
+| `lwd_status` | Get the current status and deployment history of a single app. |
+| `lwd_logs` | Get the most recent logs (`tail`-limited, default 200 lines) for an app. |
+| `lwd_history` | List recorded deployments (image, status, time) for an app. |
+| `lwd_apply` | Deploy an app from an `lwd.toml`, given inline (`toml`) or a local directory (`dir`). |
+| `lwd_deploy_git` | Deploy an app built from a git repo, from discrete fields (url/ref/dockerfile/name/domain/port/services), without hand-authoring an `lwd.toml`. |
+| `lwd_rollback` | Roll back an app to its previous deployment. |
+| `lwd_remove` | Permanently stop and remove an app. |
+| `lwd_secret_set` | Set (or overwrite) a secret value for an app. The value is never echoed back. |
+| `lwd_secret_list` | List the names of secrets set for an app — names only, never values. |
+| `lwd_secret_delete` | Delete a secret from an app. |
+
+`lwd_list`, `lwd_status`, `lwd_logs`, `lwd_history`, and `lwd_secret_list` are
+annotated `readOnlyHint: true`; `lwd_remove` and `lwd_secret_delete` are
+annotated `destructiveHint: true`. lwd-mcp itself asks nothing before calling
+the daemon — it relies entirely on **the MCP host's own per-call approval
+UI** (e.g. Claude Code's tool-permission prompt) to gate destructive and
+state-changing tools before they run; there is no additional confirmation
+argument to pass.
+
 ## Networking model
 
 - lwd creates and manages one private Docker network, `lwd`. Every app
@@ -461,6 +527,12 @@ UI end to end.
   From Git and Builder support declaring backing services), all as a thin
   client of the same daemon API the CLI uses. Deploying `lwd-web` itself as
   an lwd-managed app and multi-user auth are not built yet.
+- [`lwd-mcp`](#agent-access-lwd-mcp) (a separate stdio MCP server binary) is
+  fully live: all eleven tools (list/status/logs/history/apply/deploy_git/
+  rollback/remove/secret set-list-delete), as a thin client of the same
+  daemon API the CLI and `lwd-web` use — no daemon changes, no network
+  listener, no secret value ever returned. Networked MCP transport and
+  multi-node targeting are not built yet.
 
 ### Known limitations (this milestone)
 
@@ -521,6 +593,16 @@ LWD_DOCKER_TEST=1 go test ./test/ -v       # + real end-to-end test against Dock
 stack, drives `lwd-web`'s HTTP handler over real HTTP through a real
 `internal/client`, and exercises login → `/api/apps` → `/api/apply` →
 `/api/apps` again, proving the browser → `lwd-web` → daemon chain end to end.
+
+`internal/mcp`'s `TestIntegrationMCPClientDaemon` does the same for
+`lwd-mcp`, also as part of the plain `go test ./...` (no Docker, no build
+tag): it starts the same kind of fake-backed daemon on a temp unix socket,
+builds a real `internal/client`, wires it into `mcp.NewServer`, and drives
+the real go-sdk MCP server over an in-memory transport — `tools/list`
+(asserting every one of the eleven tools is registered), then `lwd_list`
+(empty), `lwd_apply` with an inline `lwd.toml`, and `lwd_list` again to
+confirm the app appears — proving the agent tool call → `lwd-mcp` →
+`internal/client` → daemon chain end to end.
 
 The end-to-end suite drives the full stack — a real Docker daemon, a real
 `lwd-caddy` container, and real deployments (`traefik/whoami`, and for the
