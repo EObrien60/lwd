@@ -16,12 +16,18 @@ import (
 // outside; backing services are internal-only, reached by container name on
 // the per-app network.
 //
-// resolvedSecrets maps a secret name (as referenced in a Service.Secrets
-// entry) to its resolved plaintext value; the caller is expected to have
-// already resolved secrets fail-closed (see SecretResolver) before calling.
+// RenderBackingCompose never bakes a resolved secret VALUE into the output —
+// only a name/reference. Each name in a service's declared Secrets is
+// rendered as a `${NAME}` compose-interpolation reference in that service's
+// environment block; `docker compose up` resolves it at up-time from the
+// process env the caller passes as UpSpec.Env (see (*Reconciler).ensureBacking).
+// This mirrors how Phase 4 stores a user's compose file with ${VAR} refs, not
+// resolved values: the rendered YAML here is what gets persisted verbatim to
+// store.Deployment.Compose (plaintext) and served back over the API, so it
+// must never contain a secret's plaintext value.
 //
 // RenderBackingCompose returns ("", "") if there are no services to render.
-func RenderBackingCompose(appName string, services []spec.Service, resolvedSecrets map[string]string) (yaml string, network string) {
+func RenderBackingCompose(appName string, services []spec.Service) (yaml string, network string) {
 	if len(services) == 0 {
 		return "", ""
 	}
@@ -63,16 +69,40 @@ func RenderBackingCompose(appName string, services []spec.Service, resolvedSecre
 			fmt.Fprintf(&b, "    command: %s\n", yamlQuote(svc.Command))
 		}
 
-		env := mergedEnv(svc, resolvedSecrets)
-		if len(env) > 0 {
-			b.WriteString("    environment:\n")
-			keys := make([]string, 0, len(env))
-			for k := range env {
+		if len(svc.Env) > 0 || len(svc.Secrets) > 0 {
+			secretSet := make(map[string]bool, len(svc.Secrets))
+			for _, name := range svc.Secrets {
+				secretSet[name] = true
+			}
+			keySet := make(map[string]bool, len(svc.Env)+len(svc.Secrets))
+			for k := range svc.Env {
+				keySet[k] = true
+			}
+			for name := range secretSet {
+				keySet[name] = true
+			}
+			keys := make([]string, 0, len(keySet))
+			for k := range keySet {
 				keys = append(keys, k)
 			}
 			sort.Strings(keys)
+
+			b.WriteString("    environment:\n")
 			for _, k := range keys {
-				fmt.Fprintf(&b, "      %s: %s\n", yamlQuote(k), yamlQuote(env[k]))
+				if secretSet[k] {
+					// A compose-interpolation REFERENCE, not the resolved
+					// value: docker compose substitutes ${k} from its own
+					// process env (UpSpec.Env) at `up` time. Deliberately
+					// NOT passed through yamlQuote's value-escaping (no
+					// $$-doubling) so compose actually interpolates it; only
+					// the key goes through yamlQuote for injection-safety.
+					fmt.Fprintf(&b, "      %s: \"${%s}\"\n", yamlQuote(k), k)
+				} else {
+					// A literal from Service.Env: secrets override env on
+					// key collision, so this branch is only reached for keys
+					// not also declared as a secret.
+					fmt.Fprintf(&b, "      %s: %s\n", yamlQuote(k), yamlQuote(svc.Env[k]))
+				}
 			}
 		}
 
@@ -85,27 +115,6 @@ func RenderBackingCompose(appName string, services []spec.Service, resolvedSecre
 	}
 
 	return b.String(), network
-}
-
-// mergedEnv merges a service's declared literal env with its declared
-// secrets resolved against resolvedSecrets. A secret name absent from
-// resolvedSecrets is skipped (the caller resolves secrets fail-closed
-// before calling; RenderBackingCompose stays pure and does not itself
-// error).
-func mergedEnv(svc spec.Service, resolvedSecrets map[string]string) map[string]string {
-	if len(svc.Env) == 0 && len(svc.Secrets) == 0 {
-		return nil
-	}
-	env := make(map[string]string, len(svc.Env)+len(svc.Secrets))
-	for k, v := range svc.Env {
-		env[k] = v
-	}
-	for _, name := range svc.Secrets {
-		if v, ok := resolvedSecrets[name]; ok {
-			env[name] = v
-		}
-	}
-	return env
 }
 
 // namedVolumeOf returns the top-level named-volume name declared by a

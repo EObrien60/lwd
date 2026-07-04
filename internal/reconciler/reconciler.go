@@ -386,17 +386,21 @@ func shortSHA(sha string) string {
 // network — used by both the image and git deploy paths, and idempotently
 // re-run on every redeploy/rollback (compose only recreates what changed, so
 // already-running backing services and their data are left alone). Returns
-// ("", "", nil) if the app declares no services. env is the app's merged
-// env+resolved-secrets map, used both as the values a service's declared
-// `secrets` reference (RenderBackingCompose's resolvedSecrets param — a
-// superset lookup is harmless since it only reads names a service actually
-// references) and as the process env `docker compose up` runs with.
+// ("", "", nil) if the app declares no services.
+//
+// The rendered YAML (composeContent) contains only ${NAME} references for a
+// service's declared secrets — never a resolved value — because it is
+// persisted verbatim to store.Deployment.Compose (plaintext) and served back
+// over the API. env is the app's merged env+resolved-secrets map; it is used
+// ONLY as the transient process env passed to `docker compose up` (UpSpec.Env
+// below), which is how compose actually resolves each ${NAME} reference at
+// up-time. env is never written to disk or to the store.
 func (r *Reconciler) ensureBacking(ctx context.Context, app *spec.App, env map[string]string) (network string, composeContent string, err error) {
 	if len(app.Services) == 0 {
 		return "", "", nil
 	}
 
-	yamlContent, net := RenderBackingCompose(app.Name, app.Services, env)
+	yamlContent, net := RenderBackingCompose(app.Name, app.Services)
 
 	if err := r.node.EnsureNetwork(ctx, net); err != nil {
 		return "", "", fmt.Errorf("ensure backing network: %w", err)

@@ -23,9 +23,8 @@ func TestRenderBackingComposeTwoServices(t *testing.T) {
 			Volume:  "minio-data:/data",
 		},
 	}
-	resolvedSecrets := map[string]string{"MINIO_ROOT_PASSWORD": "s3cr3t\"quote"}
 
-	yaml, network := RenderBackingCompose("myapp", services, resolvedSecrets)
+	yaml, network := RenderBackingCompose("myapp", services)
 
 	if network != "lwd-myapp" {
 		t.Fatalf("network = %q, want %q", network, "lwd-myapp")
@@ -64,8 +63,15 @@ func TestRenderBackingComposeTwoServices(t *testing.T) {
 		t.Errorf("expected top-level named volume minio-data, got:\n%s", yaml)
 	}
 
-	if !strings.Contains(yaml, `s3cr3t\"quote`) {
-		t.Errorf("expected injected secret value present (escaped), got:\n%s", yaml)
+	// The secret is rendered as a compose-interpolation REFERENCE, never a
+	// resolved value: this YAML is persisted verbatim to
+	// store.Deployment.Compose (plaintext) and served back over the API, so
+	// no resolved secret value may ever appear in it.
+	if !strings.Contains(yaml, `"MINIO_ROOT_PASSWORD": "${MINIO_ROOT_PASSWORD}"`) {
+		t.Errorf("expected MINIO_ROOT_PASSWORD rendered as a ${...} reference, got:\n%s", yaml)
+	}
+	if strings.Contains(yaml, "s3cr3t") {
+		t.Errorf("expected NO resolved secret value present, got:\n%s", yaml)
 	}
 
 	if strings.Contains(yaml, "ports:") {
@@ -74,7 +80,7 @@ func TestRenderBackingComposeTwoServices(t *testing.T) {
 }
 
 func TestRenderBackingComposeEmpty(t *testing.T) {
-	yaml, network := RenderBackingCompose("myapp", nil, nil)
+	yaml, network := RenderBackingCompose("myapp", nil)
 	if yaml != "" || network != "" {
 		t.Fatalf("expected empty results, got yaml=%q network=%q", yaml, network)
 	}
@@ -85,10 +91,9 @@ func TestRenderBackingDeterministic(t *testing.T) {
 		{Name: "minio", Image: "minio/minio:latest", Command: "server /data", Secrets: []string{"MINIO_ROOT_PASSWORD"}, Volume: "minio-data:/data"},
 		{Name: "db", Image: "postgres:16", Env: map[string]string{"POSTGRES_DB": "app", "POSTGRES_USER": "app"}, Volume: "db-data:/var/lib/postgresql/data"},
 	}
-	resolvedSecrets := map[string]string{"MINIO_ROOT_PASSWORD": "s3cr3t"}
 
-	yaml1, net1 := RenderBackingCompose("myapp", services, resolvedSecrets)
-	yaml2, net2 := RenderBackingCompose("myapp", services, resolvedSecrets)
+	yaml1, net1 := RenderBackingCompose("myapp", services)
+	yaml2, net2 := RenderBackingCompose("myapp", services)
 
 	if yaml1 != yaml2 {
 		t.Fatalf("expected deterministic output, got:\n---1---\n%s\n---2---\n%s", yaml1, yaml2)
@@ -123,7 +128,7 @@ func TestRenderBackingRejectsKeyInjection(t *testing.T) {
 		},
 	}
 
-	yaml, _ := RenderBackingCompose("myapp", services, nil)
+	yaml, _ := RenderBackingCompose("myapp", services)
 
 	for _, line := range strings.Split(yaml, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -155,7 +160,7 @@ func TestRenderBackingEscapesDollar(t *testing.T) {
 		},
 	}
 
-	yaml, _ := RenderBackingCompose("myapp", services, nil)
+	yaml, _ := RenderBackingCompose("myapp", services)
 
 	if !strings.Contains(yaml, "p@ss$$word") {
 		t.Fatalf("expected doubled $ in rendered value, got:\n%s", yaml)
@@ -175,7 +180,7 @@ func TestRenderBackingEscapesNewline(t *testing.T) {
 		},
 	}
 
-	yaml, _ := RenderBackingCompose("myapp", services, nil)
+	yaml, _ := RenderBackingCompose("myapp", services)
 
 	if !strings.Contains(yaml, `line1\nline2`) {
 		t.Fatalf("expected escaped \\n in rendered value, got:\n%s", yaml)

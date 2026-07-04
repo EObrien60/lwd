@@ -952,8 +952,21 @@ func TestApplyGitWithBacking(t *testing.T) {
 	if !contains(cf.Calls, "Up:lwd-gitapp") {
 		t.Errorf("want backing compose Up for project lwd-gitapp, calls: %v", cf.Calls)
 	}
-	if !strings.Contains(dep.Compose, "s3cr3t") {
-		t.Errorf("want rendered backing compose to include the resolved secret, got %q", dep.Compose)
+	// The persisted compose snapshot must never contain the resolved secret
+	// value: it is stored verbatim, plaintext, in store.Deployment.Compose
+	// and served back over the API, so a leaked value there defeats
+	// encryption-at-rest for secrets. It should instead hold a ${...}
+	// compose-interpolation reference.
+	if strings.Contains(dep.Compose, "s3cr3t") {
+		t.Errorf("want rendered backing compose to NOT include the resolved secret value, got %q", dep.Compose)
+	}
+	if !strings.Contains(dep.Compose, `"${DB_PASS}"`) {
+		t.Errorf("want rendered backing compose to include a ${DB_PASS} reference, got %q", dep.Compose)
+	}
+	// The resolved value must still reach the compose-up process env, so
+	// docker compose's own interpolation can resolve the ${DB_PASS} ref.
+	if cf.LastUp.Env["DB_PASS"] != "s3cr3t" {
+		t.Errorf("want LastUp.Env[DB_PASS] = s3cr3t (resolved value handed to compose up, never persisted), got %q", cf.LastUp.Env["DB_PASS"])
 	}
 
 	if !containsInOrder(f.Calls, "EnsureNetwork:lwd-gitapp", "RunContainer:lwd-gitapp-1") {
@@ -1018,6 +1031,86 @@ func TestApplyImageAppWithBacking(t *testing.T) {
 	}
 	if !contains(f.Calls, "ConnectContainerToNetwork:"+dep.ContainerID+":lwd-blog") {
 		t.Errorf("want the surface connected to the backing network, calls: %v", f.Calls)
+	}
+}
+
+// TestRollbackImageAppWithBacking covers the rollback compose-vs-backing
+// guard for a plain image app that declares backing [[service]]s: Rollback
+// must redeploy it through the image/backing surface path (a fresh
+// RunContainer reconnected to the backing network, with backing compose
+// idempotently re-ensured via Up), and must NOT misroute it into the Phase-4
+// applyCompose branch. That branch is guarded on the app spec's own Compose
+// field, which is always "" for a backing app (Compose is only ever set for
+// a Phase-4 [compose] app), so it must never be taken here — in particular,
+// compose.Down (part of the Phase-4 compose lifecycle) must never be called.
+func TestRollbackImageAppWithBacking(t *testing.T) {
+	r, f, fr, s, cf, _, _ := newTestReconcilerFull(t, &fakeResolver{vals: map[string]string{}})
+	ctx := context.Background()
+
+	app1 := testApp()
+	app1.Image = "img:a"
+	app1.Services = []spec.Service{{Name: "db", Image: "postgres:16"}}
+	app1.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	v1, err := r.Apply(ctx, app1)
+	if err != nil {
+		t.Fatalf("v1 Apply: %v", err)
+	}
+
+	app2 := testApp()
+	app2.Image = "img:b"
+	app2.Services = []spec.Service{{Name: "db", Image: "postgres:16"}}
+	app2.Health.Timeout = shortTimeout
+	v2, err := r.Apply(ctx, app2)
+	if err != nil {
+		t.Fatalf("v2 Apply: %v", err)
+	}
+	if v2.Image != "img:b" {
+		t.Fatalf("sanity: v2.Image = %q, want img:b", v2.Image)
+	}
+
+	back, err := r.Rollback(ctx, "blog")
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if back.Image != "img:a" {
+		t.Errorf("Rollback image = %q, want img:a", back.Image)
+	}
+	if back.Status != store.StatusRunning {
+		t.Errorf("Rollback status = %q, want running", back.Status)
+	}
+	if back.ContainerID == v1.ContainerID || back.ContainerID == v2.ContainerID {
+		t.Errorf("Rollback should start a fresh surface container, got %q (v1=%q v2=%q)", back.ContainerID, v1.ContainerID, v2.ContainerID)
+	}
+
+	// Redeployed via the image/backing surface path: a fresh RunContainer,
+	// reconnected to the backing network.
+	if !contains(f.Calls, "RunContainer:"+containerName(app1, 3)) {
+		t.Errorf("want rollback to start a fresh surface container via RunContainer, calls: %v", f.Calls)
+	}
+	if !contains(f.Calls, "ConnectContainerToNetwork:"+back.ContainerID+":lwd-blog") {
+		t.Errorf("want rollback surface reconnected to the backing network, calls: %v", f.Calls)
+	}
+
+	// Backing compose re-ensured (idempotent Up) on rollback too...
+	if !contains(cf.Calls, "Up:lwd-blog") {
+		t.Errorf("want backing compose re-ensured on rollback, calls: %v", cf.Calls)
+	}
+	// ...but never a Down: that would mean Rollback took the Phase-4
+	// applyCompose branch instead of the image/backing surface path.
+	for _, c := range cf.Calls {
+		if strings.HasPrefix(c, "Down:") {
+			t.Errorf("want no compose Down call on rollback of an image-with-backing app, calls: %v", cf.Calls)
+		}
+	}
+
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || cur.ID != back.ID || cur.Image != "img:a" {
+		t.Fatalf("want current deployment to be the rollback, got %+v", cur)
 	}
 }
 
