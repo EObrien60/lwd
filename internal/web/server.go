@@ -10,6 +10,7 @@ import (
 	"net/url"
 
 	"lwd/internal/api"
+	"lwd/internal/client"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -28,6 +29,10 @@ type DaemonClient interface {
 	ListSecrets(ctx context.Context, app string) ([]string, error)
 	DeleteSecret(ctx context.Context, app, key string) error
 }
+
+// The real daemon client must satisfy DaemonClient. This assertion fails the
+// build if internal/client drifts from the interface lwd-web depends on.
+var _ DaemonClient = (*client.Client)(nil)
 
 // Server wires the browser-facing JSON API to a DaemonClient, gated by an
 // Authenticator's session middleware.
