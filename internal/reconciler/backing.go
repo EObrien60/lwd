@@ -46,18 +46,18 @@ func RenderBackingCompose(appName string, services []spec.Service, resolvedSecre
 	var b strings.Builder
 
 	b.WriteString("networks:\n")
-	fmt.Fprintf(&b, "  %s:\n", network)
+	fmt.Fprintf(&b, "  %s:\n", yamlQuote(network))
 
 	if len(namedVolumes) > 0 {
 		b.WriteString("volumes:\n")
 		for _, v := range namedVolumes {
-			fmt.Fprintf(&b, "  %s:\n", v)
+			fmt.Fprintf(&b, "  %s:\n", yamlQuote(v))
 		}
 	}
 
 	b.WriteString("services:\n")
 	for _, svc := range sorted {
-		fmt.Fprintf(&b, "  %s:\n", svc.Name)
+		fmt.Fprintf(&b, "  %s:\n", yamlQuote(svc.Name))
 		fmt.Fprintf(&b, "    image: %s\n", yamlQuote(svc.Image))
 		if svc.Command != "" {
 			fmt.Fprintf(&b, "    command: %s\n", yamlQuote(svc.Command))
@@ -72,7 +72,7 @@ func RenderBackingCompose(appName string, services []spec.Service, resolvedSecre
 			}
 			sort.Strings(keys)
 			for _, k := range keys {
-				fmt.Fprintf(&b, "      %s: %s\n", k, yamlQuote(env[k]))
+				fmt.Fprintf(&b, "      %s: %s\n", yamlQuote(k), yamlQuote(env[k]))
 			}
 		}
 
@@ -80,7 +80,7 @@ func RenderBackingCompose(appName string, services []spec.Service, resolvedSecre
 			fmt.Fprintf(&b, "    volumes:\n      - %s\n", yamlQuote(svc.Volume))
 		}
 
-		fmt.Fprintf(&b, "    networks:\n      - %s\n", network)
+		fmt.Fprintf(&b, "    networks:\n      - %s\n", yamlQuote(network))
 		b.WriteString("    restart: unless-stopped\n")
 	}
 
@@ -128,11 +128,24 @@ func namedVolumeOf(volume string) string {
 	return name
 }
 
-// yamlQuote renders s as a double-quoted YAML scalar, escaping backslashes
-// and double quotes so the value round-trips safely regardless of content
-// (secrets in particular may contain arbitrary characters).
+// yamlQuote renders s as a double-quoted YAML scalar that round-trips ANY
+// content safely, regardless of embedded structure or control characters
+// (secrets, env keys/values, and other dynamic strings may contain
+// arbitrary bytes — this must never allow escaping the quoted scalar or
+// injecting YAML structure).
+//
+// Order matters: backslash must be escaped first, before any of the other
+// backslash-based escapes are introduced, so those escapes aren't
+// themselves re-escaped.
 func yamlQuote(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\r", `\r`)
+	s = strings.ReplaceAll(s, "\t", `\t`)
+	// docker compose re-interpolates ${...}/$VAR over the rendered file
+	// text; double every literal $ so our already-final values are not
+	// re-interpolated (and can't leak/corrupt values containing a $).
+	s = strings.ReplaceAll(s, `$`, `$$`)
 	return `"` + s + `"`
 }
