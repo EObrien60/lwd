@@ -63,6 +63,9 @@ func (s *Server) MCP() *sdk.Server {
 // wires the plumbing and one real read tool (lwd_list) to prove it.
 func (s *Server) registerTools(srv *sdk.Server) {
 	s.registerLwdList(srv)
+	s.registerLwdStatus(srv)
+	s.registerLwdLogs(srv)
+	s.registerLwdHistory(srv)
 }
 
 // Serve runs the MCP server over stdio until the client disconnects or ctx
