@@ -148,6 +148,48 @@ func TestRenderBackingRejectsKeyInjection(t *testing.T) {
 	}
 }
 
+// TestRenderBackingRejectsSecretNameInjection verifies a malicious secret
+// NAME cannot inject YAML structure via the unescapable `${NAME}`
+// compose-interpolation ref. Unlike env keys/values, the name inside
+// `${...}` is spliced raw (there is no valid quoting form inside that
+// construct), so RenderBackingCompose must instead refuse to emit the ref
+// at all when the name isn't a safe identifier. spec.Validate rejects such
+// names at parse time, but this function is also unit-tested/called
+// directly, so it must be safe in isolation too.
+func TestRenderBackingRejectsSecretNameInjection(t *testing.T) {
+	maliciousName := "X\"\n    ports:\n      - \"1234:1234"
+	services := []spec.Service{
+		{
+			Name:    "db",
+			Image:   "postgres",
+			Secrets: []string{maliciousName, "GOOD_NAME"},
+		},
+	}
+
+	yaml, _ := RenderBackingCompose("myapp", services)
+
+	for _, line := range strings.Split(yaml, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "ports:" {
+			t.Fatalf("malicious secret name injected a real ports: YAML key line, got:\n%s", yaml)
+		}
+		if trimmed == `- "1234:1234"` {
+			t.Fatalf("malicious secret name injected a real published-port list item, got:\n%s", yaml)
+		}
+	}
+
+	// The malicious ref must simply not be emitted at all (no unescapable
+	// splice point exists inside ${...}).
+	if strings.Contains(yaml, "${X") {
+		t.Fatalf("expected malicious secret ref to be skipped entirely, got:\n%s", yaml)
+	}
+
+	// A normal secret name must still render as a ${...} ref.
+	if !strings.Contains(yaml, `"GOOD_NAME": "${GOOD_NAME}"`) {
+		t.Fatalf("expected GOOD_NAME rendered as a ${...} reference, got:\n%s", yaml)
+	}
+}
+
 // TestRenderBackingEscapesDollar verifies a literal $ in an env value is
 // doubled so docker compose's own variable-interpolation pass (which runs
 // over the rendered file text) does not re-interpolate it.

@@ -14,6 +14,7 @@ import (
 
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 var serviceNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+var secretNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // Git describes a git source for building from a repository.
 type Git struct {
@@ -127,6 +128,15 @@ func (a *App) Validate() error {
 		return fmt.Errorf("name %q is invalid: must match [a-zA-Z0-9][a-zA-Z0-9_.-]*", a.Name)
 	}
 
+	// Secret names are injected as environment variables (and, for backing
+	// services, spliced into an unescapable `${NAME}` compose-interpolation
+	// ref) so they must be validated as env-var identifiers.
+	for _, name := range a.Secrets {
+		if !secretNameRe.MatchString(name) {
+			return fmt.Errorf("secret name %q is invalid: must match [A-Za-z_][A-Za-z0-9_]*", name)
+		}
+	}
+
 	// Surfaces are never supported
 	if len(a.Surfaces) > 0 {
 		return fmt.Errorf("surfaces are not supported yet")
@@ -205,6 +215,11 @@ func (a *App) Validate() error {
 
 			if svc.Image == "" {
 				return fmt.Errorf("service %q requires an image", svc.Name)
+			}
+			for _, name := range svc.Secrets {
+				if !secretNameRe.MatchString(name) {
+					return fmt.Errorf("secret name %q is invalid: must match [A-Za-z_][A-Za-z0-9_]*", name)
+				}
 			}
 		}
 	}

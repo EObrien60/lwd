@@ -2,11 +2,26 @@ package reconciler
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
 	"lwd/internal/spec"
 )
+
+// envIdentRe matches a valid shell/env-var identifier: the only form that
+// can be safely spliced raw into an unescapable `${NAME}` compose
+// interpolation ref (see the secret-ref emit in RenderBackingCompose below).
+var envIdentRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// isEnvIdent reports whether name is safe to splice raw into a `${name}`
+// compose-interpolation reference. RenderBackingCompose is unit-tested
+// directly (bypassing spec.Validate, which already rejects bad secret
+// names), so this guard makes the pure function safe in isolation
+// regardless of caller.
+func isEnvIdent(name string) bool {
+	return envIdentRe.MatchString(name)
+}
 
 // RenderBackingCompose renders an app's declared backing services into a
 // compose v3-ish YAML document, pure and deterministic: given the same
@@ -96,6 +111,16 @@ func RenderBackingCompose(appName string, services []spec.Service) (yaml string,
 					// NOT passed through yamlQuote's value-escaping (no
 					// $$-doubling) so compose actually interpolates it; only
 					// the key goes through yamlQuote for injection-safety.
+					//
+					// Because the name is spliced raw inside ${...} (there is
+					// no way to escape/quote inside that form), only emit
+					// the ref when the name is a valid env-var identifier;
+					// spec.Validate already enforces this at parse time, but
+					// this function is also unit-tested directly, so guard
+					// here too rather than splice an unvalidated name.
+					if !isEnvIdent(k) {
+						continue
+					}
 					fmt.Fprintf(&b, "      %s: \"${%s}\"\n", yamlQuote(k), k)
 				} else {
 					// A literal from Service.Env: secrets override env on

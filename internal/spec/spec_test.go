@@ -460,6 +460,43 @@ dockerfile = "Dockerfile"
 	}
 }
 
+func TestValidateRejectsBadSecretName(t *testing.T) {
+	t.Run("app secret with space", func(t *testing.T) {
+		a := &App{Name: "myapp", Image: "y", Port: 80, Secrets: []string{"BAD NAME"}}
+		if err := a.Validate(); err == nil {
+			t.Fatal("want error for app secret name with space")
+		}
+	})
+
+	t.Run("app secret with YAML injection payload", func(t *testing.T) {
+		a := &App{Name: "myapp", Image: "y", Port: 80, Secrets: []string{"X\"\n ports: 1"}}
+		if err := a.Validate(); err == nil {
+			t.Fatal("want error for app secret name with embedded quote/newline")
+		}
+	})
+
+	t.Run("service secret with bad name", func(t *testing.T) {
+		a := &App{
+			Name:  "myapp",
+			Image: "myimage:latest",
+			Port:  8080,
+			Services: []Service{
+				{Name: "db", Image: "postgres:16", Secrets: []string{"BAD NAME"}},
+			},
+		}
+		if err := a.Validate(); err == nil {
+			t.Fatal("want error for service secret name with space")
+		}
+	})
+
+	t.Run("normal secret name is accepted", func(t *testing.T) {
+		a := &App{Name: "myapp", Image: "y", Port: 80, Secrets: []string{"DATABASE_URL"}}
+		if err := a.Validate(); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+	})
+}
+
 func TestParseServices(t *testing.T) {
 	toml := `
 name = "myapp"
