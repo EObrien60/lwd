@@ -69,14 +69,25 @@ func Parse(data []byte) (*App, error) {
 	return &a, nil
 }
 
-// Load reads and parses <dir>/lwd.toml.
+// Load reads and parses <dir>/lwd.toml. For a compose app, a relative
+// Compose path is resolved against dir into an absolute path, so that
+// daemon-side code (which runs with a different working directory than the
+// CLI invocation) can still os.ReadFile it. An already-absolute Compose path
+// is left untouched. Single-service apps (Compose == "") are unaffected.
 func Load(dir string) (*App, error) {
 	path := filepath.Join(dir, "lwd.toml")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	return Parse(data)
+	a, err := Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	if a.Compose != "" && !filepath.IsAbs(a.Compose) {
+		a.Compose = filepath.Join(dir, a.Compose)
+	}
+	return a, nil
 }
 
 // Validate returns an error if the App cannot be deployed by this version.

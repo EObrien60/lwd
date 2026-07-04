@@ -1,6 +1,8 @@
 package spec
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -169,6 +171,50 @@ func TestComposeStillRejectsSurfaces(t *testing.T) {
 	}
 	if err := a.Validate(); err == nil {
 		t.Fatal("want error for surfaces in compose app")
+	}
+}
+
+func TestLoadResolvesComposePath(t *testing.T) {
+	dir := t.TempDir()
+	toml := `
+name = "webapp"
+compose = "docker-compose.yml"
+service = "web"
+domain = "x.example.com"
+port = 8080
+`
+	if err := os.WriteFile(filepath.Join(dir, "lwd.toml"), []byte(toml), 0o644); err != nil {
+		t.Fatalf("write lwd.toml: %v", err)
+	}
+
+	a, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := filepath.Join(dir, "docker-compose.yml")
+	if !filepath.IsAbs(a.Compose) {
+		t.Errorf("Compose = %q, want absolute path", a.Compose)
+	}
+	if a.Compose != want {
+		t.Errorf("Compose = %q, want %q", a.Compose, want)
+	}
+}
+
+func TestLoadSingleServiceUnaffected(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "lwd.toml"), []byte(singleService), 0o644); err != nil {
+		t.Fatalf("write lwd.toml: %v", err)
+	}
+
+	a, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if a.Compose != "" {
+		t.Errorf("Compose = %q, want empty for single-service app", a.Compose)
+	}
+	if a.Name != "blog" {
+		t.Errorf("Name = %q, want blog", a.Name)
 	}
 }
 
