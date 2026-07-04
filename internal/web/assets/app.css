@@ -818,6 +818,7 @@ button { cursor: pointer; }
   padding: 22px;
   animation: modal-in 0.22s var(--ease);
 }
+.modal.modal--wide { max-width: 900px; }
 @keyframes modal-in {
   from { opacity: 0; transform: translateY(-10px) scale(0.98); }
   to { opacity: 1; transform: translateY(0) scale(1); }
@@ -832,6 +833,94 @@ button { cursor: pointer; }
 }
 .modal__head h2 { margin: 0; font-size: 17px; color: var(--ink-0); }
 .modal p.hint { color: var(--ink-3); font-size: 13px; margin: 0 0 14px; }
+
+.modal .tabs { margin-bottom: 18px; }
+
+/* Deploy modal — From-Git / Builder split layout: a scrollable form column
+   next to a sticky live lwd.toml preview, so authoring stays transparent
+   about exactly what will be applied. */
+.modal__body-split {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr;
+  gap: 22px;
+  max-height: 60vh;
+  overflow-y: auto;
+  margin-right: -4px;
+  padding-right: 4px;
+}
+.modal__form { display: flex; flex-direction: column; min-width: 0; }
+.modal__preview { position: sticky; top: 0; align-self: start; min-width: 0; }
+.modal__preview .code-block { max-height: 58vh; overflow-y: auto; margin: 0; }
+
+@media (max-width: 820px) {
+  .modal__body-split { grid-template-columns: 1fr; max-height: none; overflow-y: visible; }
+  .modal__preview { position: static; }
+}
+
+.subhead {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-3);
+  margin: 18px 0 8px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-soft);
+}
+.subhead:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+.subhead-sm { margin: 10px 0 6px; padding-top: 0; border-top: none; font-size: 10px; }
+
+.form-row { display: flex; gap: 10px; }
+.form-row > .field { flex: 1; min-width: 0; }
+
+.kv-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.kv-row input { flex: 1; min-width: 0; }
+
+.row-remove {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--ink-3);
+  font-size: 16px;
+  line-height: 1;
+  transition: border-color 0.15s var(--ease), color 0.15s var(--ease);
+}
+.row-remove:hover { border-color: var(--bad-dim); color: var(--bad); }
+
+.add-row-btn {
+  border: 1px dashed var(--line);
+  justify-content: center;
+  width: 100%;
+}
+.add-row-btn:hover { border-color: var(--signal); color: var(--signal); background: transparent; }
+
+.service-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--bg-1);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-md);
+  padding: 14px;
+  margin-bottom: 12px;
+}
+.service-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink-1);
+  margin-bottom: 8px;
+}
+.service-card .row-remove { width: 26px; height: 26px; font-size: 14px; }
 
 .modal textarea {
   width: 100%;

@@ -237,3 +237,420 @@ port = 8080
 		t.Errorf("Compose = %q", a.Compose)
 	}
 }
+
+func TestGitAppValid(t *testing.T) {
+	a := &App{
+		Name:   "myapp",
+		Git:    &Git{URL: "https://github.com/me/myapp"},
+		Build:  &Build{Dockerfile: "Dockerfile"},
+		Domain: "myapp.example.com",
+		Port:   8080,
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestGitAppRequiresBuild(t *testing.T) {
+	a := &App{
+		Name:   "myapp",
+		Git:    &Git{URL: "https://github.com/me/myapp"},
+		Domain: "myapp.example.com",
+		Port:   8080,
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git app without build")
+	}
+}
+
+func TestGitAppRejectsImage(t *testing.T) {
+	a := &App{
+		Name:   "myapp",
+		Git:    &Git{URL: "https://github.com/me/myapp"},
+		Build:  &Build{Dockerfile: "Dockerfile"},
+		Image:  "some-image:latest",
+		Domain: "myapp.example.com",
+		Port:   8080,
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git app with image")
+	}
+}
+
+func TestGitAppRejectsCompose(t *testing.T) {
+	a := &App{
+		Name:    "myapp",
+		Git:     &Git{URL: "https://github.com/me/myapp"},
+		Build:   &Build{Dockerfile: "Dockerfile"},
+		Compose: "docker-compose.yml",
+		Domain:  "myapp.example.com",
+		Port:    8080,
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git app with compose")
+	}
+}
+
+func TestGitAppRequiresDomain(t *testing.T) {
+	a := &App{
+		Name:  "myapp",
+		Git:   &Git{URL: "https://github.com/me/myapp"},
+		Build: &Build{Dockerfile: "Dockerfile"},
+		Port:  8080,
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git app without domain")
+	}
+}
+
+func TestGitAppRequiresPort(t *testing.T) {
+	a := &App{
+		Name:   "myapp",
+		Git:    &Git{URL: "https://github.com/me/myapp"},
+		Build:  &Build{Dockerfile: "Dockerfile"},
+		Domain: "myapp.example.com",
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git app without port")
+	}
+}
+
+func TestServiceWithoutName(t *testing.T) {
+	a := &App{
+		Name:     "myapp",
+		Image:    "myimage:latest",
+		Port:     8080,
+		Services: []Service{{Image: "postgres:16"}},
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for service without name")
+	}
+}
+
+func TestServiceWithoutImage(t *testing.T) {
+	a := &App{
+		Name:     "myapp",
+		Image:    "myimage:latest",
+		Port:     8080,
+		Services: []Service{{Name: "db"}},
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for service without image")
+	}
+}
+
+func TestServiceDuplicateNames(t *testing.T) {
+	a := &App{
+		Name:  "myapp",
+		Image: "myimage:latest",
+		Port:  8080,
+		Services: []Service{
+			{Name: "db", Image: "postgres:16"},
+			{Name: "db", Image: "postgres:16"},
+		},
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for duplicate service names")
+	}
+}
+
+func TestServiceBadName(t *testing.T) {
+	a := &App{
+		Name:  "myapp",
+		Image: "myimage:latest",
+		Port:  8080,
+		Services: []Service{
+			{Name: "Bad_Name", Image: "postgres:16"},
+		},
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for service with invalid name")
+	}
+}
+
+func TestComposeRejectsServices(t *testing.T) {
+	a := &App{
+		Name:    "webapp",
+		Compose: "docker-compose.yml",
+		Service: "web",
+		Domain:  "x.example.com",
+		Port:    8080,
+		Services: []Service{
+			{Name: "db", Image: "postgres:16"},
+		},
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for compose app with services")
+	}
+}
+
+func TestImageAppWithService(t *testing.T) {
+	a := &App{
+		Name:  "myapp",
+		Image: "myimage:latest",
+		Port:  8080,
+		Services: []Service{
+			{Name: "db", Image: "postgres:16"},
+		},
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestParseGitApp(t *testing.T) {
+	toml := `
+name = "myapp"
+domain = "myapp.example.com"
+port = 8080
+
+[git]
+url = "https://github.com/me/myapp"
+ref = "develop"
+path = "."
+
+[build]
+dockerfile = "Dockerfile"
+`
+	a, err := Parse([]byte(toml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.Git == nil {
+		t.Fatal("Git is nil")
+	}
+	if a.Git.URL != "https://github.com/me/myapp" {
+		t.Errorf("Git.URL = %q", a.Git.URL)
+	}
+	if a.Git.Ref != "develop" {
+		t.Errorf("Git.Ref = %q, want develop", a.Git.Ref)
+	}
+	if a.Git.Path != "." {
+		t.Errorf("Git.Path = %q", a.Git.Path)
+	}
+	if a.Build == nil {
+		t.Fatal("Build is nil")
+	}
+	if a.Build.Dockerfile != "Dockerfile" {
+		t.Errorf("Build.Dockerfile = %q", a.Build.Dockerfile)
+	}
+}
+
+func TestParseGitRefDefault(t *testing.T) {
+	toml := `
+name = "myapp"
+domain = "myapp.example.com"
+port = 8080
+
+[git]
+url = "https://github.com/me/myapp"
+
+[build]
+dockerfile = "Dockerfile"
+`
+	a, err := Parse([]byte(toml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.Git == nil {
+		t.Fatal("Git is nil")
+	}
+	if a.Git.Ref != "main" {
+		t.Errorf("Git.Ref = %q, want main (default)", a.Git.Ref)
+	}
+}
+
+func TestValidateRejectsBadSecretName(t *testing.T) {
+	t.Run("app secret with space", func(t *testing.T) {
+		a := &App{Name: "myapp", Image: "y", Port: 80, Secrets: []string{"BAD NAME"}}
+		if err := a.Validate(); err == nil {
+			t.Fatal("want error for app secret name with space")
+		}
+	})
+
+	t.Run("app secret with YAML injection payload", func(t *testing.T) {
+		a := &App{Name: "myapp", Image: "y", Port: 80, Secrets: []string{"X\"\n ports: 1"}}
+		if err := a.Validate(); err == nil {
+			t.Fatal("want error for app secret name with embedded quote/newline")
+		}
+	})
+
+	t.Run("service secret with bad name", func(t *testing.T) {
+		a := &App{
+			Name:  "myapp",
+			Image: "myimage:latest",
+			Port:  8080,
+			Services: []Service{
+				{Name: "db", Image: "postgres:16", Secrets: []string{"BAD NAME"}},
+			},
+		}
+		if err := a.Validate(); err == nil {
+			t.Fatal("want error for service secret name with space")
+		}
+	})
+
+	t.Run("normal secret name is accepted", func(t *testing.T) {
+		a := &App{Name: "myapp", Image: "y", Port: 80, Secrets: []string{"DATABASE_URL"}}
+		if err := a.Validate(); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+	})
+}
+
+func TestParseServices(t *testing.T) {
+	toml := `
+name = "myapp"
+domain = "myapp.example.com"
+port = 8080
+image = "myimage:latest"
+
+[[services]]
+name = "db"
+image = "postgres:16"
+env = { POSTGRES_USER = "app", POSTGRES_DB = "app" }
+
+[[services]]
+name = "cache"
+image = "redis:7"
+command = "redis-server --appendonly yes"
+`
+	a, err := Parse([]byte(toml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(a.Services) != 2 {
+		t.Fatalf("Services count = %d, want 2", len(a.Services))
+	}
+	if a.Services[0].Name != "db" {
+		t.Errorf("Services[0].Name = %q", a.Services[0].Name)
+	}
+	if a.Services[0].Image != "postgres:16" {
+		t.Errorf("Services[0].Image = %q", a.Services[0].Image)
+	}
+	if a.Services[0].Env["POSTGRES_USER"] != "app" {
+		t.Errorf("Services[0].Env[POSTGRES_USER] = %q", a.Services[0].Env["POSTGRES_USER"])
+	}
+	if a.Services[1].Name != "cache" {
+		t.Errorf("Services[1].Name = %q", a.Services[1].Name)
+	}
+	if a.Services[1].Command != "redis-server --appendonly yes" {
+		t.Errorf("Services[1].Command = %q", a.Services[1].Command)
+	}
+}
+
+// --- Git url/ref/path hardening (host-RCE + option-injection + path
+// traversal defenses; see validateGitURL, validateGitRef,
+// validateRelativeNoTraversal) ---
+
+func gitApp(overrides func(*App)) *App {
+	a := &App{
+		Name:   "myapp",
+		Git:    &Git{URL: "https://github.com/me/myapp", Ref: "main"},
+		Build:  &Build{Dockerfile: "Dockerfile"},
+		Domain: "myapp.example.com",
+		Port:   8080,
+	}
+	if overrides != nil {
+		overrides(a)
+	}
+	return a
+}
+
+func TestGitURLRejectsExtTransport(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.URL = "ext::sh -c whoami" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for ext:: git url (host command execution)")
+	}
+}
+
+func TestGitURLRejectsFdTransport(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.URL = "fd::5" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for fd:: git url")
+	}
+}
+
+func TestGitURLRejectsLeadingDash(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.URL = "-oProxyCommand=whoami" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git url starting with -")
+	}
+}
+
+func TestGitURLAcceptsHTTPSAndScpLike(t *testing.T) {
+	for _, url := range []string{
+		"https://github.com/me/app",
+		"http://internal.example.com/me/app.git",
+		"git://example.com/me/app.git",
+		"ssh://git@example.com/me/app.git",
+		"file:///tmp/some/repo",
+		"git@github.com:me/app.git",
+	} {
+		a := gitApp(func(a *App) { a.Git.URL = url })
+		if err := a.Validate(); err != nil {
+			t.Errorf("Validate(%q): unexpected error: %v", url, err)
+		}
+	}
+}
+
+func TestGitRefRejectsLeadingDash(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.Ref = "-x" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git ref starting with -")
+	}
+}
+
+func TestGitRefRejectsWhitespace(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.Ref = "a b" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git ref containing whitespace")
+	}
+}
+
+func TestGitRefRejectsShellMetacharacters(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.Ref = "$(x)" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git ref containing shell metacharacters")
+	}
+}
+
+func TestGitRefAcceptsCommonForms(t *testing.T) {
+	for _, ref := range []string{"main", "feature/x", "v1.2.3", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"} {
+		a := gitApp(func(a *App) { a.Git.Ref = ref })
+		if err := a.Validate(); err != nil {
+			t.Errorf("Validate(ref=%q): unexpected error: %v", ref, err)
+		}
+	}
+}
+
+func TestGitPathRejectsTraversal(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.Path = "../etc" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git path escaping the clone root")
+	}
+}
+
+func TestBuildDockerfileRejectsTraversal(t *testing.T) {
+	a := gitApp(func(a *App) { a.Build.Dockerfile = "../../x" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for build dockerfile escaping the clone root")
+	}
+}
+
+func TestBuildContextRejectsAbsolutePath(t *testing.T) {
+	a := gitApp(func(a *App) { a.Build.Context = "/etc" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for absolute build context")
+	}
+}
+
+func TestGitPathAndBuildDockerfileAcceptNormalValues(t *testing.T) {
+	a := gitApp(func(a *App) {
+		a.Git.Path = "."
+		a.Build.Dockerfile = "Dockerfile"
+		a.Build.Context = "."
+	})
+	if err := a.Validate(); err != nil {
+		t.Fatalf("Validate: unexpected error: %v", err)
+	}
+}

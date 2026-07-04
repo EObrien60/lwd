@@ -16,13 +16,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 
+	"lwd/internal/build"
 	"lwd/internal/compose"
 	"lwd/internal/node"
 	"lwd/internal/router"
+	"lwd/internal/source"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -68,14 +71,18 @@ type Reconciler struct {
 	store   *store.Store
 	secrets SecretResolver
 	compose compose.Composer
+	src     source.Git
+	bld     build.Builder
 	mu      sync.Mutex
 }
 
 // New returns a Reconciler bound to a node, a router, a store, a secret
-// resolver used to inject an app's declared secrets into its container env,
-// and a Composer used to delegate compose-app deploys to `docker compose`.
-func New(n node.Node, r router.Router, s *store.Store, sec SecretResolver, comp compose.Composer) *Reconciler {
-	return &Reconciler{node: n, router: r, store: s, secrets: sec, compose: comp}
+// resolver used to inject an app's declared secrets into its container env, a
+// Composer used to delegate compose-app deploys (and rendered backing-service
+// stacks) to `docker compose`, a Git source used to clone git-built apps, and
+// a Builder used to `docker build` them.
+func New(n node.Node, r router.Router, s *store.Store, sec SecretResolver, comp compose.Composer, src source.Git, bld build.Builder) *Reconciler {
+	return &Reconciler{node: n, router: r, store: s, secrets: sec, compose: comp, src: src, bld: bld}
 }
 
 // containerName returns the name of the surface container for one blue-green
@@ -92,17 +99,22 @@ func stagingHost(deployID int64) string {
 	return fmt.Sprintf("stage-%d.lwd.internal", deployID)
 }
 
-// Apply reconciles one app using zero-downtime blue-green:
-//  1. Validate the spec.
-//  2. Ensure the router and the shared network are up, and the image present.
-//  3. Start a new surface container under a fresh, uniquely numbered name.
-//  4. Stage it behind a throwaway internal host on the router and health-check
+// Apply reconciles one app. After validating the spec, it dispatches on the
+// app's shape: a git-built app ([git]+[build]) goes through applyGit (clone,
+// build, blue-green surface); a Phase-4 compose app goes through
+// applyCompose (delegated to `docker compose`, in place); anything else is a
+// plain image app, deployed via zero-downtime blue-green:
+//  1. Ensure the router and the shared network are up, the image present, and
+//     any declared backing services running.
+//  2. Start a new surface container under a fresh, uniquely numbered name,
+//     connected to the backing network too if the app declares services.
+//  3. Stage it behind a throwaway internal host on the router and health-check
 //     it THROUGH Caddy (or via Docker health / liveness, layered — see
 //     checkHealth) rather than talking to it directly.
-//  5. On success: flip the real domain to the new container, drop the staging
+//  4. On success: flip the real domain to the new container, drop the staging
 //     route, retire and remove the old surface (if any), and record a
 //     StatusRunning deployment.
-//  6. On failure: drop the staging route, remove the new container, and
+//  5. On failure: drop the staging route, remove the new container, and
 //     record a StatusFailed deployment. The live domain is never touched.
 func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deployment, error) {
 	r.mu.Lock()
@@ -112,10 +124,19 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 		return nil, fmt.Errorf("invalid spec: %w", err)
 	}
 
+	if app.Git != nil {
+		return r.applyGit(ctx, app)
+	}
 	if app.Compose != "" {
 		return r.applyCompose(ctx, app)
 	}
+	return r.applyImage(ctx, app)
+}
 
+// applyImage deploys a plain single-service image app via zero-downtime
+// blue-green, ensuring any declared backing services first. Callers must
+// hold r.mu; Apply does so before branching here.
+func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Deployment, error) {
 	if err := r.router.EnsureUp(ctx); err != nil {
 		return nil, fmt.Errorf("ensure router: %w", err)
 	}
@@ -125,13 +146,6 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 	if err := r.node.EnsureImage(ctx, app.Image); err != nil {
 		return nil, fmt.Errorf("ensure image: %w", err)
 	}
-
-	deployID, err := r.store.NextDeployID()
-	if err != nil {
-		return nil, fmt.Errorf("next deploy id: %w", err)
-	}
-	name := containerName(app, deployID)
-	stageHost := stagingHost(deployID)
 
 	specJSON, err := json.Marshal(app)
 	if err != nil {
@@ -154,17 +168,285 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 		})
 		return nil, fmt.Errorf("resolve secrets: %w", err)
 	}
-	env := make(map[string]string, len(app.Env)+len(secretVals))
-	for k, v := range app.Env {
+	env := mergeEnv(app.Env, secretVals)
+
+	// Backing services (if declared) are ensured before the surface starts,
+	// same as the git path: they're pinned infrastructure the surface may
+	// depend on at startup (e.g. a database URL pointing at it by name).
+	network, composeContent, err := r.ensureBacking(ctx, app, env)
+	if err != nil {
+		_, _ = r.store.RecordDeployment(store.Deployment{
+			App:       app.Name,
+			Image:     app.Image,
+			Status:    store.StatusFailed,
+			CreatedAt: time.Now(),
+			Spec:      string(specJSON),
+		})
+		return nil, fmt.Errorf("ensure backing: %w", err)
+	}
+
+	return r.deployBlueGreenSurface(ctx, app, app.Image, env, network, composeContent, specJSON)
+}
+
+// applyGit deploys a git-built app: clone the declared ref with the box's
+// git, build its Dockerfile into a locally-tagged image (skipping the build
+// if that exact sha's tag already exists — idempotent redeploys), and run it
+// via the same zero-downtime blue-green surface path as an image app. Backing
+// services, if declared, are ensured first (same as applyImage). Callers must
+// hold r.mu; Apply does so before branching here.
+func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deployment, error) {
+	if err := r.router.EnsureUp(ctx); err != nil {
+		return nil, fmt.Errorf("ensure router: %w", err)
+	}
+	if err := r.node.EnsureNetwork(ctx, lwdNetwork); err != nil {
+		return nil, fmt.Errorf("ensure network: %w", err)
+	}
+
+	specJSON, err := json.Marshal(app)
+	if err != nil {
+		return nil, fmt.Errorf("marshal spec snapshot: %w", err)
+	}
+
+	// Resolve declared secrets BEFORE cloning/building/ensuring backing.
+	// Fail closed: on error, record the failed attempt and return without
+	// ever shelling out to git, docker build, or docker compose.
+	secretVals, err := r.secrets.Resolve(app.Name, app.Secrets)
+	if err != nil {
+		_, _ = r.store.RecordDeployment(store.Deployment{
+			App:       app.Name,
+			Status:    store.StatusFailed,
+			CreatedAt: time.Now(),
+			Spec:      string(specJSON),
+		})
+		return nil, fmt.Errorf("resolve secrets: %w", err)
+	}
+	env := mergeEnv(app.Env, secretVals)
+
+	// Backing first: the source clone and build are the slowest and most
+	// failure-prone steps, so bring up any declared pinned services (and fail
+	// fast if that doesn't work) before spending time on them.
+	network, composeContent, err := r.ensureBacking(ctx, app, env)
+	if err != nil {
+		_, _ = r.store.RecordDeployment(store.Deployment{
+			App:       app.Name,
+			Status:    store.StatusFailed,
+			CreatedAt: time.Now(),
+			Spec:      string(specJSON),
+		})
+		return nil, fmt.Errorf("ensure backing: %w", err)
+	}
+
+	dir, err := os.MkdirTemp("", "lwd-git-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp clone dir: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	sha, err := r.src.Clone(ctx, app.Git.URL, app.Git.Ref, dir)
+	if err != nil {
+		_, _ = r.store.RecordDeployment(store.Deployment{
+			App:       app.Name,
+			Status:    store.StatusFailed,
+			CreatedAt: time.Now(),
+			Spec:      string(specJSON),
+			Compose:   composeContent,
+		})
+		return nil, fmt.Errorf("clone: %w", err)
+	}
+
+	tag := fmt.Sprintf("lwd-build/%s:%s", app.Name, shortSHA(sha))
+	contextDir := filepath.Join(dir, app.Git.Path)
+	dockerfile := "Dockerfile"
+	if app.Build != nil && app.Build.Dockerfile != "" {
+		dockerfile = app.Build.Dockerfile
+	}
+
+	exists, err := r.bld.ImageExists(ctx, tag)
+	if err != nil {
+		_, _ = r.store.RecordDeployment(store.Deployment{
+			App:       app.Name,
+			Image:     tag,
+			Status:    store.StatusFailed,
+			CreatedAt: time.Now(),
+			Spec:      string(specJSON),
+			Compose:   composeContent,
+		})
+		return nil, fmt.Errorf("check image exists: %w", err)
+	}
+	if !exists {
+		if err := r.bld.Build(ctx, contextDir, dockerfile, tag); err != nil {
+			_, _ = r.store.RecordDeployment(store.Deployment{
+				App:       app.Name,
+				Image:     tag,
+				Status:    store.StatusFailed,
+				CreatedAt: time.Now(),
+				Spec:      string(specJSON),
+				Compose:   composeContent,
+			})
+			return nil, fmt.Errorf("build: %w", err)
+		}
+	}
+
+	return r.deployBlueGreenSurface(ctx, app, tag, env, network, composeContent, specJSON)
+}
+
+// rollbackGit redeploys app (a git-built app's spec snapshot, with Image
+// already pinned to the prior deployment's built tag) directly through the
+// blue-green surface path, WITHOUT re-cloning or rebuilding — the tag is
+// already local from the original deploy. Backing services are re-ensured
+// (idempotent; pinned services already running are left alone by compose
+// semantics). Unlike applyGit/applyImage, this takes r.mu itself: Rollback
+// (its only caller) does not hold the lock, to avoid deadlocking against
+// Apply.
+func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App) (*store.Deployment, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Validate the declared shape (git url, build, domain, port, services...)
+	// against a copy with Image cleared: spec.Validate rejects a git app that
+	// declares Image (that combination is meaningless for user-authored
+	// lwd.toml, since Image is only ever populated by a completed build), but
+	// here Image is deliberately the previous deployment's built tag, pinned
+	// by Rollback so this redeploy skips cloning/building entirely.
+	unpinned := *app
+	unpinned.Image = ""
+	if err := unpinned.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid spec: %w", err)
+	}
+	if app.Image == "" {
+		return nil, fmt.Errorf("no built image tag recorded to roll back to for %q", app.Name)
+	}
+
+	if err := r.router.EnsureUp(ctx); err != nil {
+		return nil, fmt.Errorf("ensure router: %w", err)
+	}
+	if err := r.node.EnsureNetwork(ctx, lwdNetwork); err != nil {
+		return nil, fmt.Errorf("ensure network: %w", err)
+	}
+
+	specJSON, err := json.Marshal(app)
+	if err != nil {
+		return nil, fmt.Errorf("marshal spec snapshot: %w", err)
+	}
+
+	secretVals, err := r.secrets.Resolve(app.Name, app.Secrets)
+	if err != nil {
+		_, _ = r.store.RecordDeployment(store.Deployment{
+			App:       app.Name,
+			Image:     app.Image,
+			Status:    store.StatusFailed,
+			CreatedAt: time.Now(),
+			Spec:      string(specJSON),
+		})
+		return nil, fmt.Errorf("resolve secrets: %w", err)
+	}
+	env := mergeEnv(app.Env, secretVals)
+
+	network, composeContent, err := r.ensureBacking(ctx, app, env)
+	if err != nil {
+		_, _ = r.store.RecordDeployment(store.Deployment{
+			App:       app.Name,
+			Image:     app.Image,
+			Status:    store.StatusFailed,
+			CreatedAt: time.Now(),
+			Spec:      string(specJSON),
+		})
+		return nil, fmt.Errorf("ensure backing: %w", err)
+	}
+
+	return r.deployBlueGreenSurface(ctx, app, app.Image, env, network, composeContent, specJSON)
+}
+
+// mergeEnv merges an app's plain declared env with its resolved secret
+// values, with secrets winning on key collision. Used by both the image and
+// git deploy paths.
+func mergeEnv(base, secretVals map[string]string) map[string]string {
+	env := make(map[string]string, len(base)+len(secretVals))
+	for k, v := range base {
 		env[k] = v
 	}
 	for k, v := range secretVals {
 		env[k] = v // secrets win on key collision with plain env
 	}
+	return env
+}
+
+// shortSHA returns the first 12 characters of a git commit sha (the
+// convention used for lwd-build/<app>:<shortsha> image tags), or the whole
+// string if it's shorter than that.
+func shortSHA(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
+// ensureBacking renders app's declared [[service]] backing services (if any)
+// into a compose project and brings it up, PINNED, on a dedicated per-app
+// network — used by both the image and git deploy paths, and idempotently
+// re-run on every redeploy/rollback (compose only recreates what changed, so
+// already-running backing services and their data are left alone). Returns
+// ("", "", nil) if the app declares no services.
+//
+// The rendered YAML (composeContent) contains only ${NAME} references for a
+// service's declared secrets — never a resolved value — because it is
+// persisted verbatim to store.Deployment.Compose (plaintext) and served back
+// over the API. env is the app's merged env+resolved-secrets map; it is used
+// ONLY as the transient process env passed to `docker compose up` (UpSpec.Env
+// below), which is how compose actually resolves each ${NAME} reference at
+// up-time. env is never written to disk or to the store.
+func (r *Reconciler) ensureBacking(ctx context.Context, app *spec.App, env map[string]string) (network string, composeContent string, err error) {
+	if len(app.Services) == 0 {
+		return "", "", nil
+	}
+
+	yamlContent, net := RenderBackingCompose(app.Name, app.Services)
+
+	if err := r.node.EnsureNetwork(ctx, net); err != nil {
+		return "", "", fmt.Errorf("ensure backing network: %w", err)
+	}
+
+	tmp, err := os.CreateTemp("", "lwd-backing-*.yml")
+	if err != nil {
+		return "", "", fmt.Errorf("create temp backing compose file: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(yamlContent); err != nil {
+		tmp.Close()
+		return "", "", fmt.Errorf("write temp backing compose file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", "", fmt.Errorf("close temp backing compose file: %w", err)
+	}
+
+	if err := r.compose.Up(ctx, compose.UpSpec{Project: "lwd-" + app.Name, File: tmp.Name(), Env: env}); err != nil {
+		return "", "", fmt.Errorf("backing compose up: %w", err)
+	}
+
+	return net, yamlContent, nil
+}
+
+// deployBlueGreenSurface runs the shared back half of an image or git deploy:
+// start a new surface container under image, connect it to backingNetwork
+// (if non-empty), stage it behind a throwaway host, health-check it, flip
+// the live route, retire the old surface, and record a StatusRunning
+// deployment (with composeContent, if any, so Remove/Rollback know a backing
+// project exists). On any failure, the attempt is torn down and recorded
+// StatusFailed; the live route and any previously-running deployment are
+// left completely untouched (blue-green's isolation guarantee). Callers must
+// hold r.mu, have already validated the spec, ensured the router/lwd network,
+// resolved secrets into env, and ensured backing services.
+func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, app *spec.App, image string, env map[string]string, backingNetwork, composeContent string, specJSON []byte) (*store.Deployment, error) {
+	deployID, err := r.store.NextDeployID()
+	if err != nil {
+		return nil, fmt.Errorf("next deploy id: %w", err)
+	}
+	name := containerName(app, deployID)
+	stageHost := stagingHost(deployID)
 
 	c, err := r.node.RunContainer(ctx, node.RunSpec{
 		Name:  name,
-		Image: app.Image,
+		Image: image,
 		Env:   env,
 		Labels: map[string]string{
 			"lwd.app":    app.Name,
@@ -178,6 +460,13 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 		return nil, fmt.Errorf("run container: %w", err)
 	}
 
+	if backingNetwork != "" {
+		if err := r.node.ConnectContainerToNetwork(ctx, c.ID, backingNetwork); err != nil {
+			_ = r.node.RemoveContainer(ctx, c.ID)
+			return nil, fmt.Errorf("connect container to backing network: %w", err)
+		}
+	}
+
 	if err := r.router.SetStaging(ctx, stageHost, name, app.Port); err != nil {
 		_ = r.node.RemoveContainer(ctx, c.ID)
 		return nil, fmt.Errorf("set staging route: %w", err)
@@ -189,7 +478,7 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 		// at it. Blue-green means a failed candidate never affects what's
 		// currently serving traffic, so we must not retire or otherwise mutate
 		// that row here.
-		r.recordFailedCandidate(ctx, app, stageHost, c.ID, specJSON)
+		r.recordFailedSurface(ctx, app, stageHost, c.ID, image, specJSON, composeContent)
 		return nil, fmt.Errorf("health check failed: %w", healthErr)
 	}
 
@@ -205,7 +494,7 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 		// still pointing at the old container or unset if this is the first
 		// deploy, is unaffected, and the prior running deployment row is left
 		// untouched).
-		r.recordFailedCandidate(ctx, app, stageHost, c.ID, specJSON)
+		r.recordFailedSurface(ctx, app, stageHost, c.ID, image, specJSON, composeContent)
 		return nil, fmt.Errorf("set route: %w", err)
 	}
 	_ = r.router.RemoveStaging(ctx, stageHost)
@@ -218,11 +507,12 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 
 	dep := store.Deployment{
 		App:         app.Name,
-		Image:       app.Image,
+		Image:       image,
 		ContainerID: c.ID,
 		Status:      store.StatusRunning,
 		CreatedAt:   time.Now(),
 		Spec:        string(specJSON),
+		Compose:     composeContent,
 	}
 	id, err := r.store.RecordDeployment(dep)
 	if err != nil {
@@ -230,6 +520,30 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 	}
 	dep.ID = id
 	return &dep, nil
+}
+
+// recordFailedSurface tears down a failed blue-green candidate: it removes
+// the staging route (a no-op if already removed) and the new container, then
+// records a StatusFailed deployment carrying the attempt's Spec (and, if the
+// app declares backing services, its rendered Compose) snapshot. Errors from
+// cleanup and from recording are intentionally swallowed here — the caller
+// always returns its own wrapped error for the actual failure cause. The
+// prior running deployment/route is never touched by this helper, preserving
+// blue-green's isolation guarantee: a failed candidate, however it failed,
+// never affects what's currently serving traffic.
+func (r *Reconciler) recordFailedSurface(ctx context.Context, app *spec.App, stageHost, containerID, image string, specJSON []byte, composeContent string) {
+	_ = r.router.RemoveStaging(ctx, stageHost)
+	_ = r.node.RemoveContainer(ctx, containerID)
+
+	_, _ = r.store.RecordDeployment(store.Deployment{
+		App:         app.Name,
+		Image:       image,
+		ContainerID: containerID,
+		Status:      store.StatusFailed,
+		CreatedAt:   time.Now(),
+		Spec:        string(specJSON),
+		Compose:     composeContent,
+	})
 }
 
 // applyCompose deploys a compose app by delegating orchestration to `docker
@@ -429,10 +743,32 @@ func (r *Reconciler) Remove(ctx context.Context, appName string) error {
 		return fmt.Errorf("current deployment: %w", err)
 	}
 
-	if cur != nil && cur.Compose != "" {
+	// Both a Phase-4 compose app and an image/git app with backing services
+	// leave cur.Compose non-empty, but they're removed differently: a
+	// compose app's Compose IS the app (docker compose down tears down
+	// everything, no separate surface container); a git/image app's Compose
+	// is only its PINNED backing project alongside a surface container that
+	// still needs removing by label. isComposeApp distinguishes the two by
+	// checking whether the app's own spec snapshot declared a Compose file.
+	if cur != nil && cur.Compose != "" && isComposeApp(cur.Spec) {
 		return r.removeCompose(ctx, appName, cur)
 	}
 	return r.removeSingleService(ctx, appName, cur)
+}
+
+// isComposeApp reports whether specJSON's snapshot is a Phase-4
+// user-provided compose app (its App.Compose field names the original
+// compose file), as opposed to a git/image app that merely has backing
+// services rendered into deployment.Compose.
+func isComposeApp(specJSON string) bool {
+	if specJSON == "" {
+		return false
+	}
+	var a spec.App
+	if err := json.Unmarshal([]byte(specJSON), &a); err != nil {
+		return false
+	}
+	return a.Compose != ""
 }
 
 // removeCompose tears down a compose app's stack via `docker compose down`
@@ -467,7 +803,9 @@ func (r *Reconciler) removeCompose(ctx context.Context, appName string, cur *sto
 	return r.store.SetStatus(cur.ID, store.StatusRetired)
 }
 
-// removeSingleService removes every container labeled lwd.app=appName,
+// removeSingleService removes every container labeled lwd.app=appName, downs
+// the app's PINNED backing project if it had one (cur.Compose non-empty —
+// named volumes are intentionally left in place, data is not auto-destroyed),
 // removes the app's Caddy route (resolved from cur's Spec snapshot, if any),
 // and retires cur, if present. cur may be nil (nothing recorded for appName
 // yet) — removal still runs as a defensive cleanup of any stray containers.
@@ -487,6 +825,12 @@ func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cu
 		}
 	}
 
+	if cur != nil && cur.Compose != "" {
+		if err := r.downBacking(ctx, appName, cur.Compose); err != nil {
+			return err
+		}
+	}
+
 	if domain != "" {
 		// Best-effort, same rationale as removeCompose above.
 		_ = r.router.RemoveRoute(ctx, domain)
@@ -494,6 +838,31 @@ func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cu
 
 	if cur != nil {
 		return r.store.SetStatus(cur.ID, store.StatusRetired)
+	}
+	return nil
+}
+
+// downBacking tears down a git/image app's PINNED backing project via
+// `docker compose down`, writing its stored rendered compose content
+// (composeContent) to a temp file since Down takes a file path. Named
+// volumes are not pruned by `down` without `-v`, so data persists.
+func (r *Reconciler) downBacking(ctx context.Context, appName, composeContent string) error {
+	tmp, err := os.CreateTemp("", "lwd-backing-rm-*.yml")
+	if err != nil {
+		return fmt.Errorf("create temp backing compose file: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(composeContent); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp backing compose file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp backing compose file: %w", err)
+	}
+
+	project := "lwd-" + appName
+	if err := r.compose.Down(ctx, project, tmp.Name()); err != nil {
+		return fmt.Errorf("backing compose down: %w", err)
 	}
 	return nil
 }
@@ -512,24 +881,35 @@ func domainFromSpec(specJSON string) string {
 }
 
 // Rollback redeploys the most recent retired ("previous") deployment for app,
-// restoring its exact image via a fresh blue-green Apply — so a rollback is
+// restoring its exact image via a fresh blue-green deploy — so a rollback is
 // itself zero-downtime and health-gated like any other deploy. It reads the
 // previous deployment's stored Spec snapshot (captured at the time that
 // deployment was originally applied) rather than re-resolving lwd.toml, so it
 // restores precisely what was running before, even if the local spec file has
 // since changed.
 //
-// For a compose app (prev.Compose non-empty), the previous deployment's
-// stored compose content — not whatever currently lives at the original
-// file path, which may have changed or been deleted since — is written to a
-// fresh temp file and restored.Compose is repointed at it before delegating
-// to Apply, so the rollback re-applies the exact prior stack. The temp file
-// is removed once Apply returns (applyCompose reads it synchronously before
-// then, so this is safe).
+// It dispatches on the restored spec's shape:
+//
+//   - A git-built app (restored.Git != nil) goes through rollbackGit, which
+//     redeploys the previous deployment's built image tag
+//     (lwd-build/<app>:<oldsha>, still local) directly — no re-clone, no
+//     rebuild — re-ensuring backing services from the restored spec.
+//   - A Phase-4 compose app (restored.Compose non-empty — i.e. the app's OWN
+//     spec named a compose file, not merely a git/image app with backing
+//     services rendered into the deployment row's Compose) has the previous
+//     deployment's stored compose content — not whatever currently lives at
+//     the original file path, which may have changed or been deleted since —
+//     written to a fresh temp file, and restored.Compose repointed at it
+//     before delegating to Apply, so the rollback re-applies the exact prior
+//     stack. The temp file is removed once Apply returns (applyCompose reads
+//     it synchronously before then, so this is safe).
+//   - Anything else (a plain image app, with or without backing services)
+//     delegates to Apply directly; applyImage re-ensures backing itself.
 //
 // Rollback does not hold r.mu itself: it only reads from the store and
-// unmarshals JSON before delegating to Apply, which takes the lock. Locking
-// here too would deadlock against Apply's own Lock/Unlock.
+// unmarshals JSON before delegating to Apply/rollbackGit, which take the
+// lock themselves. Locking here too would deadlock against their own
+// Lock/Unlock.
 func (r *Reconciler) Rollback(ctx context.Context, app string) (*store.Deployment, error) {
 	prev, err := r.store.PreviousDeployment(app)
 	if err != nil {
@@ -547,12 +927,16 @@ func (r *Reconciler) Rollback(ctx context.Context, app string) (*store.Deploymen
 		return nil, fmt.Errorf("unmarshal spec snapshot for %q: %w", app, err)
 	}
 	// Pin the image to exactly what that deployment recorded, guaranteeing
-	// the same digest/ref is restored even if the snapshot's Image field
-	// somehow diverged from it. Harmless for a compose app, whose Image is
-	// always empty.
+	// the same digest/ref/built-tag is restored even if the snapshot's Image
+	// field somehow diverged from it. Harmless for a compose app, whose
+	// Image is always empty.
 	restored.Image = prev.Image
 
-	if prev.Compose != "" {
+	if restored.Git != nil {
+		return r.rollbackGit(ctx, &restored)
+	}
+
+	if restored.Compose != "" {
 		tmp, err := os.CreateTemp("", "lwd-compose-rollback-*.yml")
 		if err != nil {
 			return nil, fmt.Errorf("create temp compose file: %w", err)
@@ -569,28 +953,6 @@ func (r *Reconciler) Rollback(ctx context.Context, app string) (*store.Deploymen
 	}
 
 	return r.Apply(ctx, &restored)
-}
-
-// recordFailedCandidate tears down a failed candidate deployment: it removes
-// the staging route (a no-op if already removed) and the new container, then
-// records a StatusFailed deployment carrying the attempt's Spec snapshot.
-// Errors from cleanup and from recording are intentionally swallowed here —
-// the caller always returns its own wrapped error for the actual failure
-// cause. The prior running deployment/route is never touched by this helper,
-// preserving blue-green's isolation guarantee: a failed candidate, however it
-// failed, never affects what's currently serving traffic.
-func (r *Reconciler) recordFailedCandidate(ctx context.Context, app *spec.App, stageHost, containerID string, specJSON []byte) {
-	_ = r.router.RemoveStaging(ctx, stageHost)
-	_ = r.node.RemoveContainer(ctx, containerID)
-
-	_, _ = r.store.RecordDeployment(store.Deployment{
-		App:         app.Name,
-		Image:       app.Image,
-		ContainerID: containerID,
-		Status:      store.StatusFailed,
-		CreatedAt:   time.Now(),
-		Spec:        string(specJSON),
-	})
 }
 
 // checkHealth gates the blue-green cutover using lwd's layered health policy,

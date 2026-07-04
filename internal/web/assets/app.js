@@ -148,6 +148,124 @@ function tomlString(v) {
   return JSON.stringify(String(v));
 }
 
+// ---------------------------------------------------------------------------
+// Deploy-modal toml generation (From Git / Builder tabs)
+//
+// These build an lwd.toml document client-side from form state, entirely so
+// the "From Git" and "Builder" tabs can POST to the existing /api/apply
+// (raw-toml) endpoint without any new server surface. They're pure functions
+// of the form objects so the live preview pane can call them on every
+// keystroke, and so a throwaway `go run` can sanity-check the output against
+// spec.Parse.
+//
+// TOML rule that matters here: root-level scalar keys (name/domain/port/env/
+// secrets/image) must be emitted before any table header ([git], [build]) or
+// array-of-tables header ([[services]]) — once a header is written, bare
+// `key = value` lines belong to that table.
+
+// envRowsToInline renders [{key,value}, ...] rows into an inline table
+// (`{ "K" = "V", ... }`), skipping rows with a blank key. Returns '' if no
+// rows have a usable key (the caller omits the `env = ...` line entirely).
+//
+// Both the key and the value are passed through tomlString (quoted TOML
+// basic strings). Quoting the key is a security-relevant choice, not just
+// style: a bare/unquoted key is emitted as raw TOML syntax, so a key
+// containing e.g. a newline, `"`, `#`, or `}` could otherwise terminate the
+// inline table early and inject arbitrary top-level TOML (including a new
+// `[[services]]` block) into the generated document, which is then sent to
+// the server's /api/apply endpoint. A quoted TOML basic string can't break
+// out of its own quotes (tomlString uses JSON.stringify, which escapes `"`,
+// `\`, and control characters), so a quoted key is always a single atomic
+// token no matter what characters it contains.
+function envRowsToInline(rows) {
+  const entries = (rows || [])
+    .filter((r) => r && r.key && r.key.trim() !== '')
+    .map((r) => `${tomlString(r.key.trim())} = ${tomlString(r.value || '')}`);
+  if (!entries.length) return '';
+  return `{ ${entries.join(', ')} }`;
+}
+
+// namesToArray renders a list of plain strings into a toml string array
+// (`["A", "B"]`), trimming and dropping blanks. Returns '' if nothing is left.
+function namesToArray(names) {
+  const list = (names || []).map((n) => (n || '').trim()).filter(Boolean);
+  if (!list.length) return '';
+  return `[${list.map(tomlString).join(', ')}]`;
+}
+
+// appendServiceTables pushes one `[[services]]` array-of-tables block per
+// backing-service row onto `lines`. A row with neither a name nor an image
+// is treated as an unfinished/blank row and skipped.
+function appendServiceTables(lines, services) {
+  for (const svc of services || []) {
+    if (!svc) continue;
+    const name = (svc.name || '').trim();
+    const image = (svc.image || '').trim();
+    if (!name && !image) continue;
+
+    lines.push('');
+    lines.push('[[services]]');
+    lines.push(`name = ${tomlString(name)}`);
+    lines.push(`image = ${tomlString(image)}`);
+    const command = (svc.command || '').trim();
+    if (command) lines.push(`command = ${tomlString(command)}`);
+    const env = envRowsToInline(svc.env);
+    if (env) lines.push(`env = ${env}`);
+    const secrets = namesToArray(svc.secrets);
+    if (secrets) lines.push(`secrets = ${secrets}`);
+    const volume = (svc.volume || '').trim();
+    if (volume) lines.push(`volume = ${tomlString(volume)}`);
+  }
+}
+
+// buildGitToml renders the "From Git" form into an lwd.toml document:
+// top-level app fields, a [git] block, a [build] block, then any declared
+// [[services]].
+function buildGitToml(f) {
+  const lines = [];
+  lines.push(`name = ${tomlString((f.name || '').trim())}`);
+  lines.push(`domain = ${tomlString((f.domain || '').trim())}`);
+  if (String(f.port || '').trim()) lines.push(`port = ${parseInt(f.port, 10)}`);
+  const env = envRowsToInline(f.env);
+  if (env) lines.push(`env = ${env}`);
+  const secrets = namesToArray(f.secrets);
+  if (secrets) lines.push(`secrets = ${secrets}`);
+
+  lines.push('');
+  lines.push('[git]');
+  lines.push(`url = ${tomlString((f.url || '').trim())}`);
+  lines.push(`ref = ${tomlString((f.ref || '').trim() || 'main')}`);
+  const subdir = (f.subdir || '').trim();
+  if (subdir) lines.push(`path = ${tomlString(subdir)}`);
+
+  lines.push('');
+  lines.push('[build]');
+  lines.push(`dockerfile = ${tomlString((f.dockerfile || '').trim() || 'Dockerfile')}`);
+
+  appendServiceTables(lines, f.services);
+
+  return lines.join('\n') + '\n';
+}
+
+// buildBuilderToml renders the "Builder" form (an image app, not a git build)
+// into an lwd.toml document: top-level app fields (including `image`), then
+// any declared [[services]].
+function buildBuilderToml(f) {
+  const lines = [];
+  lines.push(`name = ${tomlString((f.name || '').trim())}`);
+  lines.push(`image = ${tomlString((f.image || '').trim())}`);
+  lines.push(`domain = ${tomlString((f.domain || '').trim())}`);
+  if (String(f.port || '').trim()) lines.push(`port = ${parseInt(f.port, 10)}`);
+  const env = envRowsToInline(f.env);
+  if (env) lines.push(`env = ${env}`);
+  const secrets = namesToArray(f.secrets);
+  if (secrets) lines.push(`secrets = ${secrets}`);
+
+  appendServiceTables(lines, f.services);
+
+  return lines.join('\n') + '\n';
+}
+
 // durationString converts a Go time.Duration (nanoseconds, as it appears in
 // the JSON snapshot) into a compact Go-style duration string ("30s"), used
 // as a fallback when a stored spec has no RawTimeout (e.g. it was defaulted
@@ -197,12 +315,19 @@ function dashboard() {
     secretDeleteBusy: '',
 
     // ---- deploy modal --------------------------------------------------
+    // deploy.tab selects the active source in 'create' mode: 'git' (From
+    // Git), 'builder' (image app), or 'paste' (raw toml, the original flow).
+    // 'edit' mode (from Config -> "Edit & apply") always uses the paste
+    // textarea, pre-filled with the rendered current spec.
     deploy: {
       open: false,
       mode: 'create', // 'create' | 'edit'
+      tab: 'git', // 'git' | 'builder' | 'paste'
       toml: '',
       error: '',
       busy: false,
+      git: null,
+      builder: null,
     },
 
     // ---- danger zone ---------------------------------------------------
@@ -478,26 +603,92 @@ function dashboard() {
     // ====================================================================
     // deploy modal (create / edit-and-apply)
     // ====================================================================
+    newEnvRow() {
+      return { key: '', value: '' };
+    },
+
+    newServiceRow() {
+      return { name: '', image: '', command: '', volume: '', env: [], secrets: [] };
+    },
+
+    newGitForm() {
+      return {
+        url: '', ref: 'main', subdir: '', dockerfile: 'Dockerfile',
+        name: '', domain: '', port: '',
+        env: [], secrets: [], services: [],
+      };
+    },
+
+    newBuilderForm() {
+      return {
+        image: '',
+        name: '', domain: '', port: '',
+        env: [], secrets: [], services: [],
+      };
+    },
+
     openDeployCreate() {
-      this.deploy = { open: true, mode: 'create', toml: '', error: '', busy: false };
+      this.deploy = {
+        open: true, mode: 'create', tab: 'git', toml: '', error: '', busy: false,
+        git: this.newGitForm(), builder: this.newBuilderForm(),
+      };
     },
 
     openDeployEdit() {
-      this.deploy = { open: true, mode: 'edit', toml: this.currentSpecToml, error: '', busy: false };
+      this.deploy = {
+        open: true, mode: 'edit', tab: 'paste', toml: this.currentSpecToml, error: '', busy: false,
+        git: this.newGitForm(), builder: this.newBuilderForm(),
+      };
     },
 
     closeDeploy() {
       this.deploy.open = false;
     },
 
+    // gitPreviewToml / builderPreviewToml are the live "transparency" preview
+    // shown next to the From-Git / Builder forms, and also exactly what gets
+    // POSTed to /api/apply on submit — the preview is never a lie.
+    get gitPreviewToml() {
+      return buildGitToml(this.deploy.git);
+    },
+
+    get builderPreviewToml() {
+      return buildBuilderToml(this.deploy.builder);
+    },
+
+    get gitFormValid() {
+      const f = this.deploy.git;
+      return !!(f && f.url.trim() && f.name.trim() && f.domain.trim() && String(f.port).trim());
+    },
+
+    get builderFormValid() {
+      const f = this.deploy.builder;
+      return !!(f && f.image.trim() && f.name.trim() && f.domain.trim() && String(f.port).trim());
+    },
+
+    // deploySubmitDisabled gates the Apply button client-side (name/domain/
+    // port required for From-Git and Builder; non-empty body for Paste and
+    // Edit). The daemon validates fully regardless — this is just to avoid a
+    // pointless round trip for an obviously-incomplete form.
+    get deploySubmitDisabled() {
+      if (this.deploy.busy) return true;
+      if (this.deploy.mode === 'edit' || this.deploy.tab === 'paste') return !this.deploy.toml.trim();
+      if (this.deploy.tab === 'git') return !this.gitFormValid;
+      if (this.deploy.tab === 'builder') return !this.builderFormValid;
+      return true;
+    },
+
     async submitDeploy() {
       this.deploy.busy = true;
       this.deploy.error = '';
+      const toml = (this.deploy.mode === 'edit' || this.deploy.tab === 'paste')
+        ? this.deploy.toml
+        : (this.deploy.tab === 'git' ? this.gitPreviewToml : this.builderPreviewToml);
       try {
         const dep = await apiFetch('/api/apply', {
           method: 'POST',
           headers: { 'Content-Type': 'text/plain' },
-          body: this.deploy.toml,
+          body: toml,
         });
         this.notify('ok', `Applied ${dep && dep.App ? dep.App : 'app'}.`);
         this.deploy.open = false;
