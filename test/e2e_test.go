@@ -55,6 +55,17 @@ const composeAppLabel = "e2e-compose"
 const composeDomain = "compose-whoami.localhost"
 const composeProject = "lwd-" + composeAppLabel
 
+// gitAppLabel, gitDomain, gitBackingProject, and gitBuiltImageRepo are the
+// app name, domain, backing-compose project, and built-image repository used
+// by TestEndToEndGitDeploy. gitBackingProject mirrors the reconciler's
+// "lwd-<app>" project/network convention (see reconciler.ensureBacking /
+// RenderBackingCompose); gitBuiltImageRepo mirrors its "lwd-build/<app>" tag
+// convention (see reconciler.applyGit).
+const gitAppLabel = "e2e-git"
+const gitDomain = "git-whoami.localhost"
+const gitBackingProject = "lwd-" + gitAppLabel
+const gitBuiltImageRepo = "lwd-build/" + gitAppLabel
+
 // caddyContainerName mirrors router.caddyContainerName (unexported), needed
 // here only for best-effort cleanup via the docker CLI.
 const caddyContainerName = "lwd-caddy"
@@ -456,6 +467,276 @@ func TestEndToEndComposeApp(t *testing.T) {
 		t.Fatalf("Remove: %v", err)
 	}
 	assertNoComposeProjectContainers(t, composeProject)
+}
+
+// TestEndToEndGitDeploy drives the real stack — including real
+// source.CLI (git) and build.CLI (`docker build`), not the fakes used by the
+// reconciler's unit tests — against a real Docker daemon. It creates a
+// throwaway local git repo (a one-line `FROM traefik/whoami` Dockerfile) and
+// deploys it as a git-built app declaring a `cache` (redis) backing service,
+// proving the full Phase 6 flow end to end:
+//
+//   - clone (via `file://<repo>`) + `docker build` actually produce a locally
+//     tagged image (`lwd-build/e2e-git:<sha>`), which is then run via the
+//     same zero-downtime blue-green surface path as an `image` app;
+//   - the declared backing service comes up as a real pinned container on
+//     the app's own compose project/network, reachable independent of
+//     whoami actually using it;
+//   - redeploying the same git ref reuses the built tag (no rebuild) while
+//     still starting a fresh surface container (blue-green), and leaves the
+//     pinned backing container completely untouched (same id);
+//   - rollback redeploys the prior built tag without re-cloning or
+//     rebuilding, and likewise never disturbs the backing container.
+//
+// Run with: LWD_DOCKER_TEST=1 go test ./test/ -run TestEndToEndGitDeploy -v
+func TestEndToEndGitDeploy(t *testing.T) {
+	if os.Getenv("LWD_DOCKER_TEST") == "" {
+		t.Skip("set LWD_DOCKER_TEST=1 to run the end-to-end test against real Docker")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found on PATH")
+	}
+	if out, err := exec.Command("docker", "compose", "version").CombinedOutput(); err != nil {
+		t.Skipf("docker compose plugin not available (docker compose version failed: %v: %s)", err, out)
+	}
+
+	repoDir, branch := setupGitRepo(t)
+
+	dir := t.TempDir()
+
+	n, err := node.NewLocal()
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	// Registered before the main cleanup below so it runs LAST (t.Cleanup is
+	// LIFO) — the store must still be open when cleanupGitDeployResources
+	// calls rec.Remove.
+	t.Cleanup(func() { s.Close() })
+
+	rtr := router.NewCaddyRouter(n, dir)
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	secStore := secrets.NewStore(cipher, s)
+	rec := reconciler.New(n, rtr, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI())
+
+	t.Cleanup(func() {
+		cleanupGitDeployResources(t, rec)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := rtr.EnsureUp(ctx); err != nil {
+		if portsInUse(t) {
+			t.Skipf("ports 80/443 appear to be in use and EnsureUp failed: %v", err)
+		}
+		t.Fatalf("EnsureUp: %v", err)
+	}
+
+	app := &spec.App{
+		Name:   gitAppLabel,
+		Git:    &spec.Git{URL: "file://" + repoDir, Ref: branch},
+		Build:  &spec.Build{Dockerfile: "Dockerfile"},
+		Domain: gitDomain,
+		Port:   80, // whoami listens on :80
+		Node:   "local",
+		Services: []spec.Service{
+			{Name: "cache", Image: "redis:7-alpine"},
+		},
+	}
+	app.Health.Path = "/"
+	app.Health.Timeout = 30 * time.Second
+
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	// --- First deploy: clone + build + backing + surface ---
+	// A generous outer timeout: unlike the other e2e tests, this deploy also
+	// clones a repo and runs `docker build` (which may need to pull the
+	// traefik/whoami base layers on a cold cache).
+	applyCtx, applyCancel := context.WithTimeout(context.Background(), 180*time.Second)
+	dep1, err := rec.Apply(applyCtx, app)
+	applyCancel()
+	if err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	if dep1.Status != store.StatusRunning {
+		t.Fatalf("first deploy status = %q, want running", dep1.Status)
+	}
+	if !strings.HasPrefix(dep1.Image, gitBuiltImageRepo+":") {
+		t.Fatalf("first deploy image = %q, want prefix %q", dep1.Image, gitBuiltImageRepo+":")
+	}
+
+	assertReachableDomain(t, client, gitDomain, "first deploy")
+
+	// The built image must actually exist locally — proves docker build ran
+	// against the cloned repo, not just that the reconciler recorded a tag.
+	if out, err := exec.Command("docker", "image", "inspect", dep1.Image).CombinedOutput(); err != nil {
+		t.Fatalf("docker image inspect %s: %v: %s", dep1.Image, err, out)
+	}
+
+	// The cache (redis) backing container must be running, pinned, on the
+	// app's own compose project/network — independent of whoami actually
+	// talking to it.
+	redisID1 := composeServiceContainerID(t, gitBackingProject, "cache")
+
+	// --- Redeploy: same repo/ref, so the build should be skipped
+	// (ImageExists short-circuits it), but a fresh surface is still started
+	// (blue-green), and the pinned backing service must be left completely
+	// untouched.
+	applyCtx2, applyCancel2 := context.WithTimeout(context.Background(), 180*time.Second)
+	dep2, err := rec.Apply(applyCtx2, app)
+	applyCancel2()
+	if err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+	if dep2.Status != store.StatusRunning {
+		t.Fatalf("second deploy status = %q, want running", dep2.Status)
+	}
+	if dep2.Image != dep1.Image {
+		t.Fatalf("second deploy image = %q, want unchanged %q (same git ref should reuse the built tag)", dep2.Image, dep1.Image)
+	}
+	if dep2.ContainerID == dep1.ContainerID {
+		t.Fatalf("second deploy reused the same container id %q; blue-green should start a fresh surface", dep2.ContainerID)
+	}
+
+	assertReachableDomain(t, client, gitDomain, "after redeploy")
+
+	redisID2 := composeServiceContainerID(t, gitBackingProject, "cache")
+	if redisID2 != redisID1 {
+		t.Fatalf("cache (redis) backing container id changed across redeploy (%q -> %q): a pinned backing service must never be recreated by a surface redeploy", redisID1, redisID2)
+	}
+
+	// --- Rollback: redeploys the previous deployment's built image tag
+	// (here, identical to the current one, since the git ref/sha never
+	// changed) without re-cloning or rebuilding, and must not disturb the
+	// pinned backing service.
+	rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 180*time.Second)
+	dep3, err := rec.Rollback(rollbackCtx, gitAppLabel)
+	rollbackCancel()
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if dep3 == nil {
+		t.Fatal("Rollback returned nil deployment")
+	}
+	if dep3.Status != store.StatusRunning {
+		t.Fatalf("rollback deploy status = %q, want running", dep3.Status)
+	}
+	if dep3.Image != dep1.Image {
+		t.Fatalf("rollback image = %q, want the prior built tag %q", dep3.Image, dep1.Image)
+	}
+
+	assertReachableDomain(t, client, gitDomain, "after rollback")
+
+	redisID3 := composeServiceContainerID(t, gitBackingProject, "cache")
+	if redisID3 != redisID1 {
+		t.Fatalf("cache (redis) backing container id changed across rollback (%q -> %q): rollback must not disturb pinned backing services", redisID1, redisID3)
+	}
+}
+
+// setupGitRepo creates a throwaway local git repository in a fresh temp dir
+// containing a single-line Dockerfile (`FROM traefik/whoami` — the base
+// image already listens on :80 and needs no build steps of its own), commits
+// it under a local-only git identity, and returns the repo's directory and
+// its current branch name (whatever the host's git default-branch config
+// produces — deliberately not assumed to be "main", since that depends on
+// the host's git version/config).
+func setupGitRepo(t *testing.T) (dir, branch string) {
+	t.Helper()
+	dir = t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM traefik/whoami\n"), 0o644); err != nil {
+		t.Fatalf("write Dockerfile: %v", err)
+	}
+
+	runGit(t, dir, "init")
+	runGit(t, dir, "config", "user.email", "lwd-e2e@example.com")
+	runGit(t, dir, "config", "user.name", "lwd e2e")
+	runGit(t, dir, "add", "Dockerfile")
+	runGit(t, dir, "commit", "-m", "init")
+
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git -C %s rev-parse --abbrev-ref HEAD: %v: %s", dir, err, out)
+	}
+	branch = strings.TrimSpace(string(out))
+	if branch == "" {
+		t.Fatalf("git -C %s rev-parse --abbrev-ref HEAD returned an empty branch name", dir)
+	}
+	return dir, branch
+}
+
+// runGit runs `git -C dir <args...>`, failing the test with the command's
+// combined output on error.
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	fullArgs := append([]string{"-C", dir}, args...)
+	if out, err := exec.Command("git", fullArgs...).CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v: %s", strings.Join(fullArgs, " "), err, out)
+	}
+}
+
+// cleanupGitDeployResources is TestEndToEndGitDeploy's defensive teardown.
+// It asks the reconciler to remove the app (the product path: Remove ->
+// removes the surface container(s) by label + `compose down`s the pinned
+// backing project), falls back to direct docker commands in case Remove
+// never got a chance to run (e.g. the test failed before any deploy
+// succeeded), removes every built image tag for this app, then reuses the
+// shared lwd-caddy/lwd-network cleanup+verification from the other e2e
+// tests, and finally verifies no stray backing-project container remains.
+// Each removal step is best-effort (logged, not fatal); the verification
+// steps are real assertions.
+func cleanupGitDeployResources(t *testing.T, rec *reconciler.Reconciler) {
+	t.Helper()
+
+	if err := rec.Remove(context.Background(), gitAppLabel); err != nil {
+		t.Logf("cleanup: reconciler.Remove(%s): %v", gitAppLabel, err)
+	}
+
+	// Fallback: directly remove any stray backing-project containers and
+	// network in case Remove never ran.
+	out, err := exec.Command("docker", "ps", "-aq", "--filter", "label=com.docker.compose.project="+gitBackingProject).CombinedOutput()
+	if err != nil {
+		t.Logf("cleanup: docker ps (compose.project=%s) failed: %v: %s", gitBackingProject, err, out)
+	} else {
+		for _, id := range splitLines(string(out)) {
+			if rmOut, rmErr := exec.Command("docker", "rm", "-f", id).CombinedOutput(); rmErr != nil {
+				t.Logf("cleanup: docker rm -f %s failed: %v: %s", id, rmErr, rmOut)
+			}
+		}
+	}
+	if rmOut, rmErr := exec.Command("docker", "network", "rm", gitBackingProject).CombinedOutput(); rmErr != nil {
+		t.Logf("cleanup: docker network rm %s: %v: %s", gitBackingProject, rmErr, rmOut)
+	}
+
+	// Remove every built image tag for this app (best-effort: an already-gone
+	// tag from a failed early run, or an image still referenced by a
+	// not-yet-removed container, fails removal harmlessly).
+	imgOut, err := exec.Command("docker", "images", "--filter", "reference="+gitBuiltImageRepo, "-q").CombinedOutput()
+	if err != nil {
+		t.Logf("cleanup: docker images (reference=%s) failed: %v: %s", gitBuiltImageRepo, err, imgOut)
+	} else {
+		for _, id := range splitLines(string(imgOut)) {
+			if rmOut, rmErr := exec.Command("docker", "rmi", "-f", id).CombinedOutput(); rmErr != nil {
+				t.Logf("cleanup: docker rmi -f %s failed: %v: %s", id, rmErr, rmOut)
+			}
+		}
+	}
+
+	cleanupLWDResources(t, gitAppLabel)
+
+	// Verify no stray backing-project container remains.
+	verifyOut, err := exec.Command("docker", "ps", "-aq", "--filter", "label=com.docker.compose.project="+gitBackingProject).CombinedOutput()
+	if err != nil {
+		t.Errorf("cleanup verification: docker ps (compose.project=%s) failed: %v: %s", gitBackingProject, err, verifyOut)
+	} else if remaining := splitLines(string(verifyOut)); len(remaining) > 0 {
+		t.Errorf("cleanup verification: %d stray container(s) for backing project %s remain: %v", len(remaining), gitBackingProject, remaining)
+	}
 }
 
 // composeServiceContainerID resolves the running container ID for service

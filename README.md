@@ -6,8 +6,9 @@ free. Single static Go binary that is both the daemon and the CLI, plus an
 optional second binary, [`lwd-web`](#web-ui-lwd-web), for a browser
 dashboard.
 
-> This is the **router + blue-green + secrets + compose apps + web UI**
-> milestone. Pinned surfaces arrive in a later milestone.
+> This is the **router + blue-green + secrets + compose apps + web UI + git
+> deploy + backing services** milestone (Phases 1–6). Pinned surfaces (outside
+> compose) arrive in a later milestone.
 
 ## Build
 
@@ -50,7 +51,7 @@ self-signed cert instead of hitting a public CA.
 ## Deploy, inspect, and roll back
 
 ```bash
-lwd apply ./myapp     # deploy ./myapp/lwd.toml (blue-green for image apps, delegated to `docker compose` for compose apps)
+lwd apply ./myapp     # deploy ./myapp/lwd.toml (blue-green for image and git-built apps, delegated to `docker compose` for compose apps)
 lwd ls                # list apps and status
 lwd logs blog -f      # stream logs
 lwd history blog      # show past deployments for an app
@@ -60,12 +61,14 @@ lwd rm blog           # stop and deregister
 
 ## How deploys work
 
-This section describes single-service (`image`) apps; see
-[Compose apps](#compose-apps) for the multi-container `compose` model, which
-does not use blue-green.
+This section describes single-service (`image`) apps; a git-built app (see
+[Deploy from Git](#deploy-from-git)) uses this exact same blue-green path once
+its image has been built — the only difference is *what* image gets deployed.
+See [Compose apps](#compose-apps) for the multi-container `compose` model,
+which does not use blue-green.
 
-Every `apply` of a single-service app is a blue-green swap, never an in-place
-recreate:
+Every `apply` of a single-service or git-built app is a blue-green swap, never
+an in-place recreate:
 
 1. A new "surface" container is started alongside whatever is currently
    running, attached only to the private `lwd` network — it never publishes a
@@ -155,6 +158,133 @@ currently says. `lwd rm <app>` runs `docker compose down` against the stored con
 removing the project's containers and its own default network. `lwd logs` and `lwd ls`
 work the same as for single-service apps, against `service`'s container.
 
+## Deploy from Git
+
+Instead of a pre-built `image`, an app can be built straight from a git repo —
+declare `[git]` + `[build]` instead of `image`:
+
+```toml
+name   = "myapp"
+domain = "myapp.example.com"
+port   = 8080
+
+[git]
+url = "https://github.com/me/myapp"
+ref = "main"   # branch, tag, or commit sha; a branch tracks its latest commit on every deploy
+# path = "."   # subdir within the repo to use as the build context root
+
+[build]
+dockerfile = "Dockerfile"   # relative to git path
+```
+
+This composes the box's own tools exactly like lwd already composes `docker`,
+`docker compose`, and `caddy` — there is **no GitHub/GitLab API, OAuth, or
+webhook receiver** involved. `lwd apply` shells out to the host's `git clone`
+and then `docker build`; private repos work if the box's own git is already
+authenticated (an SSH key or a credential helper) — lwd itself manages no git
+credentials and never sees one.
+
+### Build → blue-green flow
+
+1. lwd clones `[git].ref` into a throwaway temp directory (removed after the
+   build) with the box's `git`, resolving it to a commit sha.
+2. It runs `docker build` against the checked-out tree (`[build].dockerfile`,
+   relative to `[git].path`), tagging the result `lwd-build/<app>:<shortsha>`.
+   If that exact tag already exists locally (redeploying the same commit),
+   the build is skipped — idempotent redeploys don't rebuild.
+3. The built image is then deployed exactly like an `image` app: a fresh
+   zero-downtime blue-green surface (see [How deploys work](#how-deploys-work)) —
+   staged, health-checked through Caddy, then cut over. No registry is
+   involved; the image only ever needs to exist on the local Docker daemon.
+4. The deployment record stores the resolved commit sha and the built image
+   tag, alongside the usual spec snapshot.
+
+### Rollback (tag-by-sha)
+
+Every build is tagged and kept by commit sha, so `lwd rollback <app>`
+redeploys the **previous deployment's already-built image tag** directly —
+no re-clone, no rebuild, just another blue-green swap onto
+`lwd-build/<app>:<oldsha>`, which is still sitting on the local Docker daemon.
+This costs some local disk for old image layers over time (nothing prunes
+old `lwd-build/*` tags automatically yet).
+
+### What git deploy supports
+
+Git deploy only supports the git-repo-has-a-Dockerfile → single-service
+blue-green shape. `lwd.toml` remains the source of truth for the app's name,
+domain, port, env, secrets, and backing services — lwd never reads a
+`lwd.toml` committed inside the cloned repo itself (a "the repo configures
+itself" model is a possible future addition, not built). Deploying a
+repo's *own* `docker-compose.yml` in place (as opposed to the Phase 4
+user-provided-compose model, which is unaffected) is also not built — see
+[Known limitations](#known-limitations-this-milestone). Validation rejects
+mixing `[git]` with `image` or `compose`, and requires `[build]` (a
+Dockerfile), `domain`, and `port`.
+
+`lwd-web`'s Deploy modal has a matching **From Git** tab (URL/ref/subdir,
+Dockerfile, name/domain/port, env, secrets, backing services) that builds the
+`lwd.toml` for you and applies it — see [Web UI](#web-ui-lwd-web).
+
+## Backing services
+
+Any single-service app — whether `image`-based or git-built — can declare
+**pinned backing services** (a database, a cache, an object store…) that lwd
+runs alongside it, even though the app itself is just one container:
+
+```toml
+name   = "myapp"
+image  = "ghcr.io/me/myapp:latest"   # or [git] + [build] — backing works with either
+domain = "myapp.example.com"
+port   = 8080
+env    = { DATABASE_URL = "postgres://app:app@db:5432/app" }
+
+[[services]]
+name   = "db"
+image  = "postgres:16"
+env    = { POSTGRES_USER = "app", POSTGRES_PASSWORD = "app", POSTGRES_DB = "app" }
+volume = "db-data:/var/lib/postgresql/data"
+
+[[services]]
+name    = "minio"
+image   = "minio/minio"
+command = "server /data"
+env     = { MINIO_ROOT_USER = "admin" }
+secrets = ["MINIO_ROOT_PASSWORD"]   # resolved and injected into the backing service too
+volume  = "minio-data:/data"
+```
+
+Each `[[services]]` entry accepts `name`, `image`, `command` (optional),
+`env`, `secrets` (declared names, resolved and injected the same fail-closed
+way as the app's own `secrets`), and `volume` (`name:path` for a named,
+persistent volume, or a bind-mount path).
+
+- **Pinned, never blue-greened.** Backing services are rendered into a
+  generated `docker-compose` project (`lwd-<app>`) and brought up with
+  `docker compose up -d`, on a dedicated per-app network. They are **not**
+  torn down or recreated on every `apply`/`rollback` of the app itself —
+  compose's own "only recreate what changed" semantics mean an unchanged
+  backing service (and its data) survives redeploy after redeploy.
+- **Named volumes persist.** A `volume = "name:path"` declares a top-level
+  named Docker volume; it is not removed by a normal redeploy, rollback, or
+  even `lwd rm` (which runs `compose down` without `-v` — data is never
+  auto-destroyed).
+- **Reachable by name.** The app's own surface container is connected to both
+  the shared `lwd` network (so Caddy can reach it) and the per-app backing
+  network (so it can reach `db`, `minio`, etc. by container name, exactly as
+  written in `env`/`secrets` above). Backing services publish no host ports;
+  they're internal-only.
+- **Works with `image` or `[git]` apps, not Phase-4 `compose` apps.**
+  `lwd.toml` validation rejects `[[services]]` on a `compose` app — those
+  already define their whole stack (including their own database/cache
+  services) directly in the compose file; see [Compose apps](#compose-apps).
+- **Removal:** `lwd rm <app>` removes the surface container(s) **and** runs
+  `compose down` on the backing project — this does remove the backing
+  containers, but named volumes are left in place unless pruned separately.
+
+`lwd-web`'s **From Git** and **Builder** tabs both have a "Backing services"
+section that builds `[[services]]` entries into the generated `lwd.toml` for
+you — see [Web UI](#web-ui-lwd-web).
+
 ## Secrets
 
 Apps can declare secret names in `lwd.toml`:
@@ -240,18 +370,34 @@ built-in TLS, so don't expose it directly to the internet. Instead:
 ### Features
 
 - **Overview** — every app's name, domain, status, image, and health at a
-  glance, with a **Deploy** action that applies a pasted `lwd.toml`.
+  glance, with a **Deploy** action to create a new app.
+- **Deploy modal — From Git / Builder / Paste** — three ways to author a new
+  app's `lwd.toml`, each with a live preview of the generated document:
+  - **From Git** builds a [git-deployed](#deploy-from-git) app: URL, ref,
+    subdir, Dockerfile, plus name/domain/port/env/secrets and any backing
+    services.
+  - **Builder** builds an `image`-based app the same way, minus the git
+    fields.
+  - **Paste** takes a raw `lwd.toml` document directly (also used for
+    **Edit & apply** on an existing app's config).
+  Both From Git and Builder have an "Add backing service" control that emits
+  `[[services]]` entries (name, image, command, env, secrets, volume) into
+  the generated document — see [Backing services](#backing-services).
 - **Live logs** — a per-app log stream over SSE, with a follow toggle.
 - **History + rollback** — past deployments for an app, with a one-click
-  **Roll back** to any prior deployment.
+  **Roll back** to any prior deployment (for a git-built app, this redeploys
+  the prior built image tag, same as `lwd rollback`).
 - **Secrets** — list secret names (never values), set, and delete.
 - **Redeploy** — re-apply an app's current deployment spec snapshot (e.g.
   after fixing something on the daemon host, or just to restart it).
 - **Config edit** — view and edit an app's `lwd.toml` and re-apply it.
 
 As with the CLI, compose apps deployed or edited through the UI still need
-their compose file present on the daemon host; pasting a full `lwd.toml` to
-create a new app from scratch works fully for single-service (`image`) apps.
+their compose file present on the daemon host, and a git-built app's repo
+must still be reachable (and, for a private repo, the daemon host's git
+already authenticated) at deploy time; pasting/generating a full `lwd.toml`
+for a single-service, git-built, or backing-service app works fully from the
+UI end to end.
 
 ## Networking model
 
@@ -267,26 +413,28 @@ create a new app from scratch works fully for single-service (`image`) apps.
 ## Scope of this milestone
 
 - Single host.
-- `domain` (routing + TLS) is fully live, for both single-service and compose
-  apps.
+- `domain` (routing + TLS) is fully live, for single-service, git-built, and
+  compose apps.
 - `secrets` (declare names in `lwd.toml`, set values via `lwd secret set`)
   is fully live: values are encrypted at rest and injected into the
   container/compose environment at deploy time, fail-closed on any unset
-  name.
+  name — including for backing-service `secrets`.
 - `compose` (multi-container apps, delegated to the `docker compose` CLI
   plugin — see [Compose apps](#compose-apps)) is fully live.
-- Single-service apps require a pre-built `image`; lwd's own `[build]` is not
-  supported yet. A compose file may declare its own `build:` stanzas, since
-  `docker compose up` builds those itself — that's compose's doing, not
-  lwd's.
-- `surfaces` in `lwd.toml` is parsed but rejected with a clear error for both
+- `[git]` + `[build]` (build-from-source: box-native `git clone` + `docker
+  build` → zero-downtime blue-green, no registry — see
+  [Deploy from Git](#deploy-from-git)) is fully live.
+- `[[services]]` (pinned backing services alongside an `image` or `[git]` app
+  — see [Backing services](#backing-services)) is fully live.
+- `surfaces` in `lwd.toml` is parsed but rejected with a clear error for all
   shapes; the surfaces-outside-compose blue-green model discussed for the web
   tier of a compose app is deliberately not built (YAGNI for now).
 - [`lwd-web`](#web-ui-lwd-web) (a separate dashboard binary) is fully live:
-  overview, live logs, history/rollback, secrets, redeploy, and config edit,
-  all as a thin client of the same daemon API the CLI uses. Deploying
-  `lwd-web` itself as an lwd-managed app, multi-user auth, and deploy-from-git
-  in the UI are not built yet.
+  overview, live logs, history/rollback, secrets, redeploy, config edit, and
+  a Deploy modal with **From Git**, **Builder**, and **Paste** tabs (both
+  From Git and Builder support declaring backing services), all as a thin
+  client of the same daemon API the CLI uses. Deploying `lwd-web` itself as
+  an lwd-managed app and multi-user auth are not built yet.
 
 ### Known limitations (this milestone)
 
@@ -294,11 +442,24 @@ create a new app from scratch works fully for single-service (`image`) apps.
   [Compose apps](#compose-apps)): the routed service gets a brief in-place
   restart on every redeploy, and a failed health check leaves the
   (possibly broken) new stack live rather than rolling back automatically —
-  run `lwd rollback` to recover. Single-service apps remain zero-downtime
-  blue-green.
+  run `lwd rollback` to recover. Single-service and git-built apps remain
+  zero-downtime blue-green.
+- Git deploy is repo-has-a-Dockerfile → single-service only. lwd never reads
+  a `lwd.toml` committed inside the cloned repo (config stays entirely in the
+  `lwd.toml` alongside the app, not the repo itself), and deploying a repo's
+  *own* `docker-compose.yml` in place (git + repo-compose) is deferred — the
+  Phase 4 user-provided-compose model is unaffected. Auto-redeploy on push
+  (a git hook or poller) and pushing built images to a registry are also not
+  built; lwd stays manual-trigger and single-host by design.
+- Backing-service (`[[services]]`) and top-level `secrets` **names** must be
+  valid environment-variable identifiers (`[A-Za-z_][A-Za-z0-9_]*`) — they're
+  injected as container env vars and, for backing services, spliced into an
+  unescapable `${NAME}` compose-interpolation reference, so `lwd.toml`
+  validation rejects any other form up front.
 - Mutable image tags (e.g. `:latest`) are re-pulled on every `apply` when the
   registry is reachable; if the pull fails but the image exists locally, the
-  local copy is used.
+  local copy is used. (Git-built images are never pulled — see
+  [Deploy from Git](#deploy-from-git).)
 - Public ACME certificates require the daemon's host to be reachable on
   80/443 from the internet for the domains being issued; purely local/internal
   domains (`.localhost`, bare hostnames) always use Caddy's self-signed
@@ -353,6 +514,18 @@ compose test also `redis`) — against real Docker:
   **unchanged** — proving compose does not recreate an unchanged backing
   service across a redeploy. It additionally `t.Skip`s (with a clear message)
   if the `docker compose` CLI plugin is not available.
+- `TestEndToEndGitDeploy` creates a throwaway local git repo (a one-line
+  `FROM traefik/whoami` Dockerfile) and deploys it as a git-built app
+  declaring a `cache` (`redis`) backing service, via real `source.CLI` (git)
+  and `build.CLI` (`docker build`) — proving build-from-source end to end: the
+  cloned repo is actually built into a locally-tagged `lwd-build/e2e-git:<sha>`
+  image (checked with `docker image inspect`) and deployed through Caddy;
+  redeploying the same ref reuses the built tag while still starting a fresh
+  blue-green surface, and the pinned `cache` container's ID is **unchanged**
+  across both the redeploy and a `lwd rollback`. It `t.Skip`s if `git` or the
+  `docker compose` CLI plugin (needed for the backing service) is not
+  available.
 
-All three tests clean up every container and network they create, and will
-`t.Skip` (rather than fail) if ports 80/443 are already in use on the host.
+All four tests clean up every container, network, and (for the git test)
+built image they create, and will `t.Skip` (rather than fail) if ports 80/443
+are already in use on the host.
