@@ -901,6 +901,21 @@ func TestApplyGitClonesBuildsDeploys(t *testing.T) {
 		t.Errorf("RunContainer image = %q, want %q", f.LastRunSpec.Image, wantTag)
 	}
 
+	// The recorded deployment's ContainerID must be the SURFACE container
+	// (the one that actually received the live route), not e.g. left empty
+	// or pointed at some other id — this is what `lwd logs`/`lwd ls` rely on
+	// to find the right container for a git-built app.
+	if dep.ContainerID == "" {
+		t.Fatal("dep.ContainerID is empty, want the surface container id")
+	}
+	surfaces, err := f.ListContainers(context.Background(), map[string]string{"lwd.app": "gitapp", "lwd.role": "surface"})
+	if err != nil {
+		t.Fatalf("ListContainers: %v", err)
+	}
+	if len(surfaces) != 1 || surfaces[0].ID != dep.ContainerID {
+		t.Errorf("dep.ContainerID = %q, want the sole surface container's id, found: %+v", dep.ContainerID, surfaces)
+	}
+
 	if !containsInOrder(fr.Calls, "SetStaging:stage-1.lwd.internal", "ProbeThroughCaddy:stage-1.lwd.internal") {
 		t.Errorf("expected SetStaging before the health probe, calls: %v", fr.Calls)
 	}
