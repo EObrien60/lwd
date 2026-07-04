@@ -14,12 +14,14 @@ import (
 	"testing"
 
 	"lwd/internal/api"
+	"lwd/internal/build"
 	"lwd/internal/client"
 	"lwd/internal/compose"
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
 	"lwd/internal/router"
 	"lwd/internal/secrets"
+	"lwd/internal/source"
 	"lwd/internal/store"
 )
 
@@ -44,7 +46,7 @@ func startFakeDaemon(t *testing.T) string {
 		t.Fatalf("secrets.NewCipher: %v", err)
 	}
 	secStore := secrets.NewStore(cipher, s)
-	daemon := api.New(reconciler.New(f, rt, s, secStore, compose.NewFake()), s, f, rt, secStore)
+	daemon := api.New(reconciler.New(f, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore)
 
 	ln, err := net.Listen("unix", sock)
 	if err != nil {

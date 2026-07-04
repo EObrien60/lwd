@@ -9,9 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"lwd/internal/build"
 	"lwd/internal/compose"
 	"lwd/internal/node"
 	"lwd/internal/router"
+	"lwd/internal/source"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -46,7 +48,7 @@ func newTestReconciler(t *testing.T) (*Reconciler, *node.Fake, *router.FakeRoute
 
 func newTestReconcilerWithResolver(t *testing.T, sec SecretResolver) (*Reconciler, *node.Fake, *router.FakeRouter, *store.Store) {
 	t.Helper()
-	r, f, fr, s, _ := newTestReconcilerFull(t, sec)
+	r, f, fr, s, _, _, _ := newTestReconcilerFull(t, sec)
 	return r, f, fr, s
 }
 
@@ -55,28 +57,62 @@ func newTestReconcilerWithResolver(t *testing.T, sec SecretResolver) (*Reconcile
 // assert on / configure its calls (Up/ServiceContainer/Down).
 func newTestReconcilerWithCompose(t *testing.T) (*Reconciler, *node.Fake, *router.FakeRouter, *store.Store, *compose.Fake) {
 	t.Helper()
-	return newTestReconcilerFull(t, &fakeResolver{vals: map[string]string{}})
+	r, f, fr, s, cf, _, _ := newTestReconcilerFull(t, &fakeResolver{vals: map[string]string{}})
+	return r, f, fr, s, cf
+}
+
+// newTestReconcilerWithGit is like newTestReconciler but also returns the
+// source.Fake and build.Fake, for tests that exercise the git-deploy path and
+// need to assert on / configure its calls (Clone/Build/ImageExists).
+func newTestReconcilerWithGit(t *testing.T) (*Reconciler, *node.Fake, *router.FakeRouter, *store.Store, *source.Fake, *build.Fake) {
+	t.Helper()
+	return newTestReconcilerWithGitAndResolver(t, &fakeResolver{vals: map[string]string{}})
+}
+
+// newTestReconcilerWithGitAndResolver is newTestReconcilerWithGit with an
+// explicit secret resolver, for git-path fail-closed-secret tests.
+func newTestReconcilerWithGitAndResolver(t *testing.T, sec SecretResolver) (*Reconciler, *node.Fake, *router.FakeRouter, *store.Store, *source.Fake, *build.Fake) {
+	t.Helper()
+	r, f, fr, s, _, sf, bf := newTestReconcilerFull(t, sec)
+	return r, f, fr, s, sf, bf
 }
 
 // newTestReconcilerFull builds a Reconciler wired to fresh fakes for every
-// dependency (node, router, compose) plus a temp-file store, using sec as the
-// secret resolver. It is the single place all the other constructors above
-// funnel through, so New's dependency list only has to be listed once here.
-func newTestReconcilerFull(t *testing.T, sec SecretResolver) (*Reconciler, *node.Fake, *router.FakeRouter, *store.Store, *compose.Fake) {
+// dependency (node, router, compose, source, build) plus a temp-file store,
+// using sec as the secret resolver. It is the single place all the other
+// constructors above funnel through, so New's dependency list only has to be
+// listed once here.
+func newTestReconcilerFull(t *testing.T, sec SecretResolver) (*Reconciler, *node.Fake, *router.FakeRouter, *store.Store, *compose.Fake, *source.Fake, *build.Fake) {
 	t.Helper()
 	f := node.NewFake()
 	fr := router.NewFakeRouter()
 	cf := compose.NewFake()
+	sf := source.NewFake()
+	bf := build.NewFake()
 	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	return New(f, fr, s, sec, cf), f, fr, s, cf
+	return New(f, fr, s, sec, cf, sf, bf), f, fr, s, cf, sf, bf
 }
 
 func testApp() *spec.App {
 	return &spec.App{Name: "blog", Image: "img:1", Domain: "blog.example.com", Port: 8080, Node: "local"}
+}
+
+// testGitApp returns a valid git-built app spec with no backing services: a
+// single-service surface built from `[git]` + `[build]`, per the Phase 6
+// design (docs/superpowers/specs/2026-07-04-lwd-phase6-git-deploy-design.md).
+func testGitApp() *spec.App {
+	return &spec.App{
+		Name:   "gitapp",
+		Domain: "gitapp.example.com",
+		Port:   8080,
+		Node:   "local",
+		Git:    &spec.Git{URL: "https://example.com/repo.git", Ref: "main"},
+		Build:  &spec.Build{Dockerfile: "Dockerfile"},
+	}
 }
 
 // testComposeApp writes content to a temp compose file and returns a compose
@@ -239,7 +275,7 @@ func TestApplyDockerHealthcheck(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake())
+	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -265,7 +301,7 @@ func TestApplyDockerHealthcheckUnhealthyFails(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake())
+	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -427,7 +463,7 @@ func TestApplyDockerHealthStartingThenHealthy(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake())
+	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -595,7 +631,7 @@ func TestApplyFailsClosedOnResolveError(t *testing.T) {
 }
 
 func TestApplyComposeUpConnectsRoutesVerifies(t *testing.T) {
-	r, f, fr, s, cf := newTestReconcilerFull(t, &fakeResolver{vals: map[string]string{"DB": "secretval"}})
+	r, f, fr, s, cf, _, _ := newTestReconcilerFull(t, &fakeResolver{vals: map[string]string{"DB": "secretval"}})
 	app := testComposeApp(t, "services:\n  web:\n    image: nginx\n")
 	app.Health.Timeout = shortTimeout
 	app.Env = map[string]string{"A": "1"}
@@ -651,7 +687,7 @@ func TestApplyComposeUpConnectsRoutesVerifies(t *testing.T) {
 }
 
 func TestApplyComposeFailClosedSecret(t *testing.T) {
-	r, _, _, s, cf := newTestReconcilerFull(t, &fakeResolver{err: fmt.Errorf("boom")})
+	r, _, _, s, cf, _, _ := newTestReconcilerFull(t, &fakeResolver{err: fmt.Errorf("boom")})
 	app := testComposeApp(t, "services:\n  web:\n    image: nginx\n")
 	app.Secrets = []string{"DB"}
 
@@ -811,6 +847,258 @@ func TestRemoveSingleServiceRemovesContainersAndRoute(t *testing.T) {
 		t.Errorf("want route removed after Remove")
 	}
 	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur != nil {
+		t.Errorf("want no current deployment after Remove, got %+v", cur)
+	}
+}
+
+func TestApplyGitClonesBuildsDeploys(t *testing.T) {
+	r, f, fr, _, sf, bf := newTestReconcilerWithGit(t)
+	app := testGitApp()
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+	sf.SHA = "deadbeefcafe0123456789abcdef0123456789"
+
+	dep, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	wantTag := "lwd-build/gitapp:deadbeefcafe"
+	if dep.Image != wantTag {
+		t.Errorf("Image = %q, want %q", dep.Image, wantTag)
+	}
+
+	if len(sf.Calls) != 1 {
+		t.Fatalf("want exactly one Clone call, calls: %v", sf.Calls)
+	}
+	if sf.LastURL != app.Git.URL || sf.LastRef != app.Git.Ref {
+		t.Errorf("Clone(url=%q, ref=%q), want (%q, %q)", sf.LastURL, sf.LastRef, app.Git.URL, app.Git.Ref)
+	}
+
+	if !contains(bf.Calls, "Build") {
+		t.Errorf("want Build called, calls: %v", bf.Calls)
+	}
+	if bf.LastTag != wantTag {
+		t.Errorf("Build tag = %q, want %q", bf.LastTag, wantTag)
+	}
+	if bf.LastDockerfile != "Dockerfile" {
+		t.Errorf("Build dockerfile = %q, want Dockerfile", bf.LastDockerfile)
+	}
+	// The build context must be rooted at the just-cloned directory (proving
+	// clone ran, and its result was used, before build).
+	if bf.LastContext != sf.LastDir {
+		t.Errorf("Build context = %q, want cloned dir %q", bf.LastContext, sf.LastDir)
+	}
+
+	if !contains(f.Calls, "RunContainer:lwd-gitapp-1") {
+		t.Errorf("want surface container run, calls: %v", f.Calls)
+	}
+	if f.LastRunSpec.Image != wantTag {
+		t.Errorf("RunContainer image = %q, want %q", f.LastRunSpec.Image, wantTag)
+	}
+
+	if !containsInOrder(fr.Calls, "SetStaging:stage-1.lwd.internal", "ProbeThroughCaddy:stage-1.lwd.internal") {
+		t.Errorf("expected SetStaging before the health probe, calls: %v", fr.Calls)
+	}
+	if !containsInOrder(fr.Calls, "ProbeThroughCaddy:stage-1.lwd.internal", "SetRoute:gitapp.example.com") {
+		t.Errorf("expected the health probe before SetRoute, calls: %v", fr.Calls)
+	}
+}
+
+func TestApplyGitSkipsBuildIfImageExists(t *testing.T) {
+	r, _, fr, _, sf, bf := newTestReconcilerWithGit(t)
+	app := testGitApp()
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+	sf.SHA = "cafebabecafe0123456789abcdef0123456789"
+
+	wantTag := "lwd-build/gitapp:" + shortSHA(sf.SHA)
+	bf.Exists = map[string]bool{wantTag: true}
+
+	dep, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if contains(bf.Calls, "Build") {
+		t.Errorf("want no Build call when the image already exists, calls: %v", bf.Calls)
+	}
+	if !contains(bf.Calls, "ImageExists") {
+		t.Errorf("want ImageExists checked, calls: %v", bf.Calls)
+	}
+	if dep.Image != wantTag {
+		t.Errorf("Image = %q, want %q", dep.Image, wantTag)
+	}
+}
+
+func TestApplyGitWithBacking(t *testing.T) {
+	r, f, fr, _, cf, _, _ := newTestReconcilerFull(t, &fakeResolver{vals: map[string]string{"DB_PASS": "s3cr3t"}})
+	app := testGitApp()
+	app.Health.Timeout = shortTimeout
+	app.Secrets = []string{"DB_PASS"}
+	app.Services = []spec.Service{
+		{Name: "db", Image: "postgres:16", Secrets: []string{"DB_PASS"}},
+	}
+	fr.ProbeStatus = 200
+
+	dep, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if !contains(cf.Calls, "Up:lwd-gitapp") {
+		t.Errorf("want backing compose Up for project lwd-gitapp, calls: %v", cf.Calls)
+	}
+	if !strings.Contains(dep.Compose, "s3cr3t") {
+		t.Errorf("want rendered backing compose to include the resolved secret, got %q", dep.Compose)
+	}
+
+	if !containsInOrder(f.Calls, "EnsureNetwork:lwd-gitapp", "RunContainer:lwd-gitapp-1") {
+		t.Errorf("want the backing network ensured before the surface starts, calls: %v", f.Calls)
+	}
+	if !containsInOrder(f.Calls, "RunContainer:lwd-gitapp-1", "ConnectContainerToNetwork:"+dep.ContainerID+":lwd-gitapp") {
+		t.Errorf("want the surface connected to the backing network after it starts, calls: %v", f.Calls)
+	}
+}
+
+func TestApplyGitFailClosedSecret(t *testing.T) {
+	r, f, _, s, sf, bf := newTestReconcilerWithGitAndResolver(t, &fakeResolver{err: fmt.Errorf("boom")})
+	app := testGitApp()
+	app.Secrets = []string{"DB"}
+
+	_, err := r.Apply(context.Background(), app)
+	if err == nil {
+		t.Fatal("want error when secret resolution fails")
+	}
+
+	if len(sf.Calls) != 0 {
+		t.Errorf("want no Clone call when secrets fail closed, calls: %v", sf.Calls)
+	}
+	if len(bf.Calls) != 0 {
+		t.Errorf("want no Build/ImageExists call when secrets fail closed, calls: %v", bf.Calls)
+	}
+	for _, c := range f.Calls {
+		if strings.HasPrefix(c, "RunContainer:") {
+			t.Errorf("want no RunContainer call when secrets fail closed, calls: %v", f.Calls)
+		}
+	}
+
+	history, err := s.DeploymentsForApp(app.Name)
+	if err != nil {
+		t.Fatalf("DeploymentsForApp: %v", err)
+	}
+	var sawFailed bool
+	for _, d := range history {
+		if d.Status == store.StatusFailed {
+			sawFailed = true
+		}
+	}
+	if !sawFailed {
+		t.Errorf("want a StatusFailed deployment recorded, history: %+v", history)
+	}
+}
+
+func TestApplyImageAppWithBacking(t *testing.T) {
+	r, f, fr, _, cf, _, _ := newTestReconcilerFull(t, &fakeResolver{vals: map[string]string{}})
+	app := testApp()
+	app.Services = []spec.Service{{Name: "db", Image: "postgres:16"}}
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	dep, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if !contains(cf.Calls, "Up:lwd-blog") {
+		t.Errorf("want backing compose Up for project lwd-blog, calls: %v", cf.Calls)
+	}
+	if !contains(f.Calls, "ConnectContainerToNetwork:"+dep.ContainerID+":lwd-blog") {
+		t.Errorf("want the surface connected to the backing network, calls: %v", f.Calls)
+	}
+}
+
+func TestRollbackGitRedeploysPriorTag(t *testing.T) {
+	r, _, fr, s, sf, bf := newTestReconcilerWithGit(t)
+	ctx := context.Background()
+	app := testGitApp()
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	sf.SHA = "1111111111111111111111111111111111111a"
+	v1, err := r.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("v1 Apply: %v", err)
+	}
+
+	sf.SHA = "2222222222222222222222222222222222222b"
+	v2, err := r.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("v2 Apply: %v", err)
+	}
+	if v1.Image == v2.Image {
+		t.Fatalf("sanity: v1/v2 should have built different tags, both = %q", v1.Image)
+	}
+
+	preCloneCalls := len(sf.Calls)
+	preBuildCalls := len(bf.Calls)
+
+	back, err := r.Rollback(ctx, "gitapp")
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if back.Image != v1.Image {
+		t.Errorf("Rollback image = %q, want %q (the prior tag)", back.Image, v1.Image)
+	}
+	if len(sf.Calls) != preCloneCalls {
+		t.Errorf("want no additional Clone call on rollback, calls: %v", sf.Calls)
+	}
+	if len(bf.Calls) != preBuildCalls {
+		t.Errorf("want no additional Build/ImageExists call on rollback, calls: %v", bf.Calls)
+	}
+	if back.Status != store.StatusRunning {
+		t.Errorf("status = %q, want running", back.Status)
+	}
+
+	cur, err := s.CurrentDeployment("gitapp")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || cur.Image != v1.Image {
+		t.Fatalf("want current deployment restored to %q, got %+v", v1.Image, cur)
+	}
+}
+
+func TestRemoveGitDownsBacking(t *testing.T) {
+	r, f, fr, s, cf, _, _ := newTestReconcilerFull(t, &fakeResolver{vals: map[string]string{}})
+	app := testGitApp()
+	app.Health.Timeout = shortTimeout
+	app.Services = []spec.Service{{Name: "db", Image: "postgres:16"}}
+	fr.ProbeStatus = 200
+
+	dep, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if err := r.Remove(context.Background(), "gitapp"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	if !contains(cf.Calls, "Down:lwd-gitapp") {
+		t.Errorf("want backing compose Down for project lwd-gitapp, calls: %v", cf.Calls)
+	}
+	if !contains(f.Calls, "RemoveContainer:"+dep.ContainerID) {
+		t.Errorf("want the surface container removed, calls: %v", f.Calls)
+	}
+	if _, ok := fr.Routes["gitapp.example.com"]; ok {
+		t.Errorf("want route removed after Remove")
+	}
+
+	cur, err := s.CurrentDeployment("gitapp")
 	if err != nil {
 		t.Fatalf("CurrentDeployment: %v", err)
 	}
