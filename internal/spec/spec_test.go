@@ -537,3 +537,120 @@ command = "redis-server --appendonly yes"
 		t.Errorf("Services[1].Command = %q", a.Services[1].Command)
 	}
 }
+
+// --- Git url/ref/path hardening (host-RCE + option-injection + path
+// traversal defenses; see validateGitURL, validateGitRef,
+// validateRelativeNoTraversal) ---
+
+func gitApp(overrides func(*App)) *App {
+	a := &App{
+		Name:   "myapp",
+		Git:    &Git{URL: "https://github.com/me/myapp", Ref: "main"},
+		Build:  &Build{Dockerfile: "Dockerfile"},
+		Domain: "myapp.example.com",
+		Port:   8080,
+	}
+	if overrides != nil {
+		overrides(a)
+	}
+	return a
+}
+
+func TestGitURLRejectsExtTransport(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.URL = "ext::sh -c whoami" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for ext:: git url (host command execution)")
+	}
+}
+
+func TestGitURLRejectsFdTransport(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.URL = "fd::5" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for fd:: git url")
+	}
+}
+
+func TestGitURLRejectsLeadingDash(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.URL = "-oProxyCommand=whoami" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git url starting with -")
+	}
+}
+
+func TestGitURLAcceptsHTTPSAndScpLike(t *testing.T) {
+	for _, url := range []string{
+		"https://github.com/me/app",
+		"http://internal.example.com/me/app.git",
+		"git://example.com/me/app.git",
+		"ssh://git@example.com/me/app.git",
+		"file:///tmp/some/repo",
+		"git@github.com:me/app.git",
+	} {
+		a := gitApp(func(a *App) { a.Git.URL = url })
+		if err := a.Validate(); err != nil {
+			t.Errorf("Validate(%q): unexpected error: %v", url, err)
+		}
+	}
+}
+
+func TestGitRefRejectsLeadingDash(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.Ref = "-x" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git ref starting with -")
+	}
+}
+
+func TestGitRefRejectsWhitespace(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.Ref = "a b" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git ref containing whitespace")
+	}
+}
+
+func TestGitRefRejectsShellMetacharacters(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.Ref = "$(x)" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git ref containing shell metacharacters")
+	}
+}
+
+func TestGitRefAcceptsCommonForms(t *testing.T) {
+	for _, ref := range []string{"main", "feature/x", "v1.2.3", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"} {
+		a := gitApp(func(a *App) { a.Git.Ref = ref })
+		if err := a.Validate(); err != nil {
+			t.Errorf("Validate(ref=%q): unexpected error: %v", ref, err)
+		}
+	}
+}
+
+func TestGitPathRejectsTraversal(t *testing.T) {
+	a := gitApp(func(a *App) { a.Git.Path = "../etc" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for git path escaping the clone root")
+	}
+}
+
+func TestBuildDockerfileRejectsTraversal(t *testing.T) {
+	a := gitApp(func(a *App) { a.Build.Dockerfile = "../../x" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for build dockerfile escaping the clone root")
+	}
+}
+
+func TestBuildContextRejectsAbsolutePath(t *testing.T) {
+	a := gitApp(func(a *App) { a.Build.Context = "/etc" })
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for absolute build context")
+	}
+}
+
+func TestGitPathAndBuildDockerfileAcceptNormalValues(t *testing.T) {
+	a := gitApp(func(a *App) {
+		a.Git.Path = "."
+		a.Build.Dockerfile = "Dockerfile"
+		a.Build.Context = "."
+	})
+	if err := a.Validate(); err != nil {
+		t.Fatalf("Validate: unexpected error: %v", err)
+	}
+}

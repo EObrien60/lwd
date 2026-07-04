@@ -165,18 +165,34 @@ func namedVolumeOf(volume string) string {
 // yamlQuote renders s as a double-quoted YAML scalar that round-trips ANY
 // content safely, regardless of embedded structure or control characters
 // (secrets, env keys/values, and other dynamic strings may contain
-// arbitrary bytes — this must never allow escaping the quoted scalar or
-// injecting YAML structure).
+// arbitrary bytes — this must never allow escaping the quoted scalar,
+// injecting YAML structure, or emitting a literal raw control byte that
+// would make the surrounding document invalid/unparseable YAML).
 //
 // Order matters: backslash must be escaped first, before any of the other
 // backslash-based escapes are introduced, so those escapes aren't
-// themselves re-escaped.
+// themselves re-escaped. \n, \r, and \t get their short YAML escapes; any
+// other C0 control byte (0x00-0x1F, excluding those three) is escaped as a
+// \uXXXX Unicode escape, which the YAML double-quoted scalar form supports
+// for any character.
 func yamlQuote(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
 	s = strings.ReplaceAll(s, "\n", `\n`)
 	s = strings.ReplaceAll(s, "\r", `\r`)
 	s = strings.ReplaceAll(s, "\t", `\t`)
+
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r < 0x20 {
+			fmt.Fprintf(&b, `\u%04x`, r)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	s = b.String()
+
 	// docker compose re-interpolates ${...}/$VAR over the rendered file
 	// text; double every literal $ so our already-final values are not
 	// re-interpolated (and can't leak/corrupt values containing a $).

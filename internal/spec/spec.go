@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -15,6 +16,32 @@ import (
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 var serviceNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 var secretNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// gitRefRe matches a safe git ref charset: no leading '-' (which git or a
+// shell could interpret as an option) or '.' (rejects e.g. "..", and refs
+// are conventionally not dot-prefixed), and no whitespace/control
+// characters. Allows branch names ("feature/x"), tags ("v1.2.3"), and full
+// commit SHAs.
+var gitRefRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]*$`)
+
+// gitScpLikeRe matches the scp-like scp syntax git accepts for ssh remotes,
+// e.g. "git@github.com:me/app.git" or "user@host:path/to/repo" — no "://"
+// scheme, just a user@host:path form.
+var gitScpLikeRe = regexp.MustCompile(`^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:[^:].*$`)
+
+// gitAllowedSchemes are the URL schemes lwd permits for a git remote. This
+// intentionally excludes command-executing transports like ext:: and fd::,
+// which git would otherwise use to run an arbitrary host command supplied
+// via the url (the ext:: transport runs its argument through a shell) —
+// closing the host-RCE path at the earliest possible gate, before any clone
+// is attempted, for both file- and web-generated apps.
+var gitAllowedSchemes = map[string]bool{
+	"http":  true,
+	"https": true,
+	"git":   true,
+	"ssh":   true,
+	"file":  true,
+}
 
 // Git describes a git source for building from a repository.
 type Git struct {
@@ -147,8 +174,23 @@ func (a *App) Validate() error {
 		if a.Git.URL == "" {
 			return fmt.Errorf("git url is required")
 		}
+		if err := validateGitURL(a.Git.URL); err != nil {
+			return err
+		}
+		if err := validateGitRef(a.Git.Ref); err != nil {
+			return err
+		}
+		if err := validateRelativeNoTraversal("git path", a.Git.Path); err != nil {
+			return err
+		}
 		if a.Build == nil {
 			return fmt.Errorf("build is required for git apps")
+		}
+		if err := validateRelativeNoTraversal("build context", a.Build.Context); err != nil {
+			return err
+		}
+		if err := validateRelativeNoTraversal("build dockerfile", a.Build.Dockerfile); err != nil {
+			return err
 		}
 		if a.Image != "" {
 			return fmt.Errorf("cannot mix git and image")
@@ -224,5 +266,83 @@ func (a *App) Validate() error {
 		}
 	}
 
+	return nil
+}
+
+// validateGitURL rejects git remote URLs that could reach a command-executing
+// git transport (ext::, fd::) or be parsed as a git command-line option
+// instead of a positional URL argument. This is the gate for BOTH
+// file-authored lwd.toml apps and web-generated ones, and runs before any
+// clone is attempted.
+//
+// It stays permissive for real remotes: standard scheme:// URLs with an
+// allowed scheme (http, https, git, ssh, file), and scp-like ssh syntax
+// (user@host:path, e.g. "git@github.com:me/app.git") are both accepted.
+func validateGitURL(url string) error {
+	if strings.HasPrefix(url, "-") {
+		return fmt.Errorf("git url %q is invalid: must not start with -", url)
+	}
+
+	if i := strings.Index(url, "://"); i >= 0 {
+		scheme := url[:i]
+		if !gitAllowedSchemes[strings.ToLower(scheme)] {
+			return fmt.Errorf("git url %q is invalid: unsupported scheme %q (allowed: http, https, git, ssh, file, or scp-like user@host:path)", url, scheme)
+		}
+		return nil
+	}
+
+	// No "://" scheme. Reject any other "::"-style transport prefix (e.g.
+	// ext::sh -c ..., fd::5) outright: these run arbitrary host commands or
+	// read from arbitrary file descriptors rather than fetching from a
+	// remote, and have no legitimate use in an lwd.toml.
+	if strings.Contains(url, "::") {
+		return fmt.Errorf("git url %q is invalid: command-executing transports are not allowed", url)
+	}
+
+	// Otherwise the only other form git accepts is scp-like ssh syntax
+	// (user@host:path) or a plain local filesystem path. Plain local paths
+	// are not needed by lwd (use file:// instead) and are rejected here to
+	// keep the allowed surface small and explicit.
+	if gitScpLikeRe.MatchString(url) {
+		return nil
+	}
+
+	return fmt.Errorf("git url %q is invalid: must be a scheme://... URL (http, https, git, ssh, file) or scp-like user@host:path", url)
+}
+
+// validateGitRef rejects a git ref (branch, tag, or commit SHA) that doesn't
+// match a safe charset — no leading '-' (option injection) or leading '.',
+// and no whitespace/control/shell-metacharacters. This is checked before ref
+// ever reaches `git clone --branch` or `git checkout`. An empty ref is
+// accepted here (it means "unset"; Parse defaults it to "main" — Validate
+// may also run directly against an App built without going through Parse).
+func validateGitRef(ref string) error {
+	if ref == "" {
+		return nil
+	}
+	if !gitRefRe.MatchString(ref) {
+		return fmt.Errorf("git ref %q is invalid: must match [A-Za-z0-9][A-Za-z0-9._/-]*", ref)
+	}
+	return nil
+}
+
+// validateRelativeNoTraversal rejects a path (git.path, build.context, or
+// build.dockerfile) that is absolute or escapes the directory it's
+// interpreted relative to (a git clone's root), via a ".." path segment.
+// label identifies the field in the returned error. An empty path is
+// accepted (it means "unset"; callers apply their own defaults).
+func validateRelativeNoTraversal(label, path string) error {
+	if path == "" {
+		return nil
+	}
+	if filepath.IsAbs(path) {
+		return fmt.Errorf("%s %q is invalid: must be a relative path", label, path)
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(path))
+	for _, seg := range strings.Split(cleaned, "/") {
+		if seg == ".." {
+			return fmt.Errorf("%s %q is invalid: must not escape the clone root (no .. segments)", label, path)
+		}
+	}
 	return nil
 }

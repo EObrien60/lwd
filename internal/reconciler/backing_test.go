@@ -231,3 +231,27 @@ func TestRenderBackingEscapesNewline(t *testing.T) {
 		t.Fatalf("expected no raw embedded newline in rendered value, got:\n%s", yaml)
 	}
 }
+
+// TestYamlQuoteEscapesControlBytes verifies that a stray C0 control byte
+// (other than \n, \r, \t, which get their own short escapes) is rendered as
+// a \uXXXX escape rather than passed through raw, which would otherwise
+// leave the surrounding double-quoted YAML scalar containing an invalid
+// literal control character.
+func TestYamlQuoteEscapesControlBytes(t *testing.T) {
+	got := yamlQuote("a\x01b\x1fc")
+	want := "\"a\\u0001b\\u001fc\""
+	if got != want {
+		t.Fatalf("yamlQuote(control bytes) = %q, want %q", got, want)
+	}
+}
+
+// TestYamlQuoteStillHandlesKnownEscapes is a regression guard: adding
+// control-byte handling must not disturb the existing \n/\r/\t/backslash/
+// quote/dollar escaping.
+func TestYamlQuoteStillHandlesKnownEscapes(t *testing.T) {
+	got := yamlQuote("a\nb\rc\td\\e\"f$g")
+	want := `"a\nb\rc\td\\e\"f$$g"`
+	if got != want {
+		t.Fatalf("yamlQuote(known escapes) = %q, want %q", got, want)
+	}
+}
