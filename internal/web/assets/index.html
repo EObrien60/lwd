@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lwd — deploy console</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script>
+    // Apply the saved theme before paint to avoid a flash of the wrong theme.
+    try {
+      var t = localStorage.getItem('lwd-theme');
+      if (t) document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+  </script>
+</head>
+<body>
+  <!-- lwd-web app shell -->
+  <div id="app" x-data="dashboard()" x-init="init()" x-cloak>
+
+    <header class="chrome">
+      <div class="brand">
+        <span class="brand__mark">λ</span>
+        <span>lwd</span>
+        <span class="brand__sub">deploy console</span>
+      </div>
+
+      <div class="chrome__spacer"></div>
+
+      <nav class="crumb" aria-label="breadcrumb">
+        <button type="button" @click="backToOverview()" :class="{ 'crumb__current': view === 'overview' }">
+          Fleet
+        </button>
+        <template x-if="view === 'detail'">
+          <span style="display:contents">
+            <span class="crumb__sep">/</span>
+            <span class="crumb__current" x-text="selected"></span>
+          </span>
+        </template>
+      </nav>
+
+      <button type="button" class="icon-btn" @click="toggleTheme()" title="Toggle theme" aria-label="Toggle color theme">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 3v1.6M10 15.4V17M17 10h-1.6M4.6 10H3M14.8 5.2l-1.1 1.1M6.3 13.7l-1.1 1.1M14.8 14.8l-1.1-1.1M6.3 6.3 5.2 5.2"/>
+          <circle cx="10" cy="10" r="3.6"/>
+        </svg>
+      </button>
+
+      <form method="post" action="/logout">
+        <button type="submit" class="icon-btn" title="Log out" aria-label="Log out">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M7.5 17.5H4.75A1.25 1.25 0 0 1 3.5 16.25V3.75A1.25 1.25 0 0 1 4.75 2.5H7.5"/>
+            <path d="M13 14l4-4-4-4M17 10H7.5"/>
+          </svg>
+        </button>
+      </form>
+    </header>
+
+    <!-- ================================================================ -->
+    <!-- Overview                                                          -->
+    <!-- ================================================================ -->
+    <main class="stage" x-show="view === 'overview'" x-cloak>
+
+      <div class="banner" x-show="daemonDown" x-cloak x-transition>
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10 6.5v4M10 13.2h.01" stroke-linecap="round"/><circle cx="10" cy="10" r="7.5"/></svg>
+        <span>Cannot reach the lwd daemon. Retrying in the background — checks every few seconds.</span>
+      </div>
+      <div class="banner" x-show="loadError" x-cloak x-transition>
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10 6.5v4M10 13.2h.01" stroke-linecap="round"/><circle cx="10" cy="10" r="7.5"/></svg>
+        <span x-text="loadError"></span>
+      </div>
+
+      <div class="stage-head">
+        <div>
+          <h1>Fleet</h1>
+          <p>Every app lwd is watching over, at a glance.</p>
+        </div>
+        <div style="display:flex; align-items:center; gap:20px;">
+          <div class="readout" x-show="!appsLoading">
+            <div><b x-text="apps.length"></b><span>apps</span></div>
+            <div><b x-text="apps.filter(a => a.status === 'running').length"></b><span>running</span></div>
+          </div>
+          <button type="button" class="btn btn-signal" @click="openDeployCreate()">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3l1.9 4.6 4.6 1.9-4.6 1.9L10 16l-1.9-4.6L3.5 9.5l4.6-1.9L10 3z"/></svg>
+            Deploy
+          </button>
+        </div>
+      </div>
+
+      <!-- loading -->
+      <div class="grid" x-show="appsLoading" x-cloak>
+        <template x-for="i in 6" :key="i">
+          <div class="skeleton"></div>
+        </template>
+      </div>
+
+      <!-- empty -->
+      <div class="state" x-show="!appsLoading && apps.length === 0 && !daemonDown" x-cloak>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 4v5"/></svg>
+        <strong>No apps yet</strong>
+        <p>Deploy your first app to see it here.</p>
+        <button type="button" class="btn btn-signal" @click="openDeployCreate()" style="margin-top:6px;">Deploy an app</button>
+      </div>
+
+      <!-- grid -->
+      <div class="grid" x-show="!appsLoading && apps.length > 0" x-cloak>
+        <template x-for="(app, idx) in apps" :key="app.name">
+          <div class="card card-app" role="button" tabindex="0"
+               :style="{ 'animation-delay': (idx * 35) + 'ms' }"
+               @click="openApp(app.name)" @keydown.enter="openApp(app.name)" @keydown.space.prevent="openApp(app.name)"
+               :aria-label="'Open ' + app.name">
+            <div class="card__top">
+              <div>
+                <div class="card__name" x-text="app.name"></div>
+                <a class="card__domain" x-show="app.domain" :href="'https://' + app.domain" target="_blank" rel="noopener" @click.stop :title="'Open https://' + app.domain">
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 5H4.5A1.5 1.5 0 0 0 3 6.5v9A1.5 1.5 0 0 0 4.5 17h9a1.5 1.5 0 0 0 1.5-1.5V12M12 3h5v5M17 3l-8 8"/></svg>
+                  <span x-text="app.domain"></span>
+                </a>
+                <span x-show="!app.domain" style="font-family:var(--font-mono); font-size:12px; color:var(--ink-3);">no domain</span>
+              </div>
+              <span class="pill" :class="'pill-' + statusKind(app.status)">
+                <span class="dot" :class="'dot-' + statusKind(app.status)"></span>
+                <span x-text="app.status"></span>
+              </span>
+            </div>
+            <div class="card__meta">
+              <span class="tag" x-text="shortImage(app.image)" :title="app.image"></span>
+            </div>
+          </div>
+        </template>
+      </div>
+    </main>
+
+    <!-- ================================================================ -->
+    <!-- App detail                                                        -->
+    <!-- ================================================================ -->
+    <main class="stage" x-show="view === 'detail'" x-cloak>
+      <div class="detail-head">
+        <div>
+          <h1>
+            <span x-text="selected"></span>
+            <span class="pill" :class="'pill-' + statusKind(detail && detail.status ? detail.status.status : '')" x-show="detail && detail.status">
+              <span class="dot" :class="'dot-' + statusKind(detail && detail.status ? detail.status.status : '')"></span>
+              <span x-text="detail && detail.status ? detail.status.status : ''"></span>
+            </span>
+          </h1>
+          <a class="card__domain" x-show="detail && detail.status && detail.status.domain"
+             :href="'https://' + (detail && detail.status ? detail.status.domain : '')" target="_blank" rel="noopener">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 5H4.5A1.5 1.5 0 0 0 3 6.5v9A1.5 1.5 0 0 0 4.5 17h9a1.5 1.5 0 0 0 1.5-1.5V12M12 3h5v5M17 3l-8 8"/></svg>
+            <span x-text="detail && detail.status ? detail.status.domain : ''"></span>
+          </a>
+        </div>
+        <div class="detail-actions">
+          <button type="button" class="btn" @click="redeploy()" :disabled="redeployBusy">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 10a6 6 0 1 1-2-4.5M16 3v4h-4"/></svg>
+            <span x-text="redeployBusy ? 'Redeploying…' : 'Redeploy'"></span>
+          </button>
+          <button type="button" class="btn btn-signal" @click="openDeployCreate()">Deploy</button>
+        </div>
+      </div>
+
+      <div class="banner" x-show="detailError" x-cloak x-transition>
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10 6.5v4M10 13.2h.01" stroke-linecap="round"/><circle cx="10" cy="10" r="7.5"/></svg>
+        <span x-text="detailError"></span>
+      </div>
+
+      <template x-if="!detailLoading && !detailError">
+        <div>
+          <nav class="tabs">
+            <button type="button" class="tab" :class="{ active: activeTab === 'logs' }" @click="setTab('logs')">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="14" height="13" rx="1.5"/><path d="M6 8h5M6 11h8"/></svg>
+              Logs
+            </button>
+            <button type="button" class="tab" :class="{ active: activeTab === 'deployments' }" @click="setTab('deployments')">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4v6l4 2"/><circle cx="10" cy="10" r="7"/></svg>
+              Deployments
+            </button>
+            <button type="button" class="tab" :class="{ active: activeTab === 'secrets' }" @click="setTab('secrets')">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="13" r="3"/><path d="M9.1 10.9 15 5M13 7l2 2M15.5 4.5l2 2"/></svg>
+              Secrets
+            </button>
+            <button type="button" class="tab" :class="{ active: activeTab === 'config' }" @click="setTab('config')">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h9l3 3v9H4z"/><path d="M7 4v4h6V4"/></svg>
+              Config
+            </button>
+            <button type="button" class="tab" :class="{ active: activeTab === 'danger' }" @click="setTab('danger')">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3 2.5 16h15z"/><path d="M10 8.3v3M10 13.6h.01"/></svg>
+              Danger
+            </button>
+          </nav>
+
+          <!-- Logs -->
+          <section class="panel" x-show="activeTab === 'logs'" x-cloak>
+            <div class="logs-toolbar">
+              <div class="logs-status">
+                <span class="dot" :class="logConnected ? 'dot-running' : 'dot-retired'"></span>
+                <span x-text="logConnected ? 'streaming' : 'connecting…'"></span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" :checked="logFollow" @change="toggleFollow()">
+                <span class="switch__track"></span>
+                Follow
+              </label>
+            </div>
+            <div class="log-pane" x-ref="logPane">
+              <template x-if="logLines.length === 0">
+                <div class="log-line" style="color:var(--ink-3);">
+                  Waiting for output<span class="log-caret"></span>
+                </div>
+              </template>
+              <template x-for="(line, i) in logLines" :key="i">
+                <div class="log-line" x-text="line"></div>
+              </template>
+            </div>
+          </section>
+
+          <!-- Deployments -->
+          <section class="panel" x-show="activeTab === 'deployments'" x-cloak>
+            <h2>Deployment history</h2>
+            <p class="hint">Newest first. Rolling back re-applies a prior recorded spec.</p>
+            <template x-if="!detail || !detail.history || detail.history.length === 0">
+              <div class="state">
+                <strong>No deployment history</strong>
+                <p>This app has no recorded deployments yet.</p>
+              </div>
+            </template>
+            <div class="table-wrap" x-show="detail && detail.history && detail.history.length > 0">
+              <table class="table">
+                <thead>
+                  <tr><th>Image</th><th>Status</th><th>Deployed</th><th></th></tr>
+                </thead>
+                <tbody>
+                  <template x-for="(dep, i) in (detail ? detail.history : [])" :key="dep.ID">
+                    <tr :class="{ 'row-current': i === 0 }">
+                      <td class="mono" :title="dep.Image" x-text="shortImage(dep.Image)"></td>
+                      <td>
+                        <span class="pill" :class="'pill-' + statusKind(dep.Status)">
+                          <span class="dot" :class="'dot-' + statusKind(dep.Status)"></span>
+                          <span x-text="dep.Status"></span>
+                        </span>
+                      </td>
+                      <td class="mono" :title="fullTime(dep.CreatedAt)" x-text="timeAgo(dep.CreatedAt)"></td>
+                      <td style="text-align:right;">
+                        <span x-show="i === 0" style="font-family:var(--font-mono); font-size:11px; color:var(--ink-3); text-transform:uppercase; letter-spacing:.08em;">current</span>
+                        <button type="button" class="btn btn-sm" x-show="i !== 0" @click="rollback(dep)" :disabled="rollbackBusyId === dep.ID">
+                          <span x-text="rollbackBusyId === dep.ID ? 'Rolling back…' : 'Roll back'"></span>
+                        </button>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <!-- Secrets -->
+          <section class="panel" x-show="activeTab === 'secrets'" x-cloak x-init="loadSecrets()">
+            <h2>Secrets</h2>
+            <p class="hint">Values are write-only — once saved, lwd never sends them back to the browser.</p>
+
+            <div class="banner" x-show="secretsError" x-cloak x-transition>
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10 6.5v4M10 13.2h.01" stroke-linecap="round"/><circle cx="10" cy="10" r="7.5"/></svg>
+              <span x-text="secretsError"></span>
+            </div>
+
+            <template x-if="secretsLoading">
+              <p class="hint">Loading secrets…</p>
+            </template>
+
+            <template x-if="!secretsLoading && secretNames.length === 0">
+              <div class="state" style="padding: 30px 20px;">
+                <strong>No secrets set</strong>
+              </div>
+            </template>
+
+            <div class="list" x-show="!secretsLoading && secretNames.length > 0">
+              <template x-for="name in secretNames" :key="name">
+                <div class="list-item">
+                  <span class="list-item__name">
+                    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="13" r="3"/><path d="M9.1 10.9 15 5M13 7l2 2M15.5 4.5l2 2"/></svg>
+                    <span x-text="name"></span>
+                  </span>
+                  <button type="button" class="btn btn-sm btn-danger" @click="deleteSecret(name)" :disabled="secretDeleteBusy === name">
+                    <span x-text="secretDeleteBusy === name ? 'Deleting…' : 'Delete'"></span>
+                  </button>
+                </div>
+              </template>
+            </div>
+
+            <form class="inline-form" @submit.prevent="addSecret()">
+              <div class="field">
+                <label for="secret-name">Name</label>
+                <input id="secret-name" x-model="newSecretName" placeholder="API_KEY" autocomplete="off" required>
+              </div>
+              <div class="field">
+                <label for="secret-value">Value</label>
+                <input id="secret-value" type="password" x-model="newSecretValue" placeholder="••••••••" autocomplete="off" required>
+              </div>
+              <button type="submit" class="btn btn-signal" :disabled="secretBusy">
+                <span x-text="secretBusy ? 'Saving…' : 'Add secret'"></span>
+              </button>
+            </form>
+          </section>
+
+          <!-- Config -->
+          <section class="panel" x-show="activeTab === 'config'" x-cloak>
+            <h2>lwd.toml</h2>
+            <p class="hint">Rendered from the most recent recorded deployment spec.</p>
+            <template x-if="!currentSpecJson">
+              <div class="state">
+                <strong>No spec on record</strong>
+                <p>This app has no deployment history to render a config from.</p>
+              </div>
+            </template>
+            <template x-if="currentSpecJson">
+              <div>
+                <pre class="code-block" x-text="currentSpecToml"></pre>
+                <div style="margin-top:14px;">
+                  <button type="button" class="btn btn-signal" @click="openDeployEdit()">Edit &amp; apply</button>
+                </div>
+              </div>
+            </template>
+          </section>
+
+          <!-- Danger -->
+          <section class="panel" x-show="activeTab === 'danger'" x-cloak>
+            <h2>Danger zone</h2>
+            <p class="hint">Destructive actions. There is no undo.</p>
+            <div class="danger-box">
+              <p>Delete <strong x-text="selected"></strong> and stop its container. Deployment history is kept.</p>
+              <button type="button" class="btn btn-danger" @click="deleteConfirm = true" x-show="!deleteConfirm">Delete app</button>
+            </div>
+            <div x-show="deleteConfirm" x-cloak x-transition style="margin-top:14px;" class="field">
+              <label style="text-transform:none; letter-spacing:normal; font-family:var(--font-sans); font-size:13px;">Type <strong style="font-family:var(--font-mono); color:var(--ink-0);" x-text="selected"></strong> to confirm deletion</label>
+              <div style="display:flex; gap:8px;">
+                <input x-model="deleteConfirmText" autocomplete="off" style="flex:1;">
+                <button type="button" class="btn btn-ghost" @click="deleteConfirm = false; deleteConfirmText = ''">Cancel</button>
+                <button type="button" class="btn btn-danger" :disabled="deleteConfirmText !== selected || deleteBusy" @click="deleteApp()">
+                  <span x-text="deleteBusy ? 'Deleting…' : 'Confirm delete'"></span>
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+      </template>
+
+      <div class="state" x-show="detailLoading" x-cloak>
+        <strong>Loading…</strong>
+      </div>
+    </main>
+
+    <!-- ================================================================ -->
+    <!-- Deploy modal                                                      -->
+    <!-- ================================================================ -->
+    <div class="modal-veil" x-show="deploy.open" x-cloak x-transition @keydown.escape.window="closeDeploy()">
+      <div class="modal" @click.outside="closeDeploy()" role="dialog" aria-modal="true" aria-label="Deploy">
+        <div class="modal__head">
+          <h2 x-text="deploy.mode === 'edit' ? 'Edit &amp; apply' : 'Deploy an app'"></h2>
+          <button type="button" class="icon-btn" @click="closeDeploy()" aria-label="Close">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5l10 10M15 5 5 15"/></svg>
+          </button>
+        </div>
+        <p class="hint">Paste an <code>lwd.toml</code> document. Single-service apps deploy fully from here; compose apps also need their compose file present on the daemon host.</p>
+        <textarea x-model="deploy.toml" spellcheck="false" placeholder="name = &quot;my-app&quot;&#10;image = &quot;ghcr.io/me/my-app:latest&quot;&#10;domain = &quot;my-app.example.com&quot;&#10;port = 8080" :disabled="deploy.busy"></textarea>
+        <div class="modal__error" x-show="deploy.error" x-cloak x-text="deploy.error"></div>
+        <div class="modal__foot">
+          <button type="button" class="btn btn-ghost" @click="closeDeploy()">Cancel</button>
+          <button type="button" class="btn btn-signal" @click="submitDeploy()" :disabled="deploy.busy || !deploy.toml.trim()">
+            <span x-text="deploy.busy ? 'Applying…' : 'Apply'"></span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- Toasts                                                            -->
+    <!-- ================================================================ -->
+    <div class="toasts">
+      <template x-for="toast in toasts" :key="toast.id">
+        <div class="toast" :class="toast.kind">
+          <span class="dot"></span>
+          <span x-text="toast.message"></span>
+        </div>
+      </template>
+    </div>
+
+  </div>
+  <script src="/static/app.js" defer></script>
+  <script src="/static/alpine.min.js" defer></script>
+</body>
+</html>

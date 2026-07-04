@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lwd — sign in</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script>
+    // Apply the saved theme before paint to avoid a flash of the wrong theme.
+    try {
+      var t = localStorage.getItem('lwd-theme');
+      if (t) document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+  </script>
+</head>
+<body>
+  <!-- lwd-web login -->
+  <div class="login-shell"
+       x-data="{
+         password: '',
+         error: '',
+         busy: false,
+         async submit() {
+           this.busy = true;
+           this.error = '';
+           try {
+             const body = new URLSearchParams({ password: this.password });
+             const res = await fetch('/login', {
+               method: 'POST',
+               headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+               body,
+             });
+             if (res.ok) {
+               window.location.assign('/');
+               return;
+             }
+             this.error = res.status === 401
+               ? 'Incorrect password.'
+               : 'Sign-in failed (' + res.status + ').';
+           } catch (e) {
+             this.error = 'Could not reach lwd-web. Check your connection and try again.';
+           } finally {
+             this.busy = false;
+           }
+         },
+       }">
+    <div class="login-card">
+      <div class="login-brand">
+        <span class="brand__mark">λ</span>
+        <strong>lwd</strong>
+      </div>
+      <p class="tag-line">deploy console — sign in to continue</p>
+
+      <div class="login-error" x-show="error" x-cloak x-transition>
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10 6.5v4M10 13.2h.01" stroke-linecap="round"/><circle cx="10" cy="10" r="7.5"/></svg>
+        <span x-text="error"></span>
+      </div>
+
+      <form method="post" action="/login" @submit.prevent="submit()">
+        <div class="field">
+          <label for="password">Password</label>
+          <input type="password" id="password" name="password" x-model="password"
+                 autocomplete="current-password" autofocus required :disabled="busy">
+        </div>
+        <button type="submit" class="btn btn-signal" style="margin-top: 18px;" :disabled="busy">
+          <span x-show="!busy">Sign in</span>
+          <span x-show="busy" x-cloak>Signing in…</span>
+        </button>
+      </form>
+
+      <p class="login-foot">lwd · self-hosted deploy engine</p>
+    </div>
+  </div>
+  <script src="/static/alpine.min.js" defer></script>
+</body>
+</html>
