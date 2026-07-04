@@ -2,10 +2,12 @@
 
 A suckless, self-hosted deployment engine for Docker apps. Point it at an app,
 deploy with one command, get automatic HTTPS and zero-downtime rollouts for
-free. Single static Go binary that is both the daemon and the CLI.
+free. Single static Go binary that is both the daemon and the CLI, plus an
+optional second binary, [`lwd-web`](#web-ui-lwd-web), for a browser
+dashboard.
 
-> This is the **router + blue-green + secrets + compose apps** milestone.
-> Pinned surfaces and the web UI arrive in later milestones.
+> This is the **router + blue-green + secrets + compose apps + web UI**
+> milestone. Pinned surfaces arrive in a later milestone.
 
 ## Build
 
@@ -182,6 +184,75 @@ stored at `<data_dir>/secret.key` with `0600` permissions. Once a value is
 set, it is **never read back out of the daemon** — the API and CLI only
 expose `set`, `ls` (names only), and `rm`; there is no `get`.
 
+## Web UI (lwd-web)
+
+`lwd-web` is a **separate dashboard binary** — a "self-hosted Vercel" front
+end for lwd. It is just another client of the daemon's existing unix-socket
+API (the same API the `lwd` CLI uses): it makes **zero changes to the
+daemon**, reconciler, router, or store, and can do nothing the daemon API
+doesn't already permit.
+
+### Build
+
+```bash
+CGO_ENABLED=0 go build -o lwd-web ./cmd/lwd-web
+```
+
+### Run
+
+```bash
+LWD_WEB_PASSWORD=changeme ./lwd-web
+```
+
+- `LWD_WEB_PASSWORD` (required) — the dashboard's admin password; `lwd-web`
+  refuses to start without it.
+- `LWD_WEB_ADDR` (default `127.0.0.1:8079`) — listen address.
+- `LWD_WEB_SECRET` (optional) — cookie-signing key; if unset, a random key is
+  generated at startup (sessions reset on restart).
+- The daemon's unix socket is located the same way the CLI locates it —
+  `LWD_SOCKET`, or `LWD_DATA_DIR` (default `/var/lib/lwd`) + `lwd.sock` — so
+  run `lwd-web` on the same host as the daemon, with the same `LWD_DATA_DIR`
+  if you've customized it.
+
+### Auth
+
+A single shared admin password (`LWD_WEB_PASSWORD`) gates the whole
+dashboard. `POST /login` checks the password with a constant-time compare
+and sets an `HttpOnly`, `SameSite=Lax` signed session cookie (`Secure` when
+served over TLS); the session expires after 24 hours. There's no
+multi-user/role model — this is a single-operator tool, same as the daemon
+itself.
+
+### Exposing it safely
+
+`lwd-web` binds `127.0.0.1:8079` by default and speaks plain HTTP with no
+built-in TLS, so don't expose it directly to the internet. Instead:
+
+- **SSH tunnel** (simplest): `ssh -L 8079:localhost:8079 you@host`, then browse
+  `http://localhost:8079` locally.
+- **Front it with lwd's own Caddy**: point a `domain` at `lwd-web`'s address
+  the same way you'd front any other app, so you get automatic HTTPS. (Since
+  `lwd-web` isn't itself deployed as an lwd app in this milestone, this means
+  adding it to the Caddy config manually or deploying it as a plain container
+  that proxies to the host; dogfooding `lwd-web` as an lwd-managed app is a
+  later enhancement.)
+
+### Features
+
+- **Overview** — every app's name, domain, status, image, and health at a
+  glance, with a **Deploy** action that applies a pasted `lwd.toml`.
+- **Live logs** — a per-app log stream over SSE, with a follow toggle.
+- **History + rollback** — past deployments for an app, with a one-click
+  **Roll back** to any prior deployment.
+- **Secrets** — list secret names (never values), set, and delete.
+- **Redeploy** — re-apply an app's current deployment spec snapshot (e.g.
+  after fixing something on the daemon host, or just to restart it).
+- **Config edit** — view and edit an app's `lwd.toml` and re-apply it.
+
+As with the CLI, compose apps deployed or edited through the UI still need
+their compose file present on the daemon host; pasting a full `lwd.toml` to
+create a new app from scratch works fully for single-service (`image`) apps.
+
 ## Networking model
 
 - lwd creates and manages one private Docker network, `lwd`. Every app
@@ -211,6 +282,11 @@ expose `set`, `ls` (names only), and `rm`; there is no `get`.
 - `surfaces` in `lwd.toml` is parsed but rejected with a clear error for both
   shapes; the surfaces-outside-compose blue-green model discussed for the web
   tier of a compose app is deliberately not built (YAGNI for now).
+- [`lwd-web`](#web-ui-lwd-web) (a separate dashboard binary) is fully live:
+  overview, live logs, history/rollback, secrets, redeploy, and config edit,
+  all as a thin client of the same daemon API the CLI uses. Deploying
+  `lwd-web` itself as an lwd-managed app, multi-user auth, and deploy-from-git
+  in the UI are not built yet.
 
 ### Known limitations (this milestone)
 
@@ -251,6 +327,13 @@ expose `set`, `ls` (names only), and `rm`; there is no `get`.
 go test ./...                              # unit tests (e2e SKIPs without Docker)
 LWD_DOCKER_TEST=1 go test ./test/ -v       # + real end-to-end test against Docker
 ```
+
+`internal/web`'s `TestIntegrationWebClientDaemon` runs as part of the plain
+`go test ./...` (no Docker, no build tag): it starts a real daemon
+`api.Server` on a temp unix socket backed by the fake node/router/compose
+stack, drives `lwd-web`'s HTTP handler over real HTTP through a real
+`internal/client`, and exercises login → `/api/apps` → `/api/apply` →
+`/api/apps` again, proving the browser → `lwd-web` → daemon chain end to end.
 
 The end-to-end suite drives the full stack — a real Docker daemon, a real
 `lwd-caddy` container, and real deployments (`traefik/whoami`, and for the
