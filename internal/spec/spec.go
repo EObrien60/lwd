@@ -25,9 +25,12 @@ type App struct {
 	Secrets []string          `toml:"secrets"`
 	Health  Health            `toml:"health"`
 
+	// Compose apps
+	Compose string `toml:"compose"`
+	Service string `toml:"service"`
+
 	// Not yet supported — parsed so we can reject them explicitly.
 	Build    *Build   `toml:"build"`
-	Compose  string   `toml:"compose"`
 	Surfaces []string `toml:"surfaces"`
 }
 
@@ -66,32 +69,65 @@ func Parse(data []byte) (*App, error) {
 	return &a, nil
 }
 
-// Load reads and parses <dir>/lwd.toml.
+// Load reads and parses <dir>/lwd.toml. For a compose app, a relative
+// Compose path is resolved against dir into an absolute path, so that
+// daemon-side code (which runs with a different working directory than the
+// CLI invocation) can still os.ReadFile it. An already-absolute Compose path
+// is left untouched. Single-service apps (Compose == "") are unaffected.
 func Load(dir string) (*App, error) {
 	path := filepath.Join(dir, "lwd.toml")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	return Parse(data)
+	a, err := Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	if a.Compose != "" && !filepath.IsAbs(a.Compose) {
+		a.Compose = filepath.Join(dir, a.Compose)
+	}
+	return a, nil
 }
 
 // Validate returns an error if the App cannot be deployed by this version.
 func (a *App) Validate() error {
+	// Name validation applies to both compose and single-service apps
 	if a.Name == "" {
 		return fmt.Errorf("name is required")
 	}
 	if !nameRe.MatchString(a.Name) {
 		return fmt.Errorf("name %q is invalid: must match [a-zA-Z0-9][a-zA-Z0-9_.-]*", a.Name)
 	}
-	if a.Compose != "" {
-		return fmt.Errorf("compose apps are not supported yet")
-	}
-	if a.Build != nil {
-		return fmt.Errorf("build-from-source is not supported yet")
-	}
+
+	// Surfaces are never supported
 	if len(a.Surfaces) > 0 {
 		return fmt.Errorf("surfaces are not supported yet")
+	}
+
+	// Compose app validation
+	if a.Compose != "" {
+		if a.Service == "" {
+			return fmt.Errorf("service is required for compose apps")
+		}
+		if a.Domain == "" {
+			return fmt.Errorf("domain is required for compose apps")
+		}
+		if a.Port == 0 {
+			return fmt.Errorf("port is required for compose apps")
+		}
+		if a.Image != "" {
+			return fmt.Errorf("cannot mix compose and image")
+		}
+		if a.Build != nil {
+			return fmt.Errorf("cannot mix compose and build")
+		}
+		return nil
+	}
+
+	// Single-service app validation
+	if a.Build != nil {
+		return fmt.Errorf("build-from-source is not supported yet")
 	}
 	if a.Image == "" {
 		return fmt.Errorf("image is required")

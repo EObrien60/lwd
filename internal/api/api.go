@@ -3,7 +3,6 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -176,47 +175,11 @@ func (srv *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 
 func (srv *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if err := srv.removeApp(r.Context(), name); err != nil {
+	if err := srv.rec.Remove(r.Context(), name); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func (srv *Server) removeApp(ctx context.Context, name string) error {
-	cur, err := srv.store.CurrentDeployment(name)
-	if err != nil {
-		return err
-	}
-	var domain string
-	if cur != nil && cur.Spec != "" {
-		var a spec.App
-		if err := json.Unmarshal([]byte(cur.Spec), &a); err == nil {
-			domain = a.Domain
-		}
-	}
-
-	containers, err := srv.node.ListContainers(ctx, map[string]string{"lwd.app": name})
-	if err != nil {
-		return err
-	}
-	for _, c := range containers {
-		if err := srv.node.RemoveContainer(ctx, c.ID); err != nil {
-			return err
-		}
-	}
-
-	if domain != "" {
-		// Best-effort: a failure here shouldn't stop the app from being
-		// retired (its containers are already gone), but it does mean the
-		// domain may keep 502ing until a later reload/rm fixes it up.
-		_ = srv.router.RemoveRoute(ctx, domain)
-	}
-
-	if cur != nil {
-		return srv.store.SetStatus(cur.ID, store.StatusRetired)
-	}
-	return nil
 }
 
 // secretRequest is the wire body for POST /apps/{name}/secrets. Values never

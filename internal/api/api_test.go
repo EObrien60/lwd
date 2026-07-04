@@ -7,10 +7,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"lwd/internal/compose"
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
 	"lwd/internal/router"
@@ -43,7 +45,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *node.Fake) {
 	t.Cleanup(func() { s.Close() })
 	rt := router.NewFakeRouter()
 	secStore := testSecretResolver(t, s, dir)
-	srv := New(reconciler.New(f, rt, s, secStore), s, f, rt, secStore)
+	srv := New(reconciler.New(f, rt, s, secStore, compose.NewFake()), s, f, rt, secStore)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f
@@ -63,10 +65,32 @@ func newTestServerWithRouter(t *testing.T) (*httptest.Server, *node.Fake, *route
 	t.Cleanup(func() { s.Close() })
 	rt := router.NewFakeRouter()
 	secStore := testSecretResolver(t, s, dir)
-	srv := New(reconciler.New(f, rt, s, secStore), s, f, rt, secStore)
+	srv := New(reconciler.New(f, rt, s, secStore, compose.NewFake()), s, f, rt, secStore)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f, rt
+}
+
+// newTestServerWithCompose is like newTestServer but also returns the
+// FakeRouter and the compose.Fake, so tests can drive a compose app through
+// the API and assert on `docker compose` side effects (e.g. delete calling
+// Down).
+func newTestServerWithCompose(t *testing.T) (*httptest.Server, *router.FakeRouter, *compose.Fake) {
+	t.Helper()
+	f := node.NewFake()
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	rt := router.NewFakeRouter()
+	cf := compose.NewFake()
+	secStore := testSecretResolver(t, s, dir)
+	srv := New(reconciler.New(f, rt, s, secStore, cf), s, f, rt, secStore)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts, rt, cf
 }
 
 func TestApplyEndpoint(t *testing.T) {
@@ -293,6 +317,62 @@ func TestDeleteEndpointRemovesRoute(t *testing.T) {
 
 	if _, ok := rt.Routes["blog.example.com"]; ok {
 		t.Fatalf("expected route for blog.example.com to be removed after rm, got %+v", rt.Routes)
+	}
+}
+
+func TestDeleteComposeAppCallsComposeDown(t *testing.T) {
+	ts, rt, cf := newTestServerWithCompose(t)
+
+	composeDir := t.TempDir()
+	composePath := filepath.Join(composeDir, "docker-compose.yml")
+	if err := os.WriteFile(composePath, []byte("services:\n  web:\n    image: nginx\n"), 0o644); err != nil {
+		t.Fatalf("write compose file: %v", err)
+	}
+	cf.ServiceID = "cid-1"
+	cf.ServiceName = "lwd-webapp-web-1"
+	rt.ProbeStatus = 200
+
+	app := spec.App{
+		Name:    "webapp",
+		Compose: composePath,
+		Service: "web",
+		Domain:  "webapp.example.com",
+		Port:    8080,
+		Node:    "local",
+	}
+	body, _ := json.Marshal(app)
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /apply: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("apply status = %d, body = %s", resp.StatusCode, b)
+	}
+
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/apps/webapp", nil)
+	delResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	defer delResp.Body.Close()
+	if delResp.StatusCode != 204 {
+		b, _ := io.ReadAll(delResp.Body)
+		t.Fatalf("status = %d, want 204, body = %s", delResp.StatusCode, b)
+	}
+
+	var sawDown bool
+	for _, c := range cf.Calls {
+		if c == "Down:lwd-webapp" {
+			sawDown = true
+		}
+	}
+	if !sawDown {
+		t.Fatalf("want compose Down call, calls: %v", cf.Calls)
+	}
+	if _, ok := rt.Routes["webapp.example.com"]; ok {
+		t.Fatalf("want route removed after compose delete, routes: %+v", rt.Routes)
 	}
 }
 

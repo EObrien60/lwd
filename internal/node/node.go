@@ -69,4 +69,7 @@ type Node interface {
 	// (running/exited/...) and, if the image declares a HEALTHCHECK, the
 	// Docker health status (starting/healthy/unhealthy); "" if none.
 	ContainerHealth(ctx context.Context, id string) (state string, dockerHealth string, err error)
+	// ConnectContainerToNetwork attaches a container to a network. Idempotent:
+	// if the container is already on the network, returns nil.
+	ConnectContainerToNetwork(ctx context.Context, containerID, network string) error
 }

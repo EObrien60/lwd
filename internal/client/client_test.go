@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"lwd/internal/api"
+	"lwd/internal/compose"
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
 	"lwd/internal/router"
@@ -33,7 +34,7 @@ func startUnixServer(t *testing.T) string {
 		t.Fatalf("secrets.NewCipher: %v", err)
 	}
 	secStore := secrets.NewStore(cipher, s)
-	srv := api.New(reconciler.New(f, rt, s, secStore), s, f, rt, secStore)
+	srv := api.New(reconciler.New(f, rt, s, secStore, compose.NewFake()), s, f, rt, secStore)
 
 	ln, err := net.Listen("unix", sock)
 	if err != nil {

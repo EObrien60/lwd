@@ -4,8 +4,8 @@ A suckless, self-hosted deployment engine for Docker apps. Point it at an app,
 deploy with one command, get automatic HTTPS and zero-downtime rollouts for
 free. Single static Go binary that is both the daemon and the CLI.
 
-> This is the **router + blue-green + secrets** milestone. Compose apps,
-> pinned surfaces, and the web UI arrive in later milestones.
+> This is the **router + blue-green + secrets + compose apps** milestone.
+> Pinned surfaces and the web UI arrive in later milestones.
 
 ## Build
 
@@ -48,17 +48,22 @@ self-signed cert instead of hitting a public CA.
 ## Deploy, inspect, and roll back
 
 ```bash
-lwd apply ./myapp     # zero-downtime blue-green deploy of ./myapp/lwd.toml
+lwd apply ./myapp     # deploy ./myapp/lwd.toml (blue-green for image apps, delegated to `docker compose` for compose apps)
 lwd ls                # list apps and status
 lwd logs blog -f      # stream logs
 lwd history blog      # show past deployments for an app
-lwd rollback blog     # redeploy the previous version, itself zero-downtime
+lwd rollback blog     # redeploy the previous version
 lwd rm blog           # stop and deregister
 ```
 
 ## How deploys work
 
-Every `apply` is a blue-green swap, never an in-place recreate:
+This section describes single-service (`image`) apps; see
+[Compose apps](#compose-apps) for the multi-container `compose` model, which
+does not use blue-green.
+
+Every `apply` of a single-service app is a blue-green swap, never an in-place
+recreate:
 
 1. A new "surface" container is started alongside whatever is currently
    running, attached only to the private `lwd` network — it never publishes a
@@ -82,7 +87,71 @@ recorded, while whatever was already running keeps serving traffic untouched.
 Every deployment's resolved spec is snapshotted, so `lwd rollback` restores
 the exact previous image/config from that snapshot — not a re-resolution of
 whatever `lwd.toml` currently says — via the same zero-downtime blue-green
-path used for every other deploy.
+path used for every other deploy. (For a compose app, `lwd rollback` instead
+restores the snapshotted compose file content — see
+[Compose apps](#compose-apps).)
+
+## Compose apps
+
+An app can be a multi-container [Docker Compose](https://docs.docker.com/compose/)
+stack instead of a single image — declare `compose` + `service` instead of `image`:
+
+```toml
+name    = "webapp"
+compose = "docker-compose.yml"   # relative to the app dir (or an absolute path)
+service = "web"                  # the compose service Caddy fronts
+domain  = "webapp.example.com"
+port    = 8080                   # container port of `service`
+env     = { LOG_LEVEL = "info" } # passed to `docker compose` as environment
+secrets = ["DATABASE_URL"]       # resolved, then passed the same way
+
+[health]
+path = "/healthz"
+```
+
+This requires the **`docker compose` CLI plugin** on the host running the daemon
+(Docker Desktop and modern Docker Engine both ship it — single-service `image` apps
+don't need it). `lwd.toml` validation rejects mixing `compose` with `image` or
+`[build]`; `surfaces` is not supported for either shape.
+
+### How compose deploys work (in-place recreate, not blue-green)
+
+lwd delegates orchestration entirely to `docker compose` rather than running its own
+blue-green swap:
+
+1. `docker compose -p lwd-<app> -f <compose file> up -d --remove-orphans`. Compose only
+   recreates services whose image or config changed since the last `up` — **an
+   unchanged backing service (a database, a cache) is left running untouched.** This is
+   the core guarantee of the compose model: redeploying to ship a new web-service image
+   does not restart the database.
+2. lwd resolves `service`'s running container, joins it to the shared `lwd` network, and
+   points `domain` at it through Caddy.
+3. It's health-checked through the route using the same layered policy as single-service
+   apps (`health.path` if set, otherwise a liveness fallback) — but through the **live**
+   route, not a staging one.
+
+**Honest tradeoff:** this is **not zero-downtime**. Because compose — not lwd's surface
+machinery — owns the container lifecycle, there is no old container left to keep
+serving while the new one is health-checked; the web service takes a brief in-place
+restart on every redeploy, and the route flips to it before health-gating runs. If the
+health check then fails, lwd does not tear anything down: the (possibly broken) new
+stack is left live and the deployment is recorded as failed. Run `lwd rollback <app>`
+to restore the previous compose content and recover.
+
+### Env, secrets, and rollback for compose apps
+
+`env` and declared `secrets` are resolved exactly like single-service apps — fail-closed
+on any unset secret, aborting before `docker compose` ever runs — and passed as
+**environment variables to the `docker compose` process**, so the compose file's
+`${VAR}` interpolation and any service's own `environment:` entries can reference them.
+Secret values never touch disk as part of a project file.
+
+Every deploy snapshots the compose file's content at that moment, so `lwd rollback` (see
+below) restores the exact prior stack — re-applying the stored content with secrets
+re-resolved against their current values — rather than whatever the compose file on disk
+currently says. `lwd rm <app>` runs `docker compose down` against the stored content,
+removing the project's containers and its own default network. `lwd logs` and `lwd ls`
+work the same as for single-service apps, against `service`'s container.
 
 ## Secrets
 
@@ -126,16 +195,31 @@ expose `set`, `ls` (names only), and `rm`; there is no `get`.
 
 ## Scope of this milestone
 
-- Single host, pre-built images only.
-- `domain` (routing + TLS) is fully live.
+- Single host.
+- `domain` (routing + TLS) is fully live, for both single-service and compose
+  apps.
 - `secrets` (declare names in `lwd.toml`, set values via `lwd secret set`)
   is fully live: values are encrypted at rest and injected into the
-  container environment at deploy time, fail-closed on any unset name.
-- `compose`, `[build]`, and `surfaces` in `lwd.toml` are parsed but rejected
-  with a clear error until their milestones land.
+  container/compose environment at deploy time, fail-closed on any unset
+  name.
+- `compose` (multi-container apps, delegated to the `docker compose` CLI
+  plugin — see [Compose apps](#compose-apps)) is fully live.
+- Single-service apps require a pre-built `image`; lwd's own `[build]` is not
+  supported yet. A compose file may declare its own `build:` stanzas, since
+  `docker compose up` builds those itself — that's compose's doing, not
+  lwd's.
+- `surfaces` in `lwd.toml` is parsed but rejected with a clear error for both
+  shapes; the surfaces-outside-compose blue-green model discussed for the web
+  tier of a compose app is deliberately not built (YAGNI for now).
 
 ### Known limitations (this milestone)
 
+- Compose deploys are **not zero-downtime** (see
+  [Compose apps](#compose-apps)): the routed service gets a brief in-place
+  restart on every redeploy, and a failed health check leaves the
+  (possibly broken) new stack live rather than rolling back automatically —
+  run `lwd rollback` to recover. Single-service apps remain zero-downtime
+  blue-green.
 - Mutable image tags (e.g. `:latest`) are re-pulled on every `apply` when the
   registry is reachable; if the pull fails but the image exists locally, the
   local copy is used.
@@ -169,8 +253,8 @@ LWD_DOCKER_TEST=1 go test ./test/ -v       # + real end-to-end test against Dock
 ```
 
 The end-to-end suite drives the full stack — a real Docker daemon, a real
-`lwd-caddy` container, and real `traefik/whoami` deployments — against real
-Docker:
+`lwd-caddy` container, and real deployments (`traefik/whoami`, and for the
+compose test also `redis`) — against real Docker:
 
 - `TestEndToEndBlueGreenRollback` runs two blue-green deploys and a rollback,
   asserting zero downtime across the swap.
@@ -179,6 +263,13 @@ Docker:
   `docker inspect`, not the app's HTTP response) that the value reached the
   container's environment — then asserts a deploy declaring an unset secret
   fails closed with no container left running.
+- `TestEndToEndComposeApp` deploys a real two-service compose stack (a `web`
+  service Caddy fronts, plus a `cache` backing service standing in for a
+  database) via a real `compose.CLI`, asserts the web service is reachable
+  through Caddy, then redeploys and asserts the `cache` container's ID is
+  **unchanged** — proving compose does not recreate an unchanged backing
+  service across a redeploy. It additionally `t.Skip`s (with a clear message)
+  if the `docker compose` CLI plugin is not available.
 
-Both tests clean up every container and network they create, and will
+All three tests clean up every container and network they create, and will
 `t.Skip` (rather than fail) if ports 80/443 are already in use on the host.

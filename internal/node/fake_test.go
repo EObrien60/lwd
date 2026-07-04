@@ -99,6 +99,16 @@ func TestFakeContainerHealth(t *testing.T) {
 	}
 }
 
+func TestFakeConnectContainerToNetwork(t *testing.T) {
+	f := NewFake()
+	if err := f.ConnectContainerToNetwork(context.Background(), "c1", "lwd"); err != nil {
+		t.Fatalf("ConnectContainerToNetwork: %v", err)
+	}
+	if !contains(f.Calls, "ConnectContainerToNetwork:c1:lwd") {
+		t.Errorf("calls = %v, want to contain ConnectContainerToNetwork:c1:lwd", f.Calls)
+	}
+}
+
 func contains(xs []string, want string) bool {
 	for _, x := range xs {
 		if x == want {
