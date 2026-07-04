@@ -25,9 +25,12 @@ type App struct {
 	Secrets []string          `toml:"secrets"`
 	Health  Health            `toml:"health"`
 
+	// Compose apps
+	Compose string `toml:"compose"`
+	Service string `toml:"service"`
+
 	// Not yet supported — parsed so we can reject them explicitly.
 	Build    *Build   `toml:"build"`
-	Compose  string   `toml:"compose"`
 	Surfaces []string `toml:"surfaces"`
 }
 
@@ -78,20 +81,42 @@ func Load(dir string) (*App, error) {
 
 // Validate returns an error if the App cannot be deployed by this version.
 func (a *App) Validate() error {
+	// Name validation applies to both compose and single-service apps
 	if a.Name == "" {
 		return fmt.Errorf("name is required")
 	}
 	if !nameRe.MatchString(a.Name) {
 		return fmt.Errorf("name %q is invalid: must match [a-zA-Z0-9][a-zA-Z0-9_.-]*", a.Name)
 	}
-	if a.Compose != "" {
-		return fmt.Errorf("compose apps are not supported yet")
-	}
-	if a.Build != nil {
-		return fmt.Errorf("build-from-source is not supported yet")
-	}
+
+	// Surfaces are never supported
 	if len(a.Surfaces) > 0 {
 		return fmt.Errorf("surfaces are not supported yet")
+	}
+
+	// Compose app validation
+	if a.Compose != "" {
+		if a.Service == "" {
+			return fmt.Errorf("service is required for compose apps")
+		}
+		if a.Domain == "" {
+			return fmt.Errorf("domain is required for compose apps")
+		}
+		if a.Port == 0 {
+			return fmt.Errorf("port is required for compose apps")
+		}
+		if a.Image != "" {
+			return fmt.Errorf("cannot mix compose and image")
+		}
+		if a.Build != nil {
+			return fmt.Errorf("cannot mix compose and build")
+		}
+		return nil
+	}
+
+	// Single-service app validation
+	if a.Build != nil {
+		return fmt.Errorf("build-from-source is not supported yet")
 	}
 	if a.Image == "" {
 		return fmt.Errorf("image is required")

@@ -94,3 +94,100 @@ func TestValidateRejectsBadName(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateComposeApp(t *testing.T) {
+	a := &App{
+		Name:    "webapp",
+		Compose: "docker-compose.yml",
+		Service: "web",
+		Domain:  "x.example.com",
+		Port:    8080,
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestComposeRequiresService(t *testing.T) {
+	a := &App{
+		Name:    "webapp",
+		Compose: "docker-compose.yml",
+		Domain:  "x.example.com",
+		Port:    8080,
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for compose without service")
+	}
+}
+
+func TestComposeRequiresDomain(t *testing.T) {
+	a := &App{
+		Name:    "webapp",
+		Compose: "docker-compose.yml",
+		Service: "web",
+		Port:    8080,
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for compose without domain")
+	}
+}
+
+func TestComposeRequiresPort(t *testing.T) {
+	a := &App{
+		Name:    "webapp",
+		Compose: "docker-compose.yml",
+		Service: "web",
+		Domain:  "x.example.com",
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for compose without port")
+	}
+}
+
+func TestComposeRejectsImageMix(t *testing.T) {
+	a := &App{
+		Name:    "webapp",
+		Compose: "docker-compose.yml",
+		Service: "web",
+		Domain:  "x.example.com",
+		Port:    8080,
+		Image:   "some-image:latest",
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error when compose and image both set")
+	}
+}
+
+func TestComposeStillRejectsSurfaces(t *testing.T) {
+	a := &App{
+		Name:     "webapp",
+		Compose:  "docker-compose.yml",
+		Service:  "web",
+		Domain:   "x.example.com",
+		Port:     8080,
+		Surfaces: []string{"web"},
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for surfaces in compose app")
+	}
+}
+
+func TestParseServiceField(t *testing.T) {
+	toml := `
+name = "webapp"
+compose = "docker-compose.yml"
+service = "web"
+domain = "x.example.com"
+port = 8080
+`
+	a, err := Parse([]byte(toml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.Service != "web" {
+		t.Errorf("Service = %q, want web", a.Service)
+	}
+	if a.Compose != "docker-compose.yml" {
+		t.Errorf("Compose = %q", a.Compose)
+	}
+}
