@@ -18,10 +18,16 @@ func TestSignVerifyRoundTrip(t *testing.T) {
 		t.Fatalf("expected valid session cookie to verify, got false for %q", cookie)
 	}
 
-	// Tamper a byte in the cookie value.
+	// Tamper a byte in the signature portion. Flip the FIRST signature
+	// character (immediately after the "."), not the last: the last base64
+	// char of a 32-byte HMAC carries zero-padding bits that decode ignores,
+	// so flipping it can round-trip to the same bytes and spuriously verify.
+	dot := strings.IndexByte(cookie, '.')
+	if dot < 0 || dot+1 >= len(cookie) {
+		t.Fatalf("unexpected cookie format: %q", cookie)
+	}
 	tampered := []byte(cookie)
-	// Flip a character somewhere in the middle (in the signature portion).
-	idx := len(tampered) - 1
+	idx := dot + 1 // first character of the signature
 	if tampered[idx] == 'a' {
 		tampered[idx] = 'b'
 	} else {
