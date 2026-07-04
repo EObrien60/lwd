@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +42,16 @@ const failClosedAppLabel = "e2e-failclosed-whoami"
 // TestEndToEndSecretInjection.
 const secretDomain = "secret-whoami.localhost"
 const failClosedDomain = "failclosed-whoami.localhost"
+
+// composeAppLabel and composeDomain are the app name and domain used by
+// TestEndToEndComposeApp. composeProject mirrors the reconciler's own
+// "lwd-<app>" project-naming convention (see reconciler.applyCompose), so
+// this test can inspect the project's containers directly via the compose
+// CLI without going through lwd's own compose.Composer — that's the thing
+// under test.
+const composeAppLabel = "e2e-compose"
+const composeDomain = "compose-whoami.localhost"
+const composeProject = "lwd-" + composeAppLabel
 
 // caddyContainerName mirrors router.caddyContainerName (unexported), needed
 // here only for best-effort cleanup via the docker CLI.
@@ -311,6 +322,200 @@ func TestEndToEndSecretInjection(t *testing.T) {
 	}
 }
 
+// TestEndToEndComposeApp drives the real stack — including a real
+// compose.CLI, not compose.NewFake() — against a real Docker daemon and the
+// `docker compose` plugin. It deploys a two-service compose stack (a `web`
+// service Caddy fronts, and a `cache` backing service that plays the role of
+// a database), and proves the Phase 4 core guarantee: redeploying an
+// unchanged compose file does NOT recreate the unchanged backing service —
+// the `cache` container's ID survives across a redeploy, even though the
+// whole point of the compose delegate model is that lwd does not manage that
+// container directly.
+//
+// Run with: LWD_DOCKER_TEST=1 go test ./test/ -run TestEndToEndComposeApp -v
+func TestEndToEndComposeApp(t *testing.T) {
+	if os.Getenv("LWD_DOCKER_TEST") == "" {
+		t.Skip("set LWD_DOCKER_TEST=1 to run the end-to-end test against real Docker")
+	}
+	if out, err := exec.Command("docker", "compose", "version").CombinedOutput(); err != nil {
+		t.Skipf("docker compose plugin not available (docker compose version failed: %v: %s)", err, out)
+	}
+
+	dir := t.TempDir()
+
+	composeFile := filepath.Join(dir, "docker-compose.yml")
+	composeContent := "services:\n" +
+		"  web:\n" +
+		"    image: traefik/whoami:latest\n" +
+		"  cache:\n" +
+		"    image: redis:7-alpine\n"
+	if err := os.WriteFile(composeFile, []byte(composeContent), 0o644); err != nil {
+		t.Fatalf("write compose file: %v", err)
+	}
+
+	n, err := node.NewLocal()
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	// Registered via t.Cleanup (not a plain defer) so it runs after — not
+	// before — the compose cleanup below: t.Cleanup callbacks run in LIFO
+	// order among themselves, but a bare `defer` in the test body would run
+	// as soon as the function returns, i.e. before any t.Cleanup callback,
+	// closing the store out from under cleanupComposeProject's call to
+	// rec.Remove.
+	t.Cleanup(func() { s.Close() })
+
+	rtr := router.NewCaddyRouter(n, dir)
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	secStore := secrets.NewStore(cipher, s)
+	rec := reconciler.New(n, rtr, s, secStore, compose.NewCLI())
+
+	// Cleanup runs regardless of how the test ends. It tears the compose
+	// stack down (via the reconciler, exercising Remove/`compose down` as a
+	// product path, plus a direct `docker compose down` fallback in case
+	// Remove never ran), then reuses the shared lwd-caddy/lwd-network
+	// cleanup+verification from the other e2e tests. Registered after the
+	// store's own Cleanup above, so it runs first (LIFO) — the store is
+	// still open when rec.Remove needs it.
+	t.Cleanup(func() {
+		cleanupComposeProject(t, rec, composeAppLabel, composeProject, composeFile)
+		cleanupLWDResources(t, composeAppLabel)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := rtr.EnsureUp(ctx); err != nil {
+		if portsInUse(t) {
+			t.Skipf("ports 80/443 appear to be in use and EnsureUp failed: %v", err)
+		}
+		t.Fatalf("EnsureUp: %v", err)
+	}
+
+	app := &spec.App{
+		Name:    composeAppLabel,
+		Compose: composeFile,
+		Service: "web",
+		Domain:  composeDomain,
+		Port:    80, // whoami listens on :80
+		Node:    "local",
+	}
+	app.Health.Path = "/"
+	app.Health.Timeout = 30 * time.Second
+
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	// --- First deploy ---
+	applyCtx, applyCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	dep1, err := rec.Apply(applyCtx, app)
+	applyCancel()
+	if err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	if dep1.Status != store.StatusRunning {
+		t.Fatalf("first deploy status = %q, want running", dep1.Status)
+	}
+
+	assertReachableDomain(t, client, composeDomain, "first deploy")
+
+	redisID1 := composeServiceContainerID(t, composeProject, "cache")
+
+	// --- Redeploy: the core Phase 4 guarantee ---
+	// The compose file and env are unchanged, so `docker compose up -d`
+	// should leave the `cache` service's container completely untouched —
+	// this is the whole point of delegating to compose instead of the
+	// surfaces-outside-compose machinery: an unchanged backing service (here
+	// standing in for a database) never goes down on redeploy.
+	applyCtx2, applyCancel2 := context.WithTimeout(context.Background(), 60*time.Second)
+	dep2, err := rec.Apply(applyCtx2, app)
+	applyCancel2()
+	if err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+	if dep2.Status != store.StatusRunning {
+		t.Fatalf("second deploy status = %q, want running", dep2.Status)
+	}
+
+	assertReachableDomain(t, client, composeDomain, "after redeploy")
+
+	redisID2 := composeServiceContainerID(t, composeProject, "cache")
+	if redisID2 != redisID1 {
+		t.Fatalf("cache (redis) container id changed across redeploy (%q -> %q): compose recreated an unchanged backing service, which should never happen", redisID1, redisID2)
+	}
+
+	// --- Remove ---
+	if err := rec.Remove(context.Background(), composeAppLabel); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	assertNoComposeProjectContainers(t, composeProject)
+}
+
+// composeServiceContainerID resolves the running container ID for service
+// within project via the compose CLI directly (`docker compose -p <project>
+// ps -q <service>`) — deliberately bypassing lwd's own compose.Composer,
+// which is exactly the thing under test in TestEndToEndComposeApp.
+func composeServiceContainerID(t *testing.T, project, service string) string {
+	t.Helper()
+	out, err := exec.Command("docker", "compose", "-p", project, "ps", "-q", service).CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker compose -p %s ps -q %s: %v: %s", project, service, err, out)
+	}
+	id := strings.TrimSpace(string(out))
+	if id == "" {
+		t.Fatalf("no running container found for service %s in project %s", service, project)
+	}
+	return id
+}
+
+// assertNoComposeProjectContainers fails the test if any container labeled
+// com.docker.compose.project=project remains — the label the compose CLI
+// itself applies to every container it creates for a project, regardless of
+// service.
+func assertNoComposeProjectContainers(t *testing.T, project string) {
+	t.Helper()
+	out, err := exec.Command("docker", "ps", "-aq", "--filter", "label=com.docker.compose.project="+project).CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker ps (compose.project=%s) failed: %v: %s", project, err, out)
+	}
+	if remaining := splitLines(string(out)); len(remaining) > 0 {
+		t.Fatalf("%d stray container(s) for compose project %s remain: %v", len(remaining), project, remaining)
+	}
+}
+
+// cleanupComposeProject is TestEndToEndComposeApp's defensive teardown. It
+// asks the reconciler to remove the app (the product path: Remove ->
+// `compose down` for a compose app), then falls back to a direct `docker
+// compose down` against composeFile in case Remove never got a chance to run
+// (e.g. the test failed before the app was ever successfully deployed, so
+// the store has no current deployment to key off of), and finally verifies
+// no container labeled for this compose project remains. Each step is
+// best-effort (logged, not fatal) except the final verification, matching
+// the pattern established by cleanupLWDResources.
+func cleanupComposeProject(t *testing.T, rec *reconciler.Reconciler, appName, project, composeFile string) {
+	t.Helper()
+
+	if err := rec.Remove(context.Background(), appName); err != nil {
+		t.Logf("cleanup: reconciler.Remove(%s): %v", appName, err)
+	}
+
+	if out, err := exec.Command("docker", "compose", "-p", project, "-f", composeFile, "down").CombinedOutput(); err != nil {
+		t.Logf("cleanup: docker compose -p %s -f %s down: %v: %s", project, composeFile, err, out)
+	}
+
+	out, err := exec.Command("docker", "ps", "-aq", "--filter", "label=com.docker.compose.project="+project).CombinedOutput()
+	if err != nil {
+		t.Errorf("cleanup verification: docker ps (compose.project=%s) failed: %v: %s", project, err, out)
+	} else if remaining := splitLines(string(out)); len(remaining) > 0 {
+		t.Errorf("cleanup verification: %d stray container(s) for compose project %s remain: %v", len(remaining), project, remaining)
+	}
+}
+
 // containsLine reports whether lines contains an exact match for target.
 func containsLine(lines []string, target string) bool {
 	for _, l := range lines {
@@ -365,6 +570,13 @@ func (m *zeroDowntimeMonitor) stop() []error {
 // probe issues one GET through Caddy's public HTTP listener with the
 // domain's Host header, returning the response status code.
 func probe(client *http.Client) (int, error) {
+	return probeDomain(client, domain)
+}
+
+// probeDomain is probe generalized to an arbitrary Host header, used by
+// tests (like TestEndToEndComposeApp) that route a domain other than the
+// package-level whoami.localhost constant.
+func probeDomain(client *http.Client, domain string) (int, error) {
 	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:80/", nil)
 	if err != nil {
 		return 0, err
@@ -382,10 +594,17 @@ func probe(client *http.Client) (int, error) {
 // to settle, then fails the test if it never returns 200.
 func assertReachable(t *testing.T, client *http.Client, when string) {
 	t.Helper()
+	assertReachableDomain(t, client, domain, when)
+}
+
+// assertReachableDomain is assertReachable generalized to an arbitrary
+// domain.
+func assertReachableDomain(t *testing.T, client *http.Client, domain, when string) {
+	t.Helper()
 	var lastStatus int
 	var lastErr error
 	for i := 0; i < 20; i++ {
-		lastStatus, lastErr = probe(client)
+		lastStatus, lastErr = probeDomain(client, domain)
 		if lastErr == nil && lastStatus == 200 {
 			return
 		}
