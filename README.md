@@ -314,6 +314,32 @@ stored at `<data_dir>/secret.key` with `0600` permissions. Once a value is
 set, it is **never read back out of the daemon** — the API and CLI only
 expose `set`, `ls` (names only), and `rm`; there is no `get`.
 
+## Authoring lwd.toml (Claude skill)
+
+`skills/lwd-toml/` is a [Claude Code](https://claude.com/claude-code) skill
+that writes an `lwd.toml` for you: point it at a project directory and it
+inspects for a `Dockerfile`/`docker-compose.yml`, detects the
+language/framework and listening port, spots backing-service dependencies
+(a postgres/redis/mysql/minio client, or a db service in a compose file),
+picks the right app shape (`[git]`+`[build]`, `image =`, or
+`compose =`/`service =`), and writes a valid `lwd.toml` — asking only for
+what it can't infer (the `domain`, and confirmation of the port/backing
+services). It never invents secret values, only names.
+
+To use it, copy or symlink the skill directory into Claude Code's personal
+skills folder:
+
+```bash
+cp -r skills/lwd-toml ~/.claude/skills/lwd-toml
+# or: ln -s "$(pwd)/skills/lwd-toml" ~/.claude/skills/lwd-toml
+```
+
+Then ask Claude Code to "make an lwd.toml for this project" or "deploy this
+with lwd" from within the target project. The skill's worked examples
+(`skills/lwd-toml/references/examples/*.toml`) are round-trip validated
+against the real `internal/spec` parser/validator by
+`internal/spec/examples_test.go`, so they stay in sync with the schema.
+
 ## Web UI (lwd-web)
 
 `lwd-web` is a **separate dashboard binary** — a "self-hosted Vercel" front

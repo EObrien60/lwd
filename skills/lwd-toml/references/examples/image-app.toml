@@ -1,0 +1,10 @@
+name    = "blog"
+image   = "ghcr.io/me/blog:latest"
+domain  = "blog.example.com"
+port    = 8080
+env     = { LOG_LEVEL = "info" }
+secrets = ["API_KEY"]
+
+[health]
+path    = "/healthz"
+timeout = "30s"
