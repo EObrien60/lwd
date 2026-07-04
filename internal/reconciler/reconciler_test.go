@@ -3,11 +3,13 @@ package reconciler
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"lwd/internal/compose"
 	"lwd/internal/node"
 	"lwd/internal/router"
 	"lwd/internal/spec"
@@ -44,18 +46,56 @@ func newTestReconciler(t *testing.T) (*Reconciler, *node.Fake, *router.FakeRoute
 
 func newTestReconcilerWithResolver(t *testing.T, sec SecretResolver) (*Reconciler, *node.Fake, *router.FakeRouter, *store.Store) {
 	t.Helper()
+	r, f, fr, s, _ := newTestReconcilerFull(t, sec)
+	return r, f, fr, s
+}
+
+// newTestReconcilerWithCompose is like newTestReconciler but also returns the
+// compose.Fake, for tests that exercise the compose deploy path and need to
+// assert on / configure its calls (Up/ServiceContainer/Down).
+func newTestReconcilerWithCompose(t *testing.T) (*Reconciler, *node.Fake, *router.FakeRouter, *store.Store, *compose.Fake) {
+	t.Helper()
+	return newTestReconcilerFull(t, &fakeResolver{vals: map[string]string{}})
+}
+
+// newTestReconcilerFull builds a Reconciler wired to fresh fakes for every
+// dependency (node, router, compose) plus a temp-file store, using sec as the
+// secret resolver. It is the single place all the other constructors above
+// funnel through, so New's dependency list only has to be listed once here.
+func newTestReconcilerFull(t *testing.T, sec SecretResolver) (*Reconciler, *node.Fake, *router.FakeRouter, *store.Store, *compose.Fake) {
+	t.Helper()
 	f := node.NewFake()
 	fr := router.NewFakeRouter()
+	cf := compose.NewFake()
 	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	return New(f, fr, s, sec), f, fr, s
+	return New(f, fr, s, sec, cf), f, fr, s, cf
 }
 
 func testApp() *spec.App {
 	return &spec.App{Name: "blog", Image: "img:1", Domain: "blog.example.com", Port: 8080, Node: "local"}
+}
+
+// testComposeApp writes content to a temp compose file and returns a compose
+// spec.App pointing at it (Compose already resolved to an absolute path, as
+// spec.Load is expected to do at parse time).
+func testComposeApp(t *testing.T, content string) *spec.App {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "docker-compose.yml")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write compose file: %v", err)
+	}
+	return &spec.App{
+		Name:    "webapp",
+		Compose: path,
+		Service: "web",
+		Domain:  "webapp.example.com",
+		Port:    8080,
+		Node:    "local",
+	}
 }
 
 func TestApplyStagesProbesFlips(t *testing.T) {
@@ -199,7 +239,7 @@ func TestApplyDockerHealthcheck(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}})
+	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake())
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -225,7 +265,7 @@ func TestApplyDockerHealthcheckUnhealthyFails(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}})
+	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake())
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -387,7 +427,7 @@ func TestApplyDockerHealthStartingThenHealthy(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}})
+	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake())
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -551,6 +591,231 @@ func TestApplyFailsClosedOnResolveError(t *testing.T) {
 
 	if cur, _ := s.CurrentDeployment("blog"); cur != nil {
 		t.Errorf("want no running deployment, got %+v", cur)
+	}
+}
+
+func TestApplyComposeUpConnectsRoutesVerifies(t *testing.T) {
+	r, f, fr, s, cf := newTestReconcilerFull(t, &fakeResolver{vals: map[string]string{"DB": "secretval"}})
+	app := testComposeApp(t, "services:\n  web:\n    image: nginx\n")
+	app.Health.Timeout = shortTimeout
+	app.Env = map[string]string{"A": "1"}
+	app.Secrets = []string{"DB"}
+	cf.ServiceID = "cid-1"
+	cf.ServiceName = "lwd-webapp-web-1"
+	fr.ProbeStatus = 200
+
+	dep, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if !containsInOrder(cf.Calls, "Up:lwd-webapp", "ServiceContainer:lwd-webapp:web") {
+		t.Errorf("expected Up before ServiceContainer, calls: %v", cf.Calls)
+	}
+	if !contains(f.Calls, "ConnectContainerToNetwork:cid-1:lwd") {
+		t.Errorf("expected ConnectContainerToNetwork:cid-1:lwd, calls: %v", f.Calls)
+	}
+	if !containsInOrder(fr.Calls, "SetRoute:webapp.example.com", "ProbeThroughCaddy:webapp.example.com") {
+		t.Errorf("expected SetRoute before the health probe, calls: %v", fr.Calls)
+	}
+
+	if dep.Status != store.StatusRunning {
+		t.Errorf("status = %q, want running", dep.Status)
+	}
+	if dep.Compose == "" {
+		t.Errorf("want non-empty Compose snapshot")
+	}
+	if dep.ContainerID != "cid-1" {
+		t.Errorf("ContainerID = %q, want cid-1", dep.ContainerID)
+	}
+
+	route, ok := fr.Routes["webapp.example.com"]
+	if !ok {
+		t.Fatalf("Routes[webapp.example.com] not set, routes: %+v", fr.Routes)
+	}
+	if route.Upstream != "lwd-webapp-web-1" {
+		t.Errorf("route.Upstream = %q, want lwd-webapp-web-1", route.Upstream)
+	}
+
+	if cf.LastUp.Env["A"] != "1" {
+		t.Errorf("LastUp.Env[A] = %q, want 1", cf.LastUp.Env["A"])
+	}
+	if cf.LastUp.Env["DB"] != "secretval" {
+		t.Errorf("LastUp.Env[DB] = %q, want secretval", cf.LastUp.Env["DB"])
+	}
+
+	cur, _ := s.CurrentDeployment("webapp")
+	if cur == nil || cur.ContainerID != "cid-1" {
+		t.Errorf("CurrentDeployment mismatch: %+v", cur)
+	}
+}
+
+func TestApplyComposeFailClosedSecret(t *testing.T) {
+	r, _, _, s, cf := newTestReconcilerFull(t, &fakeResolver{err: fmt.Errorf("boom")})
+	app := testComposeApp(t, "services:\n  web:\n    image: nginx\n")
+	app.Secrets = []string{"DB"}
+
+	_, err := r.Apply(context.Background(), app)
+	if err == nil {
+		t.Fatal("want error when secret resolution fails")
+	}
+
+	if len(cf.Calls) != 0 {
+		t.Errorf("want no compose calls when secrets fail closed, calls: %v", cf.Calls)
+	}
+
+	history, err := s.DeploymentsForApp(app.Name)
+	if err != nil {
+		t.Fatalf("DeploymentsForApp: %v", err)
+	}
+	var sawFailed bool
+	for _, d := range history {
+		if d.Status == store.StatusFailed {
+			sawFailed = true
+		}
+	}
+	if !sawFailed {
+		t.Errorf("want a StatusFailed deployment recorded, history: %+v", history)
+	}
+}
+
+func TestApplyComposeHealthFailRecordsFailed(t *testing.T) {
+	r, _, fr, s, cf := newTestReconcilerWithCompose(t)
+	app := testComposeApp(t, "services:\n  web:\n    image: nginx\n")
+	app.Health.Timeout = shortTimeout
+	cf.ServiceID = "cid-2"
+	cf.ServiceName = "lwd-webapp-web-1"
+	fr.ProbeStatus = 502
+
+	_, err := r.Apply(context.Background(), app)
+	if err == nil {
+		t.Fatal("want error when the health probe never succeeds")
+	}
+
+	if contains(cf.Calls, "Down:lwd-webapp") {
+		t.Errorf("compose down must never be called on a failed health check, calls: %v", cf.Calls)
+	}
+	// The stack is left live (in-place delegate model): the route set before
+	// health-gating must remain, unlike blue-green's isolation guarantee.
+	if _, ok := fr.Routes["webapp.example.com"]; !ok {
+		t.Errorf("want the route to remain set (stack stays live) after a failed compose health check")
+	}
+
+	history, err := s.DeploymentsForApp(app.Name)
+	if err != nil {
+		t.Fatalf("DeploymentsForApp: %v", err)
+	}
+	var sawFailed bool
+	for _, d := range history {
+		if d.Status == store.StatusFailed && d.ContainerID == "cid-2" {
+			sawFailed = true
+		}
+	}
+	if !sawFailed {
+		t.Errorf("want a StatusFailed deployment recorded, history: %+v", history)
+	}
+}
+
+func TestRollbackComposeReappliesStored(t *testing.T) {
+	r, _, fr, s, cf := newTestReconcilerWithCompose(t)
+	fr.ProbeStatus = 200
+
+	app1 := testComposeApp(t, "content-A")
+	app1.Health.Timeout = shortTimeout
+	cf.ServiceID = "cid-1"
+	cf.ServiceName = "lwd-webapp-web-1"
+	if _, err := r.Apply(context.Background(), app1); err != nil {
+		t.Fatalf("v1 Apply: %v", err)
+	}
+
+	app2 := testComposeApp(t, "content-B")
+	app2.Health.Timeout = shortTimeout
+	cf.ServiceID = "cid-2"
+	cf.ServiceName = "lwd-webapp-web-2"
+	if _, err := r.Apply(context.Background(), app2); err != nil {
+		t.Fatalf("v2 Apply: %v", err)
+	}
+
+	cf.ServiceID = "cid-3"
+	cf.ServiceName = "lwd-webapp-web-3"
+	back, err := r.Rollback(context.Background(), "webapp")
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if back.Compose != "content-A" {
+		t.Errorf("Rollback Compose = %q, want content-A", back.Compose)
+	}
+	if back.Status != store.StatusRunning {
+		t.Errorf("Rollback status = %q, want running", back.Status)
+	}
+
+	cur, err := s.CurrentDeployment("webapp")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || cur.Compose != "content-A" {
+		t.Fatalf("want current deployment restored to content-A, got %+v", cur)
+	}
+}
+
+func TestRemoveComposeCallsDown(t *testing.T) {
+	r, _, fr, s, cf := newTestReconcilerWithCompose(t)
+	app := testComposeApp(t, "services:\n  web:\n    image: nginx\n")
+	app.Health.Timeout = shortTimeout
+	cf.ServiceID = "cid-1"
+	cf.ServiceName = "lwd-webapp-web-1"
+	fr.ProbeStatus = 200
+
+	if _, err := r.Apply(context.Background(), app); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if err := r.Remove(context.Background(), "webapp"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	if !contains(cf.Calls, "Down:lwd-webapp") {
+		t.Errorf("expected compose Down call, calls: %v", cf.Calls)
+	}
+	if _, ok := fr.Routes["webapp.example.com"]; ok {
+		t.Errorf("want route removed after Remove")
+	}
+	cur, err := s.CurrentDeployment("webapp")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur != nil {
+		t.Errorf("want no current deployment after Remove, got %+v", cur)
+	}
+}
+
+func TestRemoveSingleServiceRemovesContainersAndRoute(t *testing.T) {
+	r, f, fr, s := newTestReconciler(t)
+	app := testApp()
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	dep, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if err := r.Remove(context.Background(), "blog"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	if !contains(f.Calls, "RemoveContainer:"+dep.ContainerID) {
+		t.Errorf("expected container removed, calls: %v", f.Calls)
+	}
+	if _, ok := fr.Routes["blog.example.com"]; ok {
+		t.Errorf("want route removed after Remove")
+	}
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur != nil {
+		t.Errorf("want no current deployment after Remove, got %+v", cur)
 	}
 }
 

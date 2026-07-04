@@ -14,6 +14,7 @@ import (
 
 	"lwd/internal/api"
 	"lwd/internal/client"
+	"lwd/internal/compose"
 	"lwd/internal/config"
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
@@ -98,7 +99,7 @@ func runDaemon() int {
 	}
 	secStore := secrets.NewStore(cipher, s)
 
-	srv := api.New(reconciler.New(n, r, s, secStore), s, n, r, secStore)
+	srv := api.New(reconciler.New(n, r, s, secStore, compose.NewCLI()), s, n, r, secStore)
 
 	sock := config.SocketPath()
 	_ = os.Remove(sock) // clean stale socket

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"lwd/internal/compose"
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
 	"lwd/internal/router"
@@ -78,7 +79,7 @@ func TestEndToEndBlueGreenRollback(t *testing.T) {
 		t.Fatalf("secrets.NewCipher: %v", err)
 	}
 	secStore := secrets.NewStore(cipher, s)
-	rec := reconciler.New(n, rtr, s, secStore)
+	rec := reconciler.New(n, rtr, s, secStore, compose.NewFake())
 
 	// Cleanup runs regardless of how the test ends (pass, fail, or panic via
 	// t.Fatal) and is best-effort: each step's error is logged, not fatal, so
@@ -230,7 +231,7 @@ func TestEndToEndSecretInjection(t *testing.T) {
 		t.Fatalf("secrets.NewCipher: %v", err)
 	}
 	secStore := secrets.NewStore(cipher, s)
-	rec := reconciler.New(n, rtr, s, secStore)
+	rec := reconciler.New(n, rtr, s, secStore, compose.NewFake())
 
 	t.Cleanup(func() {
 		cleanupLWDResources(t, secretAppLabel, failClosedAppLabel)

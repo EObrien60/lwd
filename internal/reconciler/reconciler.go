@@ -15,10 +15,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"sync"
 	"time"
 
+	"lwd/internal/compose"
 	"lwd/internal/node"
 	"lwd/internal/router"
 	"lwd/internal/spec"
@@ -65,13 +67,15 @@ type Reconciler struct {
 	router  router.Router
 	store   *store.Store
 	secrets SecretResolver
+	compose compose.Composer
 	mu      sync.Mutex
 }
 
-// New returns a Reconciler bound to a node, a router, a store, and a secret
-// resolver used to inject an app's declared secrets into its container env.
-func New(n node.Node, r router.Router, s *store.Store, sec SecretResolver) *Reconciler {
-	return &Reconciler{node: n, router: r, store: s, secrets: sec}
+// New returns a Reconciler bound to a node, a router, a store, a secret
+// resolver used to inject an app's declared secrets into its container env,
+// and a Composer used to delegate compose-app deploys to `docker compose`.
+func New(n node.Node, r router.Router, s *store.Store, sec SecretResolver, comp compose.Composer) *Reconciler {
+	return &Reconciler{node: n, router: r, store: s, secrets: sec, compose: comp}
 }
 
 // containerName returns the name of the surface container for one blue-green
@@ -106,6 +110,10 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 
 	if err := app.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid spec: %w", err)
+	}
+
+	if app.Compose != "" {
+		return r.applyCompose(ctx, app)
 	}
 
 	if err := r.router.EnsureUp(ctx); err != nil {
@@ -224,6 +232,285 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 	return &dep, nil
 }
 
+// applyCompose deploys a compose app by delegating orchestration to `docker
+// compose` and layering lwd's Caddy routing + health-gating on top. Unlike
+// the single-service blue-green path, this is an in-place recreate: compose
+// only recreates services whose image/config changed (so an unchanged
+// database stays up), the declared web service is routed live immediately,
+// and only then is it health-checked. A failed health check therefore leaves
+// the (possibly broken) new stack live and flagged — see the design doc's
+// documented tradeoff. Callers must hold r.mu; Apply does so before branching
+// here.
+func (r *Reconciler) applyCompose(ctx context.Context, app *spec.App) (*store.Deployment, error) {
+	if err := r.router.EnsureUp(ctx); err != nil {
+		return nil, fmt.Errorf("ensure router: %w", err)
+	}
+	if err := r.node.EnsureNetwork(ctx, lwdNetwork); err != nil {
+		return nil, fmt.Errorf("ensure network: %w", err)
+	}
+
+	specJSON, err := json.Marshal(app)
+	if err != nil {
+		return nil, fmt.Errorf("marshal spec snapshot: %w", err)
+	}
+
+	// Read the compose file content up front so failure snapshots (including
+	// a fail-closed secret resolve, below) can carry it whenever it happens
+	// to be readable, per the design's "Compose content if readable" note.
+	content, readErr := os.ReadFile(app.Compose)
+
+	// Resolve declared secrets BEFORE running compose. Fail closed: on error,
+	// record the failed attempt and return without ever shelling out to
+	// `docker compose` — the (possibly still running, if this is a redeploy)
+	// existing stack and live route are left completely untouched.
+	secretVals, err := r.secrets.Resolve(app.Name, app.Secrets)
+	if err != nil {
+		r.recordComposeFailed(app, "", specJSON, string(content))
+		return nil, fmt.Errorf("resolve secrets: %w", err)
+	}
+	if readErr != nil {
+		r.recordComposeFailed(app, "", specJSON, "")
+		return nil, fmt.Errorf("read compose file %s: %w", app.Compose, readErr)
+	}
+
+	env := make(map[string]string, len(app.Env)+len(secretVals))
+	for k, v := range app.Env {
+		env[k] = v
+	}
+	for k, v := range secretVals {
+		env[k] = v // secrets win on key collision with plain env
+	}
+
+	project := "lwd-" + app.Name
+	if err := r.compose.Up(ctx, compose.UpSpec{Project: project, File: app.Compose, Env: env}); err != nil {
+		r.recordComposeFailed(app, "", specJSON, string(content))
+		return nil, fmt.Errorf("compose up: %w", err)
+	}
+
+	id, name, err := r.compose.ServiceContainer(ctx, project, app.Service)
+	if err != nil {
+		r.recordComposeFailed(app, "", specJSON, string(content))
+		return nil, fmt.Errorf("resolve service container: %w", err)
+	}
+
+	if err := r.node.ConnectContainerToNetwork(ctx, id, lwdNetwork); err != nil {
+		r.recordComposeFailed(app, id, specJSON, string(content))
+		return nil, fmt.Errorf("connect container to network: %w", err)
+	}
+
+	// The new stack is live immediately: unlike blue-green there is no old
+	// container left to keep serving during health-gating, so the route
+	// flips to the freshly (re)created service before it's been proven ready.
+	if err := r.router.SetRoute(ctx, router.Route{
+		Domain:      app.Domain,
+		Upstream:    name,
+		Port:        app.Port,
+		TLSInternal: router.UseInternalTLS(app.Domain),
+	}); err != nil {
+		r.recordComposeFailed(app, id, specJSON, string(content))
+		return nil, fmt.Errorf("set route: %w", err)
+	}
+
+	if healthErr := r.checkHealthCompose(ctx, app); healthErr != nil {
+		// Deliberately do NOT compose down or otherwise tear anything down:
+		// compose owns this stack's lifecycle, and the honest tradeoff of the
+		// in-place delegate model is that a failed health check leaves the
+		// new (possibly broken) stack live, flagged by this StatusFailed
+		// record, until fixed or rolled back.
+		r.recordComposeFailed(app, id, specJSON, string(content))
+		return nil, fmt.Errorf("health check failed: %w", healthErr)
+	}
+
+	// Retire the prior running deployment ROW only — the compose stack itself
+	// is not torn down; compose already recreated only what changed.
+	if prev, perr := r.store.CurrentDeployment(app.Name); perr == nil && prev != nil {
+		_ = r.store.SetStatus(prev.ID, store.StatusRetired)
+	}
+
+	dep := store.Deployment{
+		App:         app.Name,
+		Image:       app.Image,
+		ContainerID: id,
+		Status:      store.StatusRunning,
+		CreatedAt:   time.Now(),
+		Spec:        string(specJSON),
+		Compose:     string(content),
+	}
+	depID, err := r.store.RecordDeployment(dep)
+	if err != nil {
+		return nil, fmt.Errorf("record deployment: %w", err)
+	}
+	dep.ID = depID
+	return &dep, nil
+}
+
+// recordComposeFailed records a StatusFailed deployment for a compose apply
+// attempt, carrying whatever Spec/Compose snapshot is available. Errors from
+// recording are intentionally swallowed — the caller always returns its own
+// wrapped error for the actual failure cause.
+func (r *Reconciler) recordComposeFailed(app *spec.App, containerID string, specJSON []byte, content string) {
+	_, _ = r.store.RecordDeployment(store.Deployment{
+		App:         app.Name,
+		Image:       app.Image,
+		ContainerID: containerID,
+		Status:      store.StatusFailed,
+		CreatedAt:   time.Now(),
+		Spec:        string(specJSON),
+		Compose:     content,
+	})
+}
+
+// checkHealthCompose gates a compose deploy's success using the same layered
+// policy shape as checkHealth, but probed against the app's real domain
+// (already live on the router by this point) rather than a staging host:
+// there is no separate not-yet-live candidate to probe out of band, since the
+// compose flow routes the new stack live before health-gating it. It does not
+// consult node.ContainerHealth: compose (not lwd) owns the container
+// lifecycle, so lwd only has an opinion about reachability through Caddy.
+func (r *Reconciler) checkHealthCompose(ctx context.Context, app *spec.App) error {
+	timeout := app.Health.Timeout
+	if timeout <= 0 {
+		timeout = defaultHealthTimeout
+	}
+	deadline := time.Now().Add(timeout)
+
+	if app.Health.Path != "" {
+		return r.checkHealthPath(ctx, deadline, app.Domain, app.Health.Path)
+	}
+	return r.checkLivenessThroughRoute(ctx, deadline, app.Domain)
+}
+
+// checkLivenessThroughRoute is checkLiveness's compose counterpart: after a
+// short settle window, it requires a GET through Caddy at domain to return
+// anything other than Caddy's own 502/503 (which mean it couldn't reach the
+// upstream at all). It has no container-state check to layer in, since
+// compose containers are not tracked as node.Node surfaces.
+func (r *Reconciler) checkLivenessThroughRoute(ctx context.Context, deadline time.Time, domain string) error {
+	select {
+	case <-time.After(livenessSettle):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	var lastStatus int
+	var lastErr error
+	for {
+		status, err := r.router.ProbeThroughCaddy(ctx, domain, "/")
+		lastStatus, lastErr = status, err
+		if err == nil && status != 502 && status != 503 {
+			return nil
+		}
+
+		if done, werr := waitOrDeadline(ctx, deadline); done {
+			if werr != nil {
+				return werr
+			}
+			if lastErr != nil {
+				return fmt.Errorf("liveness probe %s did not become ready: %w (last status %d)", domain, lastErr, lastStatus)
+			}
+			return fmt.Errorf("liveness check timed out: last probe status=%d", lastStatus)
+		}
+	}
+}
+
+// Remove tears down an app entirely: for a compose app (its current
+// deployment carries non-empty Compose content) it runs `docker compose
+// down` against the stored compose content, removes the Caddy route, and
+// retires the deployment row. For a single-service app it removes every
+// container labeled lwd.app=<app>, removes the Caddy route, and retires the
+// deployment row. It holds r.mu for the same reason Apply does: a concurrent
+// Apply must not interleave with a Remove.
+func (r *Reconciler) Remove(ctx context.Context, appName string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	cur, err := r.store.CurrentDeployment(appName)
+	if err != nil {
+		return fmt.Errorf("current deployment: %w", err)
+	}
+
+	if cur != nil && cur.Compose != "" {
+		return r.removeCompose(ctx, appName, cur)
+	}
+	return r.removeSingleService(ctx, appName, cur)
+}
+
+// removeCompose tears down a compose app's stack via `docker compose down`
+// (writing its stored compose content to a temp file, since Down takes a
+// file path), removes its Caddy route, and retires the deployment row.
+func (r *Reconciler) removeCompose(ctx context.Context, appName string, cur *store.Deployment) error {
+	tmp, err := os.CreateTemp("", "lwd-compose-rm-*.yml")
+	if err != nil {
+		return fmt.Errorf("create temp compose file: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(cur.Compose); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp compose file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp compose file: %w", err)
+	}
+
+	project := "lwd-" + appName
+	if err := r.compose.Down(ctx, project, tmp.Name()); err != nil {
+		return fmt.Errorf("compose down: %w", err)
+	}
+
+	if domain := domainFromSpec(cur.Spec); domain != "" {
+		// Best-effort: a failure here shouldn't stop the app from being
+		// retired (its stack is already gone), but it does mean the domain
+		// may keep 502ing until a later reload/rm fixes it up.
+		_ = r.router.RemoveRoute(ctx, domain)
+	}
+
+	return r.store.SetStatus(cur.ID, store.StatusRetired)
+}
+
+// removeSingleService removes every container labeled lwd.app=appName,
+// removes the app's Caddy route (resolved from cur's Spec snapshot, if any),
+// and retires cur, if present. cur may be nil (nothing recorded for appName
+// yet) — removal still runs as a defensive cleanup of any stray containers.
+func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cur *store.Deployment) error {
+	var domain string
+	if cur != nil {
+		domain = domainFromSpec(cur.Spec)
+	}
+
+	containers, err := r.node.ListContainers(ctx, map[string]string{"lwd.app": appName})
+	if err != nil {
+		return fmt.Errorf("list containers: %w", err)
+	}
+	for _, c := range containers {
+		if err := r.node.RemoveContainer(ctx, c.ID); err != nil {
+			return fmt.Errorf("remove container %s: %w", c.ID, err)
+		}
+	}
+
+	if domain != "" {
+		// Best-effort, same rationale as removeCompose above.
+		_ = r.router.RemoveRoute(ctx, domain)
+	}
+
+	if cur != nil {
+		return r.store.SetStatus(cur.ID, store.StatusRetired)
+	}
+	return nil
+}
+
+// domainFromSpec extracts the Domain field from a deployment's JSON Spec
+// snapshot, returning "" if specJSON is empty or fails to unmarshal.
+func domainFromSpec(specJSON string) string {
+	if specJSON == "" {
+		return ""
+	}
+	var a spec.App
+	if err := json.Unmarshal([]byte(specJSON), &a); err != nil {
+		return ""
+	}
+	return a.Domain
+}
+
 // Rollback redeploys the most recent retired ("previous") deployment for app,
 // restoring its exact image via a fresh blue-green Apply — so a rollback is
 // itself zero-downtime and health-gated like any other deploy. It reads the
@@ -231,6 +518,14 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 // deployment was originally applied) rather than re-resolving lwd.toml, so it
 // restores precisely what was running before, even if the local spec file has
 // since changed.
+//
+// For a compose app (prev.Compose non-empty), the previous deployment's
+// stored compose content — not whatever currently lives at the original
+// file path, which may have changed or been deleted since — is written to a
+// fresh temp file and restored.Compose is repointed at it before delegating
+// to Apply, so the rollback re-applies the exact prior stack. The temp file
+// is removed once Apply returns (applyCompose reads it synchronously before
+// then, so this is safe).
 //
 // Rollback does not hold r.mu itself: it only reads from the store and
 // unmarshals JSON before delegating to Apply, which takes the lock. Locking
@@ -253,8 +548,25 @@ func (r *Reconciler) Rollback(ctx context.Context, app string) (*store.Deploymen
 	}
 	// Pin the image to exactly what that deployment recorded, guaranteeing
 	// the same digest/ref is restored even if the snapshot's Image field
-	// somehow diverged from it.
+	// somehow diverged from it. Harmless for a compose app, whose Image is
+	// always empty.
 	restored.Image = prev.Image
+
+	if prev.Compose != "" {
+		tmp, err := os.CreateTemp("", "lwd-compose-rollback-*.yml")
+		if err != nil {
+			return nil, fmt.Errorf("create temp compose file: %w", err)
+		}
+		defer os.Remove(tmp.Name())
+		if _, err := tmp.WriteString(prev.Compose); err != nil {
+			tmp.Close()
+			return nil, fmt.Errorf("write temp compose file: %w", err)
+		}
+		if err := tmp.Close(); err != nil {
+			return nil, fmt.Errorf("close temp compose file: %w", err)
+		}
+		restored.Compose = tmp.Name()
+	}
 
 	return r.Apply(ctx, &restored)
 }

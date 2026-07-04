@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"lwd/internal/compose"
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
 	"lwd/internal/router"
@@ -43,7 +44,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *node.Fake) {
 	t.Cleanup(func() { s.Close() })
 	rt := router.NewFakeRouter()
 	secStore := testSecretResolver(t, s, dir)
-	srv := New(reconciler.New(f, rt, s, secStore), s, f, rt, secStore)
+	srv := New(reconciler.New(f, rt, s, secStore, compose.NewFake()), s, f, rt, secStore)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f
@@ -63,7 +64,7 @@ func newTestServerWithRouter(t *testing.T) (*httptest.Server, *node.Fake, *route
 	t.Cleanup(func() { s.Close() })
 	rt := router.NewFakeRouter()
 	secStore := testSecretResolver(t, s, dir)
-	srv := New(reconciler.New(f, rt, s, secStore), s, f, rt, secStore)
+	srv := New(reconciler.New(f, rt, s, secStore, compose.NewFake()), s, f, rt, secStore)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f, rt
