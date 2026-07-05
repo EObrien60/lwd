@@ -16,10 +16,11 @@ import (
 
 // NodeInfo is a candidate node's placement-relevant state.
 type NodeInfo struct {
-	Name      string
-	Pool      string
-	Reachable bool
-	Cap       node.Capacity
+	Name        string
+	Pool        string
+	Reachable   bool
+	Schedulable bool
+	Cap         node.Capacity
 }
 
 // Requirements describes the resources a surface needs. A zero value means
@@ -30,8 +31,11 @@ type Requirements struct {
 }
 
 // Place picks the best node in pool for req from candidates. It returns an
-// error if no reachable node exists in the pool, or if none of the reachable
-// nodes in the pool have enough capacity to satisfy req.
+// error if no reachable, schedulable node exists in the pool, or if none of
+// those nodes have enough capacity to satisfy req. A cordoned node
+// (Schedulable: false) is excluded exactly like an unreachable one — it is
+// simply not a candidate, so it shares the same "no reachable nodes" error
+// rather than a separate message.
 func Place(candidates []NodeInfo, pool string, req Requirements) (string, error) {
 	if pool == "" {
 		pool = "default"
@@ -39,7 +43,7 @@ func Place(candidates []NodeInfo, pool string, req Requirements) (string, error)
 
 	var inPool []NodeInfo
 	for _, c := range candidates {
-		if c.Reachable && c.Pool == pool {
+		if c.Reachable && c.Schedulable && c.Pool == pool {
 			inPool = append(inPool, c)
 		}
 	}
