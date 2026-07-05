@@ -95,6 +95,9 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /nodes", srv.handleNodeAdd)
 	mux.HandleFunc("GET /nodes", srv.handleNodeList)
 	mux.HandleFunc("DELETE /nodes/{name}", srv.handleNodeDelete)
+	mux.HandleFunc("POST /nodes/{name}/uncordon", srv.handleNodeUncordon)
+	mux.HandleFunc("POST /nodes/{name}/evacuate", srv.handleNodeEvacuate)
+	mux.HandleFunc("POST /nodes/{name}/drain", srv.handleNodeDrain)
 	mux.HandleFunc("GET /pools", srv.handlePools)
 	mux.HandleFunc("GET /health", srv.handleHealth)
 	return mux
@@ -402,6 +405,83 @@ func (srv *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	srv.invalidateNode(name)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// checkCordonTarget validates name for POST /nodes/{name}/drain and
+// /nodes/{name}/uncordon: the implicit local node — which never lives in the
+// registry and is where the daemon itself runs — can never be cordoned or
+// uncordoned (400), and an unregistered name is a 404 rather than a silent
+// no-op. On success it returns true and writes nothing; on failure it writes
+// the appropriate error response and returns false, so callers can just
+// `if !srv.checkCordonTarget(w, name) { return }`.
+func (srv *Server) checkCordonTarget(w http.ResponseWriter, name string) bool {
+	if name == "local" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("cannot cordon/uncordon the local node"))
+		return false
+	}
+	n, err := srv.store.GetNode(name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return false
+	}
+	if n == nil {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("node %q not found", name))
+		return false
+	}
+	return true
+}
+
+// handleNodeUncordon clears a node's cordon (store.SetSchedulable(name,
+// true)), making it eligible for scheduler placement again. It does not
+// touch anything already running.
+func (srv *Server) handleNodeUncordon(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !srv.checkCordonTarget(w, name) {
+		return
+	}
+	if err := srv.store.SetSchedulable(name, true); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleNodeEvacuate moves every scheduler-placed surface off the named node
+// onto some other fitting node (see reconciler.EvacuateNode), without
+// changing the node's schedulable bit — a node can be evacuated (to drain it
+// for e.g. a one-off maintenance window) and remain eligible for new
+// placements, unlike drain which also cordons it first.
+func (srv *Server) handleNodeEvacuate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	res, err := srv.rec.EvacuateNode(r.Context(), name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleNodeDrain cordons the named node (store.SetSchedulable(name, false))
+// THEN evacuates it (reconciler.EvacuateNode) — the two-step "take this node
+// out of service" operation: nothing new gets scheduled onto it, and
+// everything the scheduler already placed there moves off. It shares
+// checkCordonTarget's local/unregistered-name guard with uncordon, since
+// cordoning the local node makes exactly as little sense as uncordoning it.
+func (srv *Server) handleNodeDrain(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !srv.checkCordonTarget(w, name) {
+		return
+	}
+	if err := srv.store.SetSchedulable(name, false); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	res, err := srv.rec.EvacuateNode(r.Context(), name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // poolInfo is the wire shape for entries in the GET /pools response: a pool

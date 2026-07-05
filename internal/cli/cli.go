@@ -413,7 +413,7 @@ func runSecretRm(args []string) int {
 
 func runNode(args []string) int {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: lwd node <add|ls|rm|capacity|inspect> ...")
+		fmt.Fprintln(os.Stderr, "usage: lwd node <add|ls|rm|capacity|inspect|drain|evacuate|uncordon> ...")
 		return 2
 	}
 	switch args[0] {
@@ -427,6 +427,12 @@ func runNode(args []string) int {
 		return runNodeCapacity()
 	case "inspect":
 		return runNodeInspect(args[1:])
+	case "drain":
+		return runNodeDrain(args[1:])
+	case "evacuate":
+		return runNodeEvacuate(args[1:])
+	case "uncordon":
+		return runNodeUncordon(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown node command %q\n", args[0])
 		return 2
@@ -484,15 +490,25 @@ func runNodeLs() int {
 		fmt.Fprintln(os.Stderr, "node ls:", err)
 		return 1
 	}
-	fmt.Printf("%-20s %-30s %-15s %-30s %-10s %-10s %s\n", "NAME", "SSH", "MESH", "AGENT", "POOL", "TRANSPORT", "REACHABLE")
+	fmt.Printf("%-20s %-30s %-15s %-30s %-10s %-10s %-11s %s\n", "NAME", "SSH", "MESH", "AGENT", "POOL", "TRANSPORT", "SCHEDULABLE", "REACHABLE")
 	for _, n := range nodes {
 		reachable := "no"
 		if n.Reachable {
 			reachable = "yes"
 		}
-		fmt.Printf("%-20s %-30s %-15s %-30s %-10s %-10s %s\n", n.Name, n.SSHHost, n.MeshAddr, n.AgentURL, n.Pool, n.Transport, reachable)
+		fmt.Printf("%-20s %-30s %-15s %-30s %-10s %-10s %-11s %s\n", n.Name, n.SSHHost, n.MeshAddr, n.AgentURL, n.Pool, n.Transport, schedulableLabel(n.Schedulable), reachable)
 	}
 	return 0
+}
+
+// schedulableLabel renders a node's Schedulable bit as "yes" or "cordoned"
+// (rather than a bare "no") so `node ls`/`node capacity` output reads as an
+// explicit operator action (drain/cordon) rather than an ambiguous state.
+func schedulableLabel(schedulable bool) string {
+	if schedulable {
+		return "yes"
+	}
+	return "cordoned"
 }
 
 func runPool(args []string) int {
@@ -567,15 +583,24 @@ func runNodeCapacity() int {
 		return 1
 	}
 	pools := make(map[string]string, len(nodes))
+	schedulable := make(map[string]bool, len(nodes))
 	for _, n := range nodes {
 		pools[n.Name] = n.Pool
+		schedulable[n.Name] = n.Schedulable
 	}
 
-	fmt.Printf("%-16s %-10s %-14s %-20s %-20s %s\n", "NODE", "POOL", "CPU", "MEM", "DISK", "KNOWN")
+	fmt.Printf("%-16s %-10s %-11s %-14s %-20s %-20s %s\n", "NODE", "POOL", "SCHEDULABLE", "CPU", "MEM", "DISK", "KNOWN")
 	for _, n := range h.Nodes {
 		pool := pools[n.Name]
 		if pool == "" {
 			pool = "default"
+		}
+		// "local" is implicit and never registered, so it's never in the
+		// schedulable map above; it's always eligible (the daemon runs on
+		// it and it can never be drained/cordoned).
+		schedLabel := schedulableLabel(true)
+		if n.Name != "local" {
+			schedLabel = schedulableLabel(schedulable[n.Name])
 		}
 		cpu, mem, disk, known := "—", "—", "—", "no"
 		if n.Capacity.Known {
@@ -584,7 +609,7 @@ func runNodeCapacity() int {
 			mem = fmt.Sprintf("%s/%s", humanBytes(n.Capacity.MemAvailable), humanBytes(n.Capacity.MemTotal))
 			disk = fmt.Sprintf("%s/%s", humanBytes(n.Capacity.DiskFree), humanBytes(n.Capacity.DiskTotal))
 		}
-		fmt.Printf("%-16s %-10s %-14s %-20s %-20s %s\n", n.Name, pool, cpu, mem, disk, known)
+		fmt.Printf("%-16s %-10s %-11s %-14s %-20s %-20s %s\n", n.Name, pool, schedLabel, cpu, mem, disk, known)
 	}
 	return 0
 }
@@ -727,5 +752,72 @@ func runNodeRm(args []string) int {
 		return 1
 	}
 	fmt.Println("removed node", args[0])
+	return 0
+}
+
+// printEvacuateResult prints a human-readable summary of an
+// reconciler.EvacuateResult, shared by `node drain` and `node evacuate`.
+func printEvacuateResult(res reconciler.EvacuateResult) {
+	if len(res.Moved) > 0 {
+		fmt.Printf("Moved: %s\n", strings.Join(res.Moved, ", "))
+	} else {
+		fmt.Println("Moved: (none)")
+	}
+	if len(res.Skipped) > 0 {
+		fmt.Printf("Skipped (pinned): %s\n", strings.Join(res.Skipped, ", "))
+	}
+	if len(res.Failed) > 0 {
+		parts := make([]string, len(res.Failed))
+		for i, f := range res.Failed {
+			parts[i] = fmt.Sprintf("%s: %s", f.App, f.Err)
+		}
+		fmt.Printf("Failed: %s\n", strings.Join(parts, "; "))
+	}
+}
+
+// runNodeDrain cordons a node (excluding it from future scheduler placement)
+// and moves every scheduler-placed surface off it in one call.
+func runNodeDrain(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: lwd node drain <name>")
+		return 2
+	}
+	res, err := newClient().Drain(context.Background(), args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "node drain:", err)
+		return 1
+	}
+	printEvacuateResult(res)
+	return 0
+}
+
+// runNodeEvacuate moves every scheduler-placed surface off a node without
+// cordoning it — the node remains eligible for new placements afterward.
+func runNodeEvacuate(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: lwd node evacuate <name>")
+		return 2
+	}
+	res, err := newClient().Evacuate(context.Background(), args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "node evacuate:", err)
+		return 1
+	}
+	printEvacuateResult(res)
+	return 0
+}
+
+// runNodeUncordon clears a node's cordon, making it eligible for scheduler
+// placement again.
+func runNodeUncordon(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: lwd node uncordon <name>")
+		return 2
+	}
+	if err := newClient().Uncordon(context.Background(), args[0]); err != nil {
+		fmt.Fprintln(os.Stderr, "node uncordon:", err)
+		return 1
+	}
+	fmt.Println("uncordoned", args[0])
 	return 0
 }
