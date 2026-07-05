@@ -390,12 +390,13 @@
       <div class="table-wrap" x-show="!nodesLoading && nodes.length > 0" x-cloak>
         <table class="table">
           <thead>
-            <tr><th>Name</th><th>SSH host</th><th>Mesh addr</th><th>Agent URL</th><th>Transport</th><th>Reachable</th><th></th></tr>
+            <tr><th>Name</th><th>Pool</th><th>SSH host</th><th>Mesh addr</th><th>Agent URL</th><th>Transport</th><th>Reachable</th><th></th></tr>
           </thead>
           <tbody>
             <template x-for="n in nodes" :key="n.name">
               <tr>
                 <td class="mono" x-text="n.name"></td>
+                <td><span class="tag" x-text="n.pool || 'default'"></span></td>
                 <td class="mono" x-text="n.ssh_host"></td>
                 <td class="mono" x-text="n.mesh_addr"></td>
                 <td class="mono" x-text="n.agent_url || '—'"></td>
@@ -441,6 +442,12 @@
               <input id="node-agent" x-model="newNode.agentUrl" placeholder="http://100.64.0.2:8078" autocomplete="off" :disabled="nodeAddBusy">
             </div>
           </div>
+          <div class="form-row" style="margin-top:10px;">
+            <div class="field">
+              <label for="node-pool">Pool (optional)</label>
+              <input id="node-pool" x-model="newNode.pool" placeholder="default" autocomplete="off" :disabled="nodeAddBusy">
+            </div>
+          </div>
           <div style="margin-top:16px;">
             <button type="submit" class="btn btn-signal" :disabled="nodeAddBusy">
               <span x-text="nodeAddBusy ? 'Adding…' : 'Add node'"></span>
@@ -484,12 +491,13 @@
           <div class="table-wrap">
             <table class="table">
               <thead>
-                <tr><th>Name</th><th>Transport</th><th>Reachable</th><th>Updated</th></tr>
+                <tr><th>Name</th><th>Pool</th><th>Transport</th><th>Reachable</th><th>CPU</th><th>Memory</th><th>Disk</th><th>Updated</th></tr>
               </thead>
               <tbody>
                 <template x-for="n in (health ? health.nodes : [])" :key="n.name">
                   <tr>
                     <td class="mono" x-text="n.name"></td>
+                    <td><span class="tag" x-text="poolForNode(n.name)"></span></td>
                     <td><span class="tag" x-text="n.transport || '—'"></span></td>
                     <td>
                       <span class="pill" :class="n.reachable ? 'pill-healthy' : 'pill-failed'">
@@ -497,11 +505,38 @@
                         <span x-text="n.reachable ? 'reachable' : 'unreachable'"></span>
                       </span>
                     </td>
+                    <td>
+                      <template x-if="n.capacity && n.capacity.known">
+                        <div class="meter">
+                          <div class="meter__label" x-text="n.capacity.cpu_used.toFixed(2) + ' / ' + n.capacity.cpu_cores + ' cores'"></div>
+                          <div class="meter__track"><div class="meter__fill" :class="{ 'meter__fill--warn': cpuUsedPct(n.capacity) >= 90 }" :style="{ width: cpuUsedPct(n.capacity) + '%' }"></div></div>
+                        </div>
+                      </template>
+                      <span class="capacity-unknown" x-show="!n.capacity || !n.capacity.known">unknown</span>
+                    </td>
+                    <td>
+                      <template x-if="n.capacity && n.capacity.known">
+                        <div class="meter">
+                          <div class="meter__label" x-text="formatBytes(n.capacity.mem_available) + ' / ' + formatBytes(n.capacity.mem_total)"></div>
+                          <div class="meter__track"><div class="meter__fill" :class="{ 'meter__fill--warn': memUsedPct(n.capacity) >= 90 }" :style="{ width: memUsedPct(n.capacity) + '%' }"></div></div>
+                        </div>
+                      </template>
+                      <span class="capacity-unknown" x-show="!n.capacity || !n.capacity.known">unknown</span>
+                    </td>
+                    <td>
+                      <template x-if="n.capacity && n.capacity.known">
+                        <div class="meter">
+                          <div class="meter__label" x-text="formatBytes(n.capacity.disk_free) + ' / ' + formatBytes(n.capacity.disk_total)"></div>
+                          <div class="meter__track"><div class="meter__fill" :class="{ 'meter__fill--warn': diskUsedPct(n.capacity) >= 90 }" :style="{ width: diskUsedPct(n.capacity) + '%' }"></div></div>
+                        </div>
+                      </template>
+                      <span class="capacity-unknown" x-show="!n.capacity || !n.capacity.known">unknown</span>
+                    </td>
                     <td class="mono" :title="fullTime(n.updated_at)" x-text="timeAgo(n.updated_at)"></td>
                   </tr>
                 </template>
                 <tr x-show="!health || health.nodes.length === 0">
-                  <td colspan="4" style="color:var(--ink-3);">Node reachability isn't being observed yet.</td>
+                  <td colspan="8" style="color:var(--ink-3);">Node reachability isn't being observed yet.</td>
                 </tr>
               </tbody>
             </table>
@@ -632,11 +667,35 @@
               <div class="field">
                 <label for="git-node">Node</label>
                 <select id="git-node" x-model="deploy.git.node" :disabled="deploy.busy">
+                  <option value="">Auto (let lwd schedule)</option>
                   <option value="local">local (this controller)</option>
                   <template x-for="n in nodes" :key="n.name">
                     <option :value="n.name" x-text="n.name"></option>
                   </template>
                 </select>
+              </div>
+              <p class="hint" style="margin:2px 0 0;" x-show="!deploy.git.node">Placed on whichever node in the chosen pool currently has the most free capacity.</p>
+
+              <div class="form-row" style="margin-top:10px;">
+                <div class="field">
+                  <label for="git-pool">Pool (optional)</label>
+                  <select id="git-pool" x-model="deploy.git.pool" :disabled="deploy.busy">
+                    <option value="">default</option>
+                    <template x-for="p in otherPools" :key="p.name">
+                      <option :value="p.name" x-text="p.name"></option>
+                    </template>
+                  </select>
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="field">
+                  <label for="git-req-cpu">CPU requirement (cores, optional)</label>
+                  <input id="git-req-cpu" type="number" min="0" step="0.1" x-model="deploy.git.reqCpu" placeholder="0.5" autocomplete="off" :disabled="deploy.busy">
+                </div>
+                <div class="field">
+                  <label for="git-req-mem">Memory requirement (optional)</label>
+                  <input id="git-req-mem" x-model="deploy.git.reqMemory" placeholder="512M" autocomplete="off" :disabled="deploy.busy">
+                </div>
               </div>
 
               <div class="subhead">Environment</div>
@@ -742,11 +801,35 @@
               <div class="field">
                 <label for="builder-node">Node</label>
                 <select id="builder-node" x-model="deploy.builder.node" :disabled="deploy.busy">
+                  <option value="">Auto (let lwd schedule)</option>
                   <option value="local">local (this controller)</option>
                   <template x-for="n in nodes" :key="n.name">
                     <option :value="n.name" x-text="n.name"></option>
                   </template>
                 </select>
+              </div>
+              <p class="hint" style="margin:2px 0 0;" x-show="!deploy.builder.node">Placed on whichever node in the chosen pool currently has the most free capacity.</p>
+
+              <div class="form-row" style="margin-top:10px;">
+                <div class="field">
+                  <label for="builder-pool">Pool (optional)</label>
+                  <select id="builder-pool" x-model="deploy.builder.pool" :disabled="deploy.busy">
+                    <option value="">default</option>
+                    <template x-for="p in otherPools" :key="p.name">
+                      <option :value="p.name" x-text="p.name"></option>
+                    </template>
+                  </select>
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="field">
+                  <label for="builder-req-cpu">CPU requirement (cores, optional)</label>
+                  <input id="builder-req-cpu" type="number" min="0" step="0.1" x-model="deploy.builder.reqCpu" placeholder="0.5" autocomplete="off" :disabled="deploy.busy">
+                </div>
+                <div class="field">
+                  <label for="builder-req-mem">Memory requirement (optional)</label>
+                  <input id="builder-req-mem" x-model="deploy.builder.reqMemory" placeholder="512M" autocomplete="off" :disabled="deploy.busy">
+                </div>
               </div>
 
               <div class="subhead">Environment</div>

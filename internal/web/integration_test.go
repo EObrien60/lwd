@@ -46,7 +46,13 @@ func startFakeDaemon(t *testing.T) string {
 		t.Fatalf("secrets.NewCipher: %v", err)
 	}
 	secStore := secrets.NewStore(cipher, s)
-	daemon := api.New(reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore, nil)
+	// "" is mapped alongside "local" because spec.Parse (Phase 11a) no
+	// longer normalizes an unset lwd.toml `node` to "local" — it preserves
+	// "" so the (future) scheduler can tell "unset" from "pinned local".
+	// FakeResolver, unlike the production RegistryResolver, does not
+	// special-case "" on its own, so the apply-without-node path exercised
+	// here needs it mapped explicitly.
+	daemon := api.New(reconciler.New(node.FakeResolver{"": f, "local": f}, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore, nil)
 
 	ln, err := net.Listen("unix", sock)
 	if err != nil {

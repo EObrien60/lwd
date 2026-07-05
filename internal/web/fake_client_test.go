@@ -51,12 +51,15 @@ type fakeDaemon struct {
 
 	health    reconciler.Health
 	healthErr error
+
+	pools    []client.Pool
+	poolsErr error
 }
 
 // nodeAddCall captures the arguments of one AddNode call, so tests can assert
 // on them (including agent_url) without a real daemon.
 type nodeAddCall struct {
-	Name, SSHHost, MeshAddr, AgentURL string
+	Name, SSHHost, MeshAddr, AgentURL, Pool string
 }
 
 func newFakeDaemon() *fakeDaemon {
@@ -158,11 +161,11 @@ func (f *fakeDaemon) Nodes(ctx context.Context) ([]client.NodeStatus, error) {
 	return f.nodes, nil
 }
 
-func (f *fakeDaemon) AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL string) error {
+func (f *fakeDaemon) AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL, pool string) error {
 	if f.addNodeErr != nil {
 		return f.addNodeErr
 	}
-	f.addedNodes = append(f.addedNodes, nodeAddCall{Name: name, SSHHost: sshHost, MeshAddr: meshAddr, AgentURL: agentURL})
+	f.addedNodes = append(f.addedNodes, nodeAddCall{Name: name, SSHHost: sshHost, MeshAddr: meshAddr, AgentURL: agentURL, Pool: pool})
 	return nil
 }
 
@@ -179,4 +182,11 @@ func (f *fakeDaemon) Health(ctx context.Context) (reconciler.Health, error) {
 		return reconciler.Health{}, f.healthErr
 	}
 	return f.health, nil
+}
+
+func (f *fakeDaemon) Pools(ctx context.Context) ([]client.Pool, error) {
+	if f.poolsErr != nil {
+		return nil, f.poolsErr
+	}
+	return f.pools, nil
 }

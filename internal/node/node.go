@@ -35,6 +35,12 @@ type RunSpec struct {
 	// before exec'ing caddy, so the admin API binds correctly from the first
 	// instant the container runs (see router.EnsureUp).
 	Cmd []string
+	// CPUs is the CPU limit in cores (e.g. 0.5 = half a core); 0 means no
+	// limit. Applied to the container's HostConfig as NanoCPUs.
+	CPUs float64
+	// MemoryBytes is the memory limit in bytes; 0 means no limit. Applied to
+	// the container's HostConfig as Memory.
+	MemoryBytes int64
 }
 
 // Container describes a container known to a node.
@@ -89,4 +95,10 @@ type Node interface {
 	SaveImage(ctx context.Context, ref string) (io.ReadCloser, error)
 	// LoadImage loads a tar stream produced by SaveImage (docker load).
 	LoadImage(ctx context.Context, r io.Reader) error
+
+	// Capacity reports this node's total and (where available) currently
+	// used resources. Known is false when only totals — not live usage —
+	// could be determined (e.g. a remote docker-over-ssh node, or a
+	// non-Linux host with no /proc).
+	Capacity(ctx context.Context) (Capacity, error)
 }

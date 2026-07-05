@@ -11,6 +11,7 @@ import (
 
 	"lwd/internal/api"
 	"lwd/internal/client"
+	"lwd/internal/node"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -200,12 +201,25 @@ func deploymentOutput(d *store.Deployment) lwdDeploymentOutput {
 	}
 }
 
+// lwdRequirementsInput mirrors spec.Requirements for the lwd_apply and
+// lwd_deploy_git tools' optional requirements argument, used by the
+// scheduler (Phase 11a) to pick a node when node/pool are left unset.
+type lwdRequirementsInput struct {
+	CPU    float64 `json:"cpu,omitempty" jsonschema:"CPU cores required (e.g. 0.5); omitted or 0 means no CPU requirement"`
+	Memory string  `json:"memory,omitempty" jsonschema:"memory required, as a size string like \"512M\" or \"2G\"; omitted means no memory requirement"`
+}
+
 // lwdApplyInput is the input of lwd_apply. Exactly one of Dir or Toml must
 // be set.
 type lwdApplyInput struct {
 	Dir  string `json:"dir,omitempty" jsonschema:"local directory containing an lwd.toml to deploy (mutually exclusive with toml)"`
 	Toml string `json:"toml,omitempty" jsonschema:"inline lwd.toml document to deploy (mutually exclusive with dir)"`
-	Node string `json:"node,omitempty" jsonschema:"name of a registered node to place this app on (overrides the toml's own node field); omitted or \"local\" deploys to the controller"`
+	Node string `json:"node,omitempty" jsonschema:"name of a registered node to place this app on (overrides the toml's own node field); omitted lets lwd schedule it (or pins to \"local\" for the controller)"`
+	Pool string `json:"pool,omitempty" jsonschema:"name of a node pool to schedule into when node is omitted; omitted means the \"default\" pool"`
+	// Requirements is a pointer so an entirely-omitted argument (vs. an
+	// explicit zero-valued {}) is distinguishable: only a non-nil
+	// Requirements sets app.Requirements at all.
+	Requirements *lwdRequirementsInput `json:"requirements,omitempty" jsonschema:"optional resource requirements (cpu, memory) the scheduler uses when node is omitted"`
 }
 
 // registerLwdApply adds the lwd_apply tool: deploy an app from either a
@@ -238,6 +252,12 @@ func (s *Server) registerLwdApply(srv *sdk.Server) {
 		if in.Node != "" {
 			app.Node = in.Node
 		}
+		if in.Pool != "" {
+			app.Pool = in.Pool
+		}
+		if in.Requirements != nil {
+			app.Requirements = &spec.Requirements{CPU: in.Requirements.CPU, Memory: in.Requirements.Memory}
+		}
 		if err := app.Validate(); err != nil {
 			return nil, lwdDeploymentOutput{}, err
 		}
@@ -263,14 +283,16 @@ type lwdDeployGitServiceInput struct {
 
 // lwdDeployGitInput is the input of lwd_deploy_git.
 type lwdDeployGitInput struct {
-	URL        string                     `json:"url" jsonschema:"the git remote URL to build from"`
-	Ref        string                     `json:"ref,omitempty" jsonschema:"the git ref (branch, tag, or commit) to build; defaults to main"`
-	Dockerfile string                     `json:"dockerfile,omitempty" jsonschema:"path to the Dockerfile within the repo; defaults to Dockerfile"`
-	Name       string                     `json:"name" jsonschema:"the app name"`
-	Domain     string                     `json:"domain" jsonschema:"the domain to route to this app"`
-	Port       int                        `json:"port" jsonschema:"the container port the app listens on"`
-	Services   []lwdDeployGitServiceInput `json:"services,omitempty" jsonschema:"optional backing services (e.g. a database) to deploy alongside the app"`
-	Node       string                     `json:"node,omitempty" jsonschema:"name of a registered node to place this app on; omitted or \"local\" deploys to the controller"`
+	URL          string                     `json:"url" jsonschema:"the git remote URL to build from"`
+	Ref          string                     `json:"ref,omitempty" jsonschema:"the git ref (branch, tag, or commit) to build; defaults to main"`
+	Dockerfile   string                     `json:"dockerfile,omitempty" jsonschema:"path to the Dockerfile within the repo; defaults to Dockerfile"`
+	Name         string                     `json:"name" jsonschema:"the app name"`
+	Domain       string                     `json:"domain" jsonschema:"the domain to route to this app"`
+	Port         int                        `json:"port" jsonschema:"the container port the app listens on"`
+	Services     []lwdDeployGitServiceInput `json:"services,omitempty" jsonschema:"optional backing services (e.g. a database) to deploy alongside the app"`
+	Node         string                     `json:"node,omitempty" jsonschema:"name of a registered node to place this app on; omitted lets lwd schedule it (or pins to \"local\" for the controller)"`
+	Pool         string                     `json:"pool,omitempty" jsonschema:"name of a node pool to schedule into when node is omitted; omitted means the \"default\" pool"`
+	Requirements *lwdRequirementsInput      `json:"requirements,omitempty" jsonschema:"optional resource requirements (cpu, memory) the scheduler uses when node is omitted"`
 }
 
 const (
@@ -324,6 +346,12 @@ func (s *Server) registerLwdDeployGit(srv *sdk.Server) {
 		}
 		if in.Node != "" {
 			app.Node = in.Node
+		}
+		if in.Pool != "" {
+			app.Pool = in.Pool
+		}
+		if in.Requirements != nil {
+			app.Requirements = &spec.Requirements{CPU: in.Requirements.CPU, Memory: in.Requirements.Memory}
 		}
 		if err := app.Validate(); err != nil {
 			return nil, lwdDeploymentOutput{}, err
@@ -479,26 +507,55 @@ func (s *Server) registerLwdSecretDelete(srv *sdk.Server) {
 	})
 }
 
+// lwdNodeInfo is one registered node's registry row + live transport/
+// reachability (client.NodeStatus, as returned by lwd_node_list before
+// Phase 11a Task 8) plus its live Capacity snapshot, sourced from the
+// daemon's health snapshot (client.Health) rather than client.Nodes — see
+// reconciler.NodeHealth.Capacity. Capacity is zero-valued
+// (Capacity.Known == false) if no health snapshot is available at all, or if
+// this node has no entry in it yet (e.g. no reconcile pass has run) — this
+// never fails the tool call, since node/pool info is still useful without
+// capacity.
+type lwdNodeInfo struct {
+	client.NodeStatus
+	Capacity node.Capacity `json:"capacity"`
+}
+
 // lwdNodeListOutput is the structured result of lwd_node_list.
 type lwdNodeListOutput struct {
-	Nodes []client.NodeStatus `json:"nodes"`
+	Nodes []lwdNodeInfo `json:"nodes"`
 }
 
 // registerLwdNodeList adds the lwd_node_list tool: every registered node
-// (ssh host, mesh address, agent URL if any) plus its live transport and
-// reachability, as reported by the daemon.
+// (ssh host, mesh address, agent URL if any, pool) plus its live transport,
+// reachability, and best-effort capacity, as reported by the daemon.
 func (s *Server) registerLwdNodeList(srv *sdk.Server) {
 	readOnly := true
 	sdk.AddTool(srv, &sdk.Tool{
 		Name:        "lwd_node_list",
-		Description: "List every registered node, its ssh host/mesh address/agent URL, and its live transport (agent/ssh) and reachability.",
+		Description: "List every registered node, its ssh host/mesh address/agent URL/pool, and its live transport (agent/ssh), reachability, and capacity (CPU/memory/disk).",
 		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: readOnly},
 	}, func(ctx context.Context, _ *sdk.CallToolRequest, _ any) (*sdk.CallToolResult, lwdNodeListOutput, error) {
 		nodes, err := s.client.Nodes(ctx)
 		if err != nil {
 			return nil, lwdNodeListOutput{}, err
 		}
-		return nil, lwdNodeListOutput{Nodes: nodes}, nil
+		// Capacity lives in the health snapshot, not the /nodes response (see
+		// client.NodeStatus vs reconciler.NodeHealth). A failed fetch is
+		// tolerated: every node is still returned, just with Capacity.Known
+		// == false, rather than failing the whole tool call over a
+		// best-effort enrichment.
+		capByName := map[string]node.Capacity{}
+		if h, herr := s.client.Health(ctx); herr == nil {
+			for _, nh := range h.Nodes {
+				capByName[nh.Name] = nh.Capacity
+			}
+		}
+		out := make([]lwdNodeInfo, 0, len(nodes))
+		for _, n := range nodes {
+			out = append(out, lwdNodeInfo{NodeStatus: n, Capacity: capByName[n.Name]})
+		}
+		return nil, lwdNodeListOutput{Nodes: out}, nil
 	})
 }
 
@@ -508,6 +565,7 @@ type lwdNodeAddInput struct {
 	SSHHost  string `json:"ssh_host" jsonschema:"anything ssh accepts for this node (user@host, or a ~/.ssh/config Host alias)"`
 	MeshAddr string `json:"mesh_addr" jsonschema:"the WireGuard mesh address the controller reaches this node's app traffic at"`
 	AgentURL string `json:"agent_url,omitempty" jsonschema:"base URL of this node's lwd-agent (e.g. http://<mesh-addr>:8078); omit if the node has no agent registered"`
+	Pool     string `json:"pool,omitempty" jsonschema:"the node pool to register this node into; omit for the \"default\" pool"`
 }
 
 // lwdNodeAddOutput is the structured result of lwd_node_add.
@@ -522,9 +580,9 @@ type lwdNodeAddOutput struct {
 func (s *Server) registerLwdNodeAdd(srv *sdk.Server) {
 	sdk.AddTool(srv, &sdk.Tool{
 		Name:        "lwd_node_add",
-		Description: "Register (or update) a node lwd can place apps on: name, ssh host, mesh address, and an optional lwd-agent URL.",
+		Description: "Register (or update) a node lwd can place apps on: name, ssh host, mesh address, an optional lwd-agent URL, and an optional pool.",
 	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdNodeAddInput) (*sdk.CallToolResult, lwdNodeAddOutput, error) {
-		if err := s.client.AddNode(ctx, in.Name, in.SSHHost, in.MeshAddr, in.AgentURL); err != nil {
+		if err := s.client.AddNode(ctx, in.Name, in.SSHHost, in.MeshAddr, in.AgentURL, in.Pool); err != nil {
 			return nil, lwdNodeAddOutput{}, err
 		}
 		return nil, lwdNodeAddOutput{OK: true, Name: in.Name}, nil

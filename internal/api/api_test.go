@@ -766,6 +766,195 @@ func TestNodeAddValidatesAgentURL(t *testing.T) {
 	}
 }
 
+// TestNodeAddPersistsPool covers Phase 11a Task 4: POST /nodes accepts an
+// optional pool, and GET /nodes echoes it back; an omitted pool defaults to
+// "default".
+func TestNodeAddPersistsPool(t *testing.T) {
+	ts, _ := newTestServerWithInvalidator(t)
+
+	body, _ := json.Marshal(map[string]string{
+		"name": "web1", "ssh_host": "deploy@web1", "mesh_addr": "100.64.0.2",
+		"pool": "web",
+	})
+	resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /nodes: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+
+	body2, _ := json.Marshal(map[string]string{
+		"name": "web2", "ssh_host": "deploy@web2", "mesh_addr": "100.64.0.3",
+	})
+	resp, err = http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body2))
+	if err != nil {
+		t.Fatalf("POST /nodes: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+
+	resp, err = http.Get(ts.URL + "/nodes")
+	if err != nil {
+		t.Fatalf("GET /nodes: %v", err)
+	}
+	defer resp.Body.Close()
+	var nodes []struct {
+		store.Node
+		Transport string `json:"transport"`
+		Reachable bool   `json:"reachable"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	byName := map[string]string{}
+	for _, n := range nodes {
+		byName[n.Name] = n.Pool
+	}
+	if byName["web1"] != "web" {
+		t.Fatalf("web1 pool = %q, want %q", byName["web1"], "web")
+	}
+	if byName["web2"] != "default" {
+		t.Fatalf("web2 pool = %q, want %q (default)", byName["web2"], "default")
+	}
+}
+
+// TestNodeListIncludesPool covers Phase 11a Task 4: the GET /nodes status DTO
+// serializes pool (it rides via the embedded store.Node).
+func TestNodeListIncludesPool(t *testing.T) {
+	ts, _ := newTestServerWithInvalidator(t)
+
+	body, _ := json.Marshal(map[string]string{
+		"name": "web1", "ssh_host": "deploy@web1", "mesh_addr": "100.64.0.2", "pool": "web",
+	})
+	resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /nodes: %v", err)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Get(ts.URL + "/nodes")
+	if err != nil {
+		t.Fatalf("GET /nodes: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !strings.Contains(string(raw), `"pool":"web"`) {
+		t.Fatalf("body = %s, want it to contain %q", raw, `"pool":"web"`)
+	}
+}
+
+// TestNodeAddInvalidPool covers Phase 11a Task 4: an invalid pool name (one
+// that doesn't match ^[A-Za-z0-9][A-Za-z0-9_-]*$) is rejected with 400.
+func TestNodeAddInvalidPool(t *testing.T) {
+	ts, _ := newTestServerWithInvalidator(t)
+
+	rejected := []string{"has space", "-leadingdash", "bad/slash", "bad!char"}
+	for i, pool := range rejected {
+		body, _ := json.Marshal(map[string]string{
+			"name": fmt.Sprintf("web%d", i), "ssh_host": "deploy@webX", "mesh_addr": "100.64.0.2",
+			"pool": pool,
+		})
+		resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /nodes pool=%q: %v", pool, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("pool=%q: status = %d, want 400", pool, resp.StatusCode)
+		}
+	}
+}
+
+// TestPoolsEndpoint covers Phase 11a Task 4: GET /pools aggregates registered
+// nodes by pool, and always counts the implicit local node (never stored in
+// the registry) as a member of "default".
+func TestPoolsEndpoint(t *testing.T) {
+	ts, _ := newTestServerWithInvalidator(t)
+
+	for _, n := range []map[string]string{
+		{"name": "web1", "ssh_host": "deploy@web1", "mesh_addr": "100.64.0.2", "pool": "web"},
+		{"name": "web2", "ssh_host": "deploy@web2", "mesh_addr": "100.64.0.3", "pool": "web"},
+		{"name": "db1", "ssh_host": "deploy@db1", "mesh_addr": "100.64.0.4"},
+	} {
+		body, _ := json.Marshal(n)
+		resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /nodes: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	resp, err := http.Get(ts.URL + "/pools")
+	if err != nil {
+		t.Fatalf("GET /pools: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var pools []struct {
+		Name  string `json:"name"`
+		Nodes int    `json:"nodes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&pools); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	byName := map[string]int{}
+	for _, p := range pools {
+		byName[p.Name] = p.Nodes
+	}
+	if byName["web"] != 2 {
+		t.Fatalf("pool web = %d, want 2", byName["web"])
+	}
+	// default = local (always present, count 1) + db1 (registered, no pool
+	// set, defaults to "default").
+	if byName["default"] != 2 {
+		t.Fatalf("pool default = %d, want 2", byName["default"])
+	}
+}
+
+// TestPoolsEndpointDefaultAlwaysPresent covers the zero-registered-nodes case
+// of GET /pools: "default" must appear with count 1, since the implicit local
+// node is always a member of pool "default" even though it's never stored.
+func TestPoolsEndpointDefaultAlwaysPresent(t *testing.T) {
+	ts, _ := newTestServerWithInvalidator(t)
+
+	resp, err := http.Get(ts.URL + "/pools")
+	if err != nil {
+		t.Fatalf("GET /pools: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var pools []struct {
+		Name  string `json:"name"`
+		Nodes int    `json:"nodes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&pools); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	found := false
+	for _, p := range pools {
+		if p.Name == "default" {
+			found = true
+			if p.Nodes != 1 {
+				t.Fatalf("pool default = %d, want 1", p.Nodes)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("pools = %+v, want \"default\" present", pools)
+	}
+}
+
 // TestNodeListNilResolver covers the documented nil-resolver contract: a
 // Server built without a NodeResolver (newTestServer passes nil) must still
 // serve GET /nodes, reporting every node with transport "" and reachable

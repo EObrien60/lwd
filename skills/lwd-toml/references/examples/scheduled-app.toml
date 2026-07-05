@@ -1,0 +1,10 @@
+name    = "worker"
+image   = "ghcr.io/me/worker:latest"
+domain  = "worker.example.com"
+port    = 8080
+
+pool = "web"
+
+[requirements]
+cpu    = 1
+memory = "1G"

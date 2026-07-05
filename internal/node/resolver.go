@@ -247,8 +247,9 @@ func (rr *RegistryResolver) Reachable(ctx context.Context, name string) (string,
 // the mapped Node for a name, or an "unknown node" error if the name isn't
 // present. Unlike RegistryResolver it does not special-case "" or "local" —
 // tests that want those to resolve must map them explicitly (as
-// spec.App.Node is always normalized to "local" by spec.Parse, tests
-// typically just do FakeResolver{"local": someFake}).
+// spec.App.Node may be "" — Parse preserves an unset node rather than
+// defaulting it — tests typically just do FakeResolver{"local": someFake}
+// and set Node: "local" explicitly on the App they construct).
 type FakeResolver map[string]Node
 
 // Resolve looks nodeName up in the map.

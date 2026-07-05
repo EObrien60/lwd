@@ -14,8 +14,8 @@ import (
 func TestApiNodesList(t *testing.T) {
 	fd := newFakeDaemon()
 	fd.nodes = []client.NodeStatus{
-		{Node: store.Node{Name: "web1", SSHHost: "deploy@web1.example.com", MeshAddr: "100.64.0.2", AgentURL: "http://100.64.0.2:8078"}, Transport: "agent", Reachable: true},
-		{Node: store.Node{Name: "web2", SSHHost: "deploy@web2.example.com", MeshAddr: "100.64.0.3"}, Transport: "ssh", Reachable: false},
+		{Node: store.Node{Name: "web1", SSHHost: "deploy@web1.example.com", MeshAddr: "100.64.0.2", AgentURL: "http://100.64.0.2:8078", Pool: "web"}, Transport: "agent", Reachable: true},
+		{Node: store.Node{Name: "web2", SSHHost: "deploy@web2.example.com", MeshAddr: "100.64.0.3", Pool: "default"}, Transport: "ssh", Reachable: false},
 	}
 	srv, auth := testServer(fd)
 
@@ -31,10 +31,10 @@ func TestApiNodesList(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("got %+v", got)
 	}
-	if got[0].Name != "web1" || got[0].Transport != "agent" || !got[0].Reachable {
+	if got[0].Name != "web1" || got[0].Transport != "agent" || !got[0].Reachable || got[0].Pool != "web" {
 		t.Errorf("unexpected node[0]: %+v", got[0])
 	}
-	if got[1].Name != "web2" || got[1].Transport != "ssh" || got[1].Reachable {
+	if got[1].Name != "web2" || got[1].Transport != "ssh" || got[1].Reachable || got[1].Pool != "default" {
 		t.Errorf("unexpected node[1]: %+v", got[1])
 	}
 }
@@ -43,7 +43,7 @@ func TestApiNodeAdd(t *testing.T) {
 	fd := newFakeDaemon()
 	srv, auth := testServer(fd)
 
-	body := `{"name":"web1","ssh_host":"deploy@web1.example.com","mesh_addr":"100.64.0.2","agent_url":"http://100.64.0.2:8078"}`
+	body := `{"name":"web1","ssh_host":"deploy@web1.example.com","mesh_addr":"100.64.0.2","agent_url":"http://100.64.0.2:8078","pool":"web"}`
 	req := authedRequest(t, auth, http.MethodPost, "/api/nodes", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := do(srv, req)
@@ -55,7 +55,7 @@ func TestApiNodeAdd(t *testing.T) {
 		t.Fatalf("expected AddNode called once, got %d", len(fd.addedNodes))
 	}
 	got := fd.addedNodes[0]
-	if got.Name != "web1" || got.SSHHost != "deploy@web1.example.com" || got.MeshAddr != "100.64.0.2" || got.AgentURL != "http://100.64.0.2:8078" {
+	if got.Name != "web1" || got.SSHHost != "deploy@web1.example.com" || got.MeshAddr != "100.64.0.2" || got.AgentURL != "http://100.64.0.2:8078" || got.Pool != "web" {
 		t.Errorf("unexpected AddNode call: %+v", got)
 	}
 }

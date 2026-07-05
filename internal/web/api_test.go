@@ -149,6 +149,97 @@ func TestApiApplyRejectsBadToml(t *testing.T) {
 	}
 }
 
+// TestApiApplyParsesPoolAndRequirements covers the contract the deploy
+// modal's generated lwd.toml (From Git / Builder tabs) relies on: a `pool`
+// line plus a `[requirements]` table with `cpu`/`memory` set, in the shape
+// app.js's buildGitToml/buildBuilderToml emit (root-level scalars, then
+// `[requirements]`, before any `[git]`/`[[services]]` table headers), parses
+// and validates into an App with Pool/Requirements populated and reaches
+// Apply unchanged. There is no JS test runner in this repo (see app.js's
+// header comment on the buildless design), so this is the closest thing to a
+// test of the deploy modal's pool/requirements output: it proves the exact
+// wire format the modal must produce is accepted end to end.
+func TestApiApplyParsesPoolAndRequirements(t *testing.T) {
+	fd := newFakeDaemon()
+	srv, auth := testServer(fd)
+
+	toml := `
+name = "myapp"
+image = "nginx:latest"
+domain = "myapp.example.com"
+port = 80
+pool = "web"
+
+[requirements]
+cpu = 1.5
+memory = "512M"
+`
+	req := authedRequest(t, auth, http.MethodPost, "/api/apply", strings.NewReader(toml))
+	rec := do(srv, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+	if len(fd.applied) != 1 {
+		t.Fatalf("applied count = %d, want 1", len(fd.applied))
+	}
+	got := fd.applied[0]
+	if got.Pool != "web" {
+		t.Errorf("Pool = %q, want %q", got.Pool, "web")
+	}
+	if got.Requirements == nil {
+		t.Fatalf("Requirements = nil, want non-nil")
+	}
+	if got.Requirements.CPU != 1.5 || got.Requirements.Memory != "512M" {
+		t.Errorf("Requirements = %+v, want {CPU:1.5 Memory:512M}", got.Requirements)
+	}
+	// Node was left unset in the generated toml (the "Auto" placement
+	// option): spec.Parse must preserve "" rather than defaulting it, so the
+	// scheduler (not this test) decides where it lands.
+	if got.Node != "" {
+		t.Errorf("Node = %q, want unset", got.Node)
+	}
+}
+
+// TestApiApplyPreservesExplicitLocalNode is the server-side regression for
+// the "Edit & apply" flow's local-pin preservation (Phase 11a). app.js's
+// specToToml renders a stored spec back into the Paste textarea that
+// openDeployEdit pre-fills and submitDeploy POSTs verbatim to /api/apply;
+// before the fix it dropped `node = "local"` (treating "local" as equivalent
+// to unset, which was true pre-11a), silently converting a local-pinned app
+// into an unset/scheduled one on any edit-and-apply — potentially relocating
+// a running app off local. specToToml is browser Alpine JS with no Go seam,
+// so this asserts the boundary it feeds: a toml carrying an EXPLICIT
+// `node = "local"` (exactly what the fixed specToToml now emits for a
+// local-pinned app) must round-trip through /api/apply with Node == "local"
+// preserved, NOT collapsed to "". The specToToml fix itself is covered by
+// code review + the shared-logic grep in the task report (all three toml
+// generators now use identical `if (x.Node)` emission with no `!== 'local'`).
+func TestApiApplyPreservesExplicitLocalNode(t *testing.T) {
+	fd := newFakeDaemon()
+	srv, auth := testServer(fd)
+
+	toml := `
+name = "myapp"
+image = "nginx:latest"
+domain = "myapp.example.com"
+port = 80
+node = "local"
+`
+	req := authedRequest(t, auth, http.MethodPost, "/api/apply", strings.NewReader(toml))
+	rec := do(srv, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+	if len(fd.applied) != 1 {
+		t.Fatalf("applied count = %d, want 1", len(fd.applied))
+	}
+	if got := fd.applied[0].Node; got != "local" {
+		t.Errorf("Node = %q, want %q (an explicit local pin must survive edit-and-apply, not collapse to unset/scheduled)", got, "local")
+	}
+}
+
 func TestApiApplyRejectsBadSpec(t *testing.T) {
 	fd := newFakeDaemon()
 	srv, auth := testServer(fd)

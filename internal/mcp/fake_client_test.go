@@ -6,6 +6,7 @@ import (
 
 	"lwd/internal/api"
 	"lwd/internal/client"
+	"lwd/internal/reconciler"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -48,12 +49,15 @@ type fakeClient struct {
 
 	removedNodes  []string
 	removeNodeErr error
+
+	health    reconciler.Health
+	healthErr error
 }
 
 // nodeAddCall captures the arguments of one AddNode call, so tests can assert
 // on them (including agent_url) without a real daemon.
 type nodeAddCall struct {
-	Name, SSHHost, MeshAddr, AgentURL string
+	Name, SSHHost, MeshAddr, AgentURL, Pool string
 }
 
 func newFakeClient() *fakeClient {
@@ -155,11 +159,11 @@ func (f *fakeClient) Nodes(ctx context.Context) ([]client.NodeStatus, error) {
 	return f.nodes, nil
 }
 
-func (f *fakeClient) AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL string) error {
+func (f *fakeClient) AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL, pool string) error {
 	if f.addNodeErr != nil {
 		return f.addNodeErr
 	}
-	f.addedNodes = append(f.addedNodes, nodeAddCall{Name: name, SSHHost: sshHost, MeshAddr: meshAddr, AgentURL: agentURL})
+	f.addedNodes = append(f.addedNodes, nodeAddCall{Name: name, SSHHost: sshHost, MeshAddr: meshAddr, AgentURL: agentURL, Pool: pool})
 	return nil
 }
 
@@ -169,4 +173,11 @@ func (f *fakeClient) RemoveNode(ctx context.Context, name string) error {
 	}
 	f.removedNodes = append(f.removedNodes, name)
 	return nil
+}
+
+func (f *fakeClient) Health(ctx context.Context) (reconciler.Health, error) {
+	if f.healthErr != nil {
+		return reconciler.Health{}, f.healthErr
+	}
+	return f.health, nil
 }

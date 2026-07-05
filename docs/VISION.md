@@ -134,11 +134,34 @@ Everything on plain Linux. WireGuard mesh. No custom kernel/init/fs, no service 
   yet, that's P11. Surfaced via `GET /health` → `client.Health` → `lwd
   health` (CLI) and `lwd-web`'s **Health** panel. See `README.md`'s
   [Self-healing & health](../README.md#self-healing--health) section.
-- **P11 — next — Scheduler + capacity + pools:** nodes report capacity; apps declare
-  requirements; placement across nodes/pools; `node inspect/capacity/drain/evacuate`,
-  `pool create`. **Surface failover reschedules here** on node loss (cross-node
-  reschedule of a surface whose node has gone away — P10 only self-heals a
-  surface in place on its existing node).
+- **P11a — Scheduler + capacity + pools — DONE (merged):** `node.Capacity`
+  (live CPU/mem/disk; agent-connected nodes report precise live usage via
+  `/proc`+`statfs`, ssh-only nodes report best-effort `docker info` totals
+  with no usage figures, a failed probe reports `Known: false`) exposed via
+  the dumb agent's own primitives (`node.Node.Capacity`) and the reconciler's
+  `GET /health` snapshot (`reconciler.NodeHealth.Capacity`); `store.Node.Pool`
+  + `--pool` + `GET /pools` + `lwd pool ls`; `spec.App.Pool`/`[requirements]`
+  (`cpu`, `memory` via `spec.ParseSize`) with an **unset `node` now meaning
+  "let lwd place it"** (no longer implicitly `"local"` — a deliberate
+  behavior change from P9a/P9b, gated entirely behind an app declaring no
+  `node` at all); a pure `internal/scheduler` (most-free-node ranking:
+  memory, then CPU, then name, among reachable nodes in the target pool that
+  fit `[requirements]`, optimistically including any node whose capacity
+  couldn't be measured); the reconciler schedules every unpinned surface at
+  apply time (one-shot, not continuous) and records the concrete chosen node
+  in the deployment's spec snapshot; `lwd node capacity`/`lwd node inspect`,
+  `lwd-web`'s Nodes/Health views (pool badges + CPU/mem/disk meters, a
+  Deploy-modal pool/requirements picker), and `lwd-mcp`'s
+  `lwd_node_list`/`lwd_apply`/`lwd_deploy_git` all surface pool + capacity +
+  requirements. Single-node behavior is unchanged (an unpinned app with no
+  other nodes registered still always lands on `local`). See `README.md`'s
+  [Scheduling & pools](../README.md#scheduling--pools) section.
+- **P11b — next — Node drain/evacuate + automatic node-loss failover:**
+  **cross-node reschedule of a surface whose node has gone away** (P10 only
+  self-heals a surface in place on its *existing* node; P11a only schedules
+  an unpinned app once, at apply time — neither moves an already-running
+  surface off a node that later disappears); `lwd node drain`/`evacuate` for
+  operator-initiated migration off a node ahead of planned maintenance.
 - **P12 — Surface replicas + LB:** `lwd scale api N`; Caddy load-balances across healthy
   replicas; blue/green across the replica set. Human scaling only (no autoscaler).
 - **P13 — Multi-edge routing:** N Caddy edges + DNS round-robin; edge-failure resilience.

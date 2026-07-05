@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,12 @@ import (
 // deliberately rejects whitespace, a URL scheme, or other garbage that could
 // never be dialed as a docker-over-ssh host.
 var hostnamePattern = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$`)
+
+// poolNamePattern matches a valid pool name: it must start with an
+// alphanumeric character and may otherwise contain alphanumerics, "_", or
+// "-". This keeps pool names safe to use as path segments / labels
+// elsewhere without further escaping.
+var poolNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 // NodeResolver lets the API evict a resolver's cached remote node entry when
 // a node's registry row changes — added, updated, or removed via POST/DELETE
@@ -88,6 +95,7 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /nodes", srv.handleNodeAdd)
 	mux.HandleFunc("GET /nodes", srv.handleNodeList)
 	mux.HandleFunc("DELETE /nodes/{name}", srv.handleNodeDelete)
+	mux.HandleFunc("GET /pools", srv.handlePools)
 	mux.HandleFunc("GET /health", srv.handleHealth)
 	return mux
 }
@@ -270,6 +278,7 @@ type nodeRequest struct {
 	SSHHost  string `json:"ssh_host"`
 	MeshAddr string `json:"mesh_addr"`
 	AgentURL string `json:"agent_url"`
+	Pool     string `json:"pool"`
 }
 
 // nodeStatusResponse is the wire shape for entries in the GET /nodes
@@ -336,7 +345,11 @@ func (srv *Server) handleNodeAdd(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	n := store.Node{Name: req.Name, SSHHost: req.SSHHost, MeshAddr: req.MeshAddr, AgentURL: req.AgentURL, CreatedAt: time.Now()}
+	if req.Pool != "" && !poolNamePattern.MatchString(req.Pool) {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("pool %q is invalid: must match %s", req.Pool, poolNamePattern.String()))
+		return
+	}
+	n := store.Node{Name: req.Name, SSHHost: req.SSHHost, MeshAddr: req.MeshAddr, AgentURL: req.AgentURL, Pool: req.Pool, CreatedAt: time.Now()}
 	if err := srv.store.AddNode(n); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -389,6 +402,40 @@ func (srv *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	srv.invalidateNode(name)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// poolInfo is the wire shape for entries in the GET /pools response: a pool
+// name and the number of registered nodes in it.
+type poolInfo struct {
+	Name  string `json:"name"`
+	Nodes int    `json:"nodes"`
+}
+
+// handlePools lists every pool with a registered node in it, plus the count
+// of nodes in each. "default" is always included, seeded at 1 — the
+// implicit "local" node (the controller's own Docker, never stored in the
+// registry) is always a member of "default" — before adding registered
+// store nodes on top.
+func (srv *Server) handlePools(w http.ResponseWriter, r *http.Request) {
+	nodes, err := srv.store.ListNodes()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	counts := map[string]int{store.DefaultPool: 1}
+	for _, n := range nodes {
+		counts[n.Pool]++
+	}
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]poolInfo, len(names))
+	for i, name := range names {
+		out[i] = poolInfo{Name: name, Nodes: counts[name]}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleHealth serves the reconciler's current in-memory Health snapshot

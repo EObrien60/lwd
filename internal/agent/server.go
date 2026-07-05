@@ -31,6 +31,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET "+node.PathHealthz, s.handleHealthz)
 	mux.HandleFunc("GET "+node.PathReady, s.handleReady)
+	mux.HandleFunc("GET "+node.PathCapacity, s.handleCapacity)
 
 	mux.HandleFunc("POST "+node.PathEnsureImage, s.handleEnsureImage)
 	mux.HandleFunc("POST "+node.PathImagePresent, s.handleImagePresent)
@@ -96,6 +97,18 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleCapacity reports this node's own resources (s.node is always
+// node.NewLocal() for a running agent, so this reads the machine's own
+// /proc). Like every route except /healthz, it is gated by authMiddleware.
+func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
+	cap, err := s.node.Capacity(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, cap)
 }
 
 func (s *Server) handleEnsureImage(w http.ResponseWriter, r *http.Request) {

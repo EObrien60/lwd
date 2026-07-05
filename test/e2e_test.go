@@ -5,6 +5,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -1613,6 +1614,164 @@ func TestEndToEndSelfHeal(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("want %q present in health snapshot Apps, got %+v", app.Name, snap.Apps)
+	}
+}
+
+// schedAppLabel, schedDomain, and the two node names are used by
+// TestEndToEndScheduling, kept distinct from every other test's labels so
+// cleanup/assertions never collide.
+const schedAppLabel = "e2e-sched-whoami"
+const schedDomain = "sched-whoami.localhost"
+const schedNodeAName = "sched-node-a"
+const schedNodeBName = "sched-node-b"
+
+// schedFakeReach is a reconciler.Reachability backed by a plain map: it
+// reports every mapped node name reachable over a fixed "ssh" transport —
+// enough for resolvePlacement's candidate-gathering to consider a registered
+// node at all (see reconciler.Reconciler.SetReachability), without a real
+// registry, agent, or ssh session.
+type schedFakeReach map[string]bool
+
+func (f schedFakeReach) Reachable(ctx context.Context, name string) (string, bool) {
+	return "ssh", f[name]
+}
+
+// TestEndToEndScheduling covers Phase 11a end to end: a real reconciler with
+// two registered nodes — both in pool "default", with differing live
+// MemAvailable — plus the implicit local node (whose capacity is left
+// unmeasured, Known: false), deploying an app whose `node` is UNSET (the
+// "let lwd schedule it" case — see spec.App.Node's doc comment). It asserts
+// the surface actually lands on the node with the most free memory
+// (scheduler.Place's ranking) and that the deployment recorded in the store
+// captures that concrete node in its spec snapshot, not the "" the app
+// declared (see reconciler.applyImage, which resolves placement and sets
+// app.Node before marshaling the snapshot).
+//
+// This is deliberately NOT gated by LWD_DOCKER_TEST: like
+// TestEndToEndSelfHeal and TestEndToEndAgentTransportSelection, it drives
+// the real reconciler/scheduler/store against fake nodes and a fake router,
+// so it stays part of the plain `go test ./...` run with no Docker
+// dependency — the placement decision under test lives entirely in
+// reconciler.resolvePlacement + scheduler.Place, neither of which touches a
+// real Docker daemon.
+func TestEndToEndScheduling(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	// local's capacity is left at the zero value (Known: false): resolvePlacement
+	// always offers it as a "default"-pool candidate, but scheduler.freeMem
+	// falls back to MemTotal (0) for an unmeasured node — so it can never win
+	// the most-free-memory ranking against nodeA/nodeB below. This is the
+	// case that actually proves scheduling picked nodeB deliberately, not by
+	// local simply being the only candidate.
+	local := node.NewFake()
+
+	nodeA := node.NewFake()
+	nodeA.Cap = node.Capacity{CPUCores: 4, MemTotal: 8 << 30, MemAvailable: 2 << 30, Known: true}
+	nodeA.MeshAddr = "100.64.0.10"
+	nodeB := node.NewFake()
+	nodeB.Cap = node.Capacity{CPUCores: 4, MemTotal: 8 << 30, MemAvailable: 6 << 30, Known: true}
+	nodeB.MeshAddr = "100.64.0.11"
+
+	if err := s.AddNode(store.Node{Name: schedNodeAName, SSHHost: "deploy@nodea", MeshAddr: "100.64.0.10", Pool: store.DefaultPool, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("AddNode %s: %v", schedNodeAName, err)
+	}
+	if err := s.AddNode(store.Node{Name: schedNodeBName, SSHHost: "deploy@nodeb", MeshAddr: "100.64.0.11", Pool: store.DefaultPool, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("AddNode %s: %v", schedNodeBName, err)
+	}
+	t.Cleanup(func() {
+		_ = s.DeleteNode(schedNodeAName)
+		_ = s.DeleteNode(schedNodeBName)
+	})
+
+	resolver := node.FakeResolver{"local": local, schedNodeAName: nodeA, schedNodeBName: nodeB}
+	reach := schedFakeReach{schedNodeAName: true, schedNodeBName: true}
+
+	fr := router.NewFakeRouter()
+	fr.ProbeStatus = http.StatusOK
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	secStore := secrets.NewStore(cipher, s)
+
+	rec := reconciler.New(resolver, fr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
+	rec.SetReachability(reach)
+
+	app := &spec.App{
+		Name:   schedAppLabel,
+		Image:  "whoami:fake",
+		Domain: schedDomain,
+		Port:   8080,
+		// Node is deliberately left unset: this is the scheduling case under
+		// test. Pool is also unset, meaning "default" — the pool both
+		// registered nodes (and the implicit local node) live in.
+	}
+	app.Health.Timeout = 150 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dep, err := rec.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if dep.Status != store.StatusRunning {
+		t.Fatalf("deployment status = %q, want %q", dep.Status, store.StatusRunning)
+	}
+
+	cur, err := s.CurrentDeployment(app.Name)
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil {
+		t.Fatalf("want a current deployment after Apply, got none")
+	}
+	var recorded spec.App
+	if err := json.Unmarshal([]byte(cur.Spec), &recorded); err != nil {
+		t.Fatalf("unmarshal recorded spec snapshot: %v", err)
+	}
+	if recorded.Node != schedNodeBName {
+		t.Fatalf("recorded deployment spec Node = %q, want %q (the most-free-memory candidate)", recorded.Node, schedNodeBName)
+	}
+
+	// The surface container actually ran on nodeB's fake — not nodeA's, not
+	// local's. All three fakes legitimately see OTHER calls first (every
+	// candidate's Capacity is probed while gathering placement candidates,
+	// and local additionally sees a SaveImage as the source of the
+	// save|load transfer that makes the image available on remote nodeB —
+	// see reconciler.ensureImageOnNode) — RunContainer specifically is the
+	// one call that must appear only on the node actually chosen.
+	ranOn := func(f *node.Fake) bool {
+		for _, c := range f.Calls {
+			if strings.HasPrefix(c, "RunContainer:") {
+				return true
+			}
+		}
+		return false
+	}
+	if !ranOn(nodeB) {
+		t.Errorf("want nodeB (the most-free node) to have run the surface container, calls: %v", nodeB.Calls)
+	}
+	if ranOn(nodeA) {
+		t.Errorf("want nodeA (not the most-free node) to never run a container, calls: %v", nodeA.Calls)
+	}
+	if ranOn(local) {
+		t.Errorf("want local (capacity unknown, always loses the ranking) to never run a container, calls: %v", local.Calls)
+	}
+
+	// The router's live route must point at nodeB's surface.
+	route, ok := fr.Routes[app.Domain]
+	if !ok {
+		t.Fatalf("want a live route for %q", app.Domain)
+	}
+	if route.Upstream == "" {
+		t.Errorf("want a live route upstream set, got %+v", route)
 	}
 }
 

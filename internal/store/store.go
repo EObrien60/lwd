@@ -42,8 +42,13 @@ type Node struct {
 	SSHHost   string    `json:"ssh_host"`
 	MeshAddr  string    `json:"mesh_addr"`
 	AgentURL  string    `json:"agent_url"`
+	Pool      string    `json:"pool"`
 	CreatedAt time.Time `json:"created_at"`
 }
+
+// DefaultPool is the pool an implicit "local" node lives in, and the pool a
+// node registered without an explicit pool is normalized into.
+const DefaultPool = "default"
 
 // Store wraps the SQLite database.
 type Store struct {
@@ -73,7 +78,8 @@ CREATE TABLE IF NOT EXISTS nodes (
 	ssh_host  TEXT    NOT NULL,
 	mesh_addr TEXT    NOT NULL,
 	created_at INTEGER NOT NULL,
-	agent_url TEXT    NOT NULL DEFAULT ''
+	agent_url TEXT    NOT NULL DEFAULT '',
+	pool      TEXT    NOT NULL DEFAULT 'default'
 );
 `
 
@@ -101,6 +107,10 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	if err := migrateAddAgentURLColumn(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	if err := migrateAddPoolColumn(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -244,6 +254,53 @@ func migrateAddAgentURLColumn(db *sql.DB) error {
 			return nil
 		}
 		return fmt.Errorf("add agent_url column: %w", err)
+	}
+	return nil
+}
+
+// migrateAddPoolColumn adds the "pool" column to a pre-Phase-11a nodes
+// table that predates it. Safe to call on every Open: it first checks
+// PRAGMA table_info for the column and only issues ALTER TABLE if missing,
+// and additionally tolerates a concurrent/duplicate "add column" error
+// (e.g. "duplicate column name: pool") so it never fails on a DB that
+// already has the column, including one created by the base schema above.
+func migrateAddPoolColumn(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(nodes)`)
+	if err != nil {
+		return fmt.Errorf("table_info: %w", err)
+	}
+	hasPool := false
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			ctype     string
+			notnull   int
+			dfltValue any
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan table_info: %w", err)
+		}
+		if name == "pool" {
+			hasPool = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("table_info rows: %w", err)
+	}
+	rows.Close()
+	if hasPool {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE nodes ADD COLUMN pool TEXT NOT NULL DEFAULT 'default'`); err != nil {
+		// Tolerate a race/duplicate add: some other process (or a prior
+		// partial run) already added it between our check and this call.
+		if strings.Contains(err.Error(), "duplicate column name") {
+			return nil
+		}
+		return fmt.Errorf("add pool column: %w", err)
 	}
 	return nil
 }
@@ -433,12 +490,17 @@ func (s *Store) DeleteSecret(app, key string) error {
 }
 
 // AddNode upserts a node by name. An existing node with the same name will have its
-// ssh_host, mesh_addr, and agent_url updated; created_at is preserved on update.
+// ssh_host, mesh_addr, agent_url, and pool updated; created_at is preserved on update.
+// An empty Pool is normalized to DefaultPool before insert.
 func (s *Store) AddNode(n Node) error {
+	pool := n.Pool
+	if pool == "" {
+		pool = DefaultPool
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO nodes (name, ssh_host, mesh_addr, created_at, agent_url) VALUES (?, ?, ?, ?, ?)
-		 ON CONFLICT(name) DO UPDATE SET ssh_host=excluded.ssh_host, mesh_addr=excluded.mesh_addr, agent_url=excluded.agent_url`,
-		n.Name, n.SSHHost, n.MeshAddr, n.CreatedAt.Unix(), n.AgentURL,
+		`INSERT INTO nodes (name, ssh_host, mesh_addr, created_at, agent_url, pool) VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(name) DO UPDATE SET ssh_host=excluded.ssh_host, mesh_addr=excluded.mesh_addr, agent_url=excluded.agent_url, pool=excluded.pool`,
+		n.Name, n.SSHHost, n.MeshAddr, n.CreatedAt.Unix(), n.AgentURL, pool,
 	)
 	if err != nil {
 		return fmt.Errorf("add node: %w", err)
@@ -448,10 +510,10 @@ func (s *Store) AddNode(n Node) error {
 
 // GetNode returns a node by name, or (nil, nil) if not found.
 func (s *Store) GetNode(name string) (*Node, error) {
-	row := s.db.QueryRow(`SELECT name, ssh_host, mesh_addr, created_at, agent_url FROM nodes WHERE name = ?`, name)
+	row := s.db.QueryRow(`SELECT name, ssh_host, mesh_addr, created_at, agent_url, pool FROM nodes WHERE name = ?`, name)
 	var n Node
 	var ts int64
-	switch err := row.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts, &n.AgentURL); err {
+	switch err := row.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts, &n.AgentURL, &n.Pool); err {
 	case nil:
 		n.CreatedAt = time.Unix(ts, 0)
 		return &n, nil
@@ -464,7 +526,7 @@ func (s *Store) GetNode(name string) (*Node, error) {
 
 // ListNodes returns all nodes sorted by name ascending.
 func (s *Store) ListNodes() ([]Node, error) {
-	rows, err := s.db.Query(`SELECT name, ssh_host, mesh_addr, created_at, agent_url FROM nodes ORDER BY name ASC`)
+	rows, err := s.db.Query(`SELECT name, ssh_host, mesh_addr, created_at, agent_url, pool FROM nodes ORDER BY name ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
@@ -473,7 +535,7 @@ func (s *Store) ListNodes() ([]Node, error) {
 	for rows.Next() {
 		var n Node
 		var ts int64
-		if err := rows.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts, &n.AgentURL); err != nil {
+		if err := rows.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts, &n.AgentURL, &n.Pool); err != nil {
 			return nil, fmt.Errorf("scan node: %w", err)
 		}
 		n.CreatedAt = time.Unix(ts, 0)
