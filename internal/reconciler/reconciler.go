@@ -521,7 +521,14 @@ func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deploy
 func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App) (*store.Deployment, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.rollbackGitLocked(ctx, app)
+}
 
+// rollbackGitLocked is rollbackGit's body, extracted so the Phase 10 heal
+// path (healSurfaceLocked) can redeploy a git app's recorded spec+built tag
+// while ALREADY holding r.mu — calling rollbackGit itself would deadlock.
+// Callers must hold r.mu.
+func (r *Reconciler) rollbackGitLocked(ctx context.Context, app *spec.App) (*store.Deployment, error) {
 	// Validate the declared shape (git url, build, domain, port, services...)
 	// against a copy with Image cleared: spec.Validate rejects a git app that
 	// declares Image (that combination is meaningless for user-authored
@@ -604,6 +611,42 @@ func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App) (*store.Dep
 	}
 
 	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr)
+}
+
+// healSurfaceLocked recreates a dead surface from cur, the app's current
+// recorded deployment row: it reconstructs the spec.App that produced it from
+// cur.Spec (the JSON snapshot captured at deploy time), pins Image back to
+// cur.Image, and redeploys through the existing blue-green path — reusing the
+// already-built/already-present image, never re-cloning or rebuilding a git
+// app. This is the Phase 10 control loop's self-heal primitive: called while
+// the loop ALREADY holds r.mu (it observed cur as dead via surfaceIsDead
+// under the same lock), so — unlike Rollback and Apply — it must NOT lock
+// r.mu itself; doing so would deadlock.
+func (r *Reconciler) healSurfaceLocked(ctx context.Context, cur *store.Deployment) (*store.Deployment, error) {
+	var restored spec.App
+	if cur.Spec == "" {
+		return nil, fmt.Errorf("no spec snapshot to heal %q", cur.App)
+	}
+	if err := json.Unmarshal([]byte(cur.Spec), &restored); err != nil {
+		return nil, fmt.Errorf("unmarshal spec snapshot for %q: %w", cur.App, err)
+	}
+	restored.Image = cur.Image
+	if restored.Git != nil {
+		return r.rollbackGitLocked(ctx, &restored) // reuses built tag, no clone/build
+	}
+	if err := restored.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid spec snapshot for %q: %w", cur.App, err)
+	}
+	return r.applyImage(ctx, &restored) // applyImage assumes r.mu held; image already present
+}
+
+// surfaceIsDead classifies a node.ContainerHealth observation (state, err) as
+// needing a heal: any error observing health, or any non-"running" state,
+// counts as dead. A container that has disappeared entirely may surface as
+// either an error or an empty/non-running state depending on the node.Node
+// implementation; both are treated the same way here.
+func surfaceIsDead(state string, err error) bool {
+	return err != nil || state != "running"
 }
 
 // mergeEnv merges an app's plain declared env with its resolved secret
@@ -813,7 +856,22 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, ap
 		return nil, fmt.Errorf("record deployment: %w", err)
 	}
 	dep.ID = id
+
+	// Every successful surface deploy — manual Apply, Rollback, or a Phase 10
+	// self-heal — clears the app's heal backoff: whatever was making it
+	// unhealthy (if anything) has now demonstrably been resolved by a fresh,
+	// health-gated container.
+	r.resetHeal(app.Name)
+
 	return &dep, nil
+}
+
+// resetHeal clears app's in-progress self-heal bookkeeping (attempt count and
+// backoff gate), if any. Called on every successful surface deploy so a
+// healthy redeploy doesn't carry forward a stale backoff from before it was
+// fixed. Callers must hold r.mu.
+func (r *Reconciler) resetHeal(app string) {
+	delete(r.heal, app)
 }
 
 // recordFailedSurface tears down a failed blue-green candidate: it removes
