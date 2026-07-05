@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -758,5 +759,178 @@ func TestEvacuateReplicaNoCapacityFails(t *testing.T) {
 	}
 	if contains(web1.Calls, "RemoveContainer:"+oldWeb1ContainerID) {
 		t.Errorf("failed move must not remove the old container: %v", web1.Calls)
+	}
+}
+
+// TestEvacuateMultipleReplicasSameNode covers the multi-mover case: a
+// scheduled 4-replica surface with TWO replicas stacked on the node being
+// evacuated (web-b) and the other two on distinct nodes (web-a, web-c). Both
+// web-b replicas must move, and — critically for spread — they must land on
+// TWO DIFFERENT new nodes (web-d, web-e), never stacked onto the same one,
+// because the second mover's exclude set includes the FIRST mover's freshly
+// chosen node (cur.Replicas is updated in place between movers). The two
+// survivors on web-a/web-c stay byte-identical.
+//
+// The starting deployment's Replicas is hand-built via RecordDeployment so
+// the "2 replicas on the same node" arrangement is deterministic rather than
+// depending on placement luck.
+func TestEvacuateMultipleReplicasSameNode(t *testing.T) {
+	r, resolver, localFake, fr, s := newSchedulingReconciler(t, "web-a", "web-b", "web-c", "web-d", "web-e")
+	ctx := context.Background()
+	fr.ProbeStatus = 200
+
+	// local starved so it never fits the 2000-byte requirement; the two
+	// excluded survivor nodes (web-a/web-c) and the evacuated node (web-b)
+	// have ample capacity but are never candidates for a mover; web-d
+	// (4000) > web-e (3000) so the first mover deterministically picks web-d
+	// and the second — with web-d now excluded — picks web-e.
+	localFake.Cap = node.Capacity{Known: true, CPUCores: 1, MemAvailable: 1}
+	caps := map[string]int64{"web-a": 5000, "web-b": 5000, "web-c": 5000, "web-d": 4000, "web-e": 3000}
+	for i, name := range []string{"web-a", "web-b", "web-c", "web-d", "web-e"} {
+		fk := resolver[name].(*node.Fake)
+		fk.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: caps[name]}
+		fk.MeshAddr = fmt.Sprintf("100.64.0.%d", i+2)
+		if err := s.AddNode(store.Node{Name: name, SSHHost: "deploy@" + name, MeshAddr: fk.MeshAddr, Pool: "default"}); err != nil {
+			t.Fatalf("AddNode %s: %v", name, err)
+		}
+	}
+
+	specApp := spec.App{
+		Name:         "blog",
+		Image:        "img:1",
+		Domain:       "blog.example.com",
+		Port:         8080,
+		Replicas:     4,
+		Requirements: &spec.Requirements{Memory: "2000"},
+	}
+	specApp.Health.Path = "/healthz"
+	specApp.Health.Timeout = shortTimeout
+	specJSON, err := json.Marshal(specApp)
+	if err != nil {
+		t.Fatalf("marshal spec: %v", err)
+	}
+
+	replicas := []store.Replica{
+		{ContainerID: "ca", Node: "web-a", Upstream: "100.64.0.2", Port: 9001},
+		{ContainerID: "cb1", Node: "web-b", Upstream: "100.64.0.3", Port: 9002},
+		{ContainerID: "cc", Node: "web-c", Upstream: "100.64.0.4", Port: 9003},
+		{ContainerID: "cb2", Node: "web-b", Upstream: "100.64.0.3", Port: 9004},
+	}
+	id, err := s.RecordDeployment(store.Deployment{
+		App:         "blog",
+		Image:       "img:1",
+		ContainerID: replicas[0].ContainerID,
+		Status:      store.StatusRunning,
+		CreatedAt:   time.Now(),
+		Spec:        string(specJSON),
+		Scheduled:   true,
+		Replicas:    replicas,
+	})
+	if err != nil {
+		t.Fatalf("RecordDeployment: %v", err)
+	}
+
+	webA := resolver["web-a"].(*node.Fake)
+	webB := resolver["web-b"].(*node.Fake)
+	webC := resolver["web-c"].(*node.Fake)
+	webD := resolver["web-d"].(*node.Fake)
+	webE := resolver["web-e"].(*node.Fake)
+
+	result, err := r.EvacuateNode(ctx, "web-b")
+	if err != nil {
+		t.Fatalf("EvacuateNode: %v", err)
+	}
+	if !contains(result.Moved, "blog") {
+		t.Fatalf("Moved = %v, want to contain blog", result.Moved)
+	}
+	if len(result.Failed) != 0 {
+		t.Fatalf("Failed = %+v, want empty", result.Failed)
+	}
+
+	newCur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if newCur == nil || newCur.ID != id {
+		t.Fatalf("want the SAME deployment row updated in place (id %d), got %+v", id, newCur)
+	}
+	if len(newCur.Replicas) != 4 {
+		t.Fatalf("Replicas = %+v, want 4", newCur.Replicas)
+	}
+
+	// Survivors untouched (node, container, upstream, port all identical).
+	if newCur.Replicas[0] != replicas[0] {
+		t.Errorf("replica 0 (web-a survivor) = %+v, want untouched %+v", newCur.Replicas[0], replicas[0])
+	}
+	if newCur.Replicas[2] != replicas[2] {
+		t.Errorf("replica 2 (web-c survivor) = %+v, want untouched %+v", newCur.Replicas[2], replicas[2])
+	}
+
+	// Both movers relocated off web-b, onto TWO DIFFERENT nodes.
+	moved1, moved3 := newCur.Replicas[1], newCur.Replicas[3]
+	if moved1.Node == "web-b" || moved3.Node == "web-b" {
+		t.Errorf("a mover is still on web-b: [1]=%+v [3]=%+v", moved1, moved3)
+	}
+	if moved1.Node == moved3.Node {
+		t.Errorf("both movers stacked onto the same node %q — spread NOT preserved (distinct capacity existed): [1]=%+v [3]=%+v", moved1.Node, moved1, moved3)
+	}
+	if moved1.Node != "web-d" {
+		t.Errorf("first mover on %q, want web-d (most-free target)", moved1.Node)
+	}
+	if moved3.Node != "web-e" {
+		t.Errorf("second mover on %q, want web-e (web-d excluded by first mover)", moved3.Node)
+	}
+	if moved1.ContainerID == "cb1" || moved3.ContainerID == "cb2" {
+		t.Errorf("movers kept their old container ids, want fresh ones: [1]=%q [3]=%q", moved1.ContainerID, moved3.ContainerID)
+	}
+
+	// No replica of this app remains on web-b.
+	for i, rep := range newCur.Replicas {
+		if rep.Node == "web-b" {
+			t.Errorf("replica %d still on evacuated web-b: %+v", i, rep)
+		}
+	}
+
+	// Exactly one new container per target node; none on the survivors.
+	if got := runContainerCalls(webA); got != 0 {
+		t.Errorf("web-a (survivor) got RunContainer calls, want none: %v", webA.Calls)
+	}
+	if got := runContainerCalls(webC); got != 0 {
+		t.Errorf("web-c (survivor) got RunContainer calls, want none: %v", webC.Calls)
+	}
+	if got := runContainerCalls(webD); got != 1 {
+		t.Errorf("web-d RunContainer calls = %d, want 1: %v", got, webD.Calls)
+	}
+	if got := runContainerCalls(webE); got != 1 {
+		t.Errorf("web-e RunContainer calls = %d, want 1: %v", got, webE.Calls)
+	}
+
+	// Both old containers removed on their own node (web-b, reachable — no
+	// Reachability wired up, so removal is attempted).
+	if !contains(webB.Calls, "RemoveContainer:cb1") {
+		t.Errorf("want old container cb1 removed on web-b: %v", webB.Calls)
+	}
+	if !contains(webB.Calls, "RemoveContainer:cb2") {
+		t.Errorf("want old container cb2 removed on web-b: %v", webB.Calls)
+	}
+
+	// Live route carries all 4 upstreams (2 untouched survivors + 2 movers).
+	route, ok := fr.Routes["blog.example.com"]
+	if !ok {
+		t.Fatalf("want a live route for blog.example.com")
+	}
+	if len(route.Upstreams) != 4 {
+		t.Fatalf("route.Upstreams = %+v, want 4", route.Upstreams)
+	}
+	for _, mov := range []store.Replica{moved1, moved3} {
+		found := false
+		for _, u := range route.Upstreams {
+			if u.Host == mov.Upstream && u.Port == mov.Port {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("route.Upstreams %+v missing moved replica upstream %+v", route.Upstreams, mov)
+		}
 	}
 }
