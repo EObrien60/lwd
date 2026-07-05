@@ -88,6 +88,7 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /nodes", srv.handleNodeAdd)
 	mux.HandleFunc("GET /nodes", srv.handleNodeList)
 	mux.HandleFunc("DELETE /nodes/{name}", srv.handleNodeDelete)
+	mux.HandleFunc("GET /health", srv.handleHealth)
 	return mux
 }
 
@@ -388,4 +389,14 @@ func (srv *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	srv.invalidateNode(name)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleHealth serves the reconciler's current in-memory Health snapshot
+// (node reachability, edge/router reachability, and per-app surface health)
+// as populated by the continuous reconciler loop's most recent pass. It
+// carries no secret values — just reachability booleans and heal
+// bookkeeping — so it's safe to expose read-only with no additional
+// filtering.
+func (srv *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, srv.rec.HealthSnapshot())
 }

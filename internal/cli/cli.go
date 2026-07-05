@@ -53,6 +53,8 @@ func Run(args []string) int {
 		return runSecret(args[1:])
 	case "node":
 		return runNode(args[1:])
+	case "health":
+		return runHealth(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
 		return 2
@@ -464,6 +466,44 @@ func runNodeLs() int {
 			reachable = "yes"
 		}
 		fmt.Printf("%-20s %-30s %-15s %-30s %-10s %s\n", n.Name, n.SSHHost, n.MeshAddr, n.AgentURL, n.Transport, reachable)
+	}
+	return 0
+}
+
+// runHealth prints the daemon's current reconciler health snapshot: node
+// reachability, edge (Caddy) reachability, and per-app self-heal state. args
+// is accepted (and ignored) for consistency with the other run* commands;
+// `lwd health` takes no flags or positional arguments.
+func runHealth(args []string) int {
+	h, err := newClient().Health(context.Background())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "health:", err)
+		return 1
+	}
+
+	fmt.Println("NODES")
+	fmt.Printf("%-20s %-10s %s\n", "NAME", "TRANSPORT", "REACHABLE")
+	for _, n := range h.Nodes {
+		reachable := "no"
+		if n.Reachable {
+			reachable = "yes"
+		}
+		fmt.Printf("%-20s %-10s %s\n", n.Name, n.Transport, reachable)
+	}
+
+	fmt.Println()
+	fmt.Println("EDGE")
+	edgeReachable := "no"
+	if h.Edge.Reachable {
+		edgeReachable = "yes"
+	}
+	fmt.Printf("caddy reachable: %s\n", edgeReachable)
+
+	fmt.Println()
+	fmt.Println("APPS")
+	fmt.Printf("%-20s %-10s %-14s %s\n", "APP", "STATE", "HEAL ATTEMPTS", "LAST ERROR")
+	for _, a := range h.Apps {
+		fmt.Printf("%-20s %-10s %-14d %s\n", a.App, a.State, a.HealAttempts, a.LastError)
 	}
 	return 0
 }
