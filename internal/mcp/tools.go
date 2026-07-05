@@ -12,6 +12,7 @@ import (
 	"lwd/internal/api"
 	"lwd/internal/client"
 	"lwd/internal/node"
+	"lwd/internal/reconciler"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -614,5 +615,77 @@ func (s *Server) registerLwdNodeRemove(srv *sdk.Server) {
 			return nil, lwdNodeRemoveOutput{}, err
 		}
 		return nil, lwdNodeRemoveOutput{Name: in.Name, Removed: true}, nil
+	})
+}
+
+// lwdNodeTargetInput is the input shared by lwd_node_drain, lwd_node_evacuate,
+// and lwd_node_uncordon: just the target node's name.
+type lwdNodeTargetInput struct {
+	Name string `json:"name" jsonschema:"the node's name"`
+}
+
+// registerLwdNodeDrain adds the lwd_node_drain tool: cordon a node (exclude
+// it from future scheduler placement) THEN evacuate every scheduler-placed
+// surface currently on it onto some other fitting node — the two-step "take
+// this node out of service" operation. Pinned surfaces and compose/backing
+// stacks are left running untouched (see reconciler.EvacuateNode).
+// Annotated destructiveHint, since surfaces actually move (and their old
+// containers are torn down) — the MCP host should confirm with the user
+// before invoking it.
+func (s *Server) registerLwdNodeDrain(srv *sdk.Server) {
+	destructive := true
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_node_drain",
+		Description: "Cordon a node (exclude it from future scheduler placement) THEN move every scheduler-placed surface off it onto another fitting node. Pinned surfaces and compose apps are left untouched.",
+		Annotations: &sdk.ToolAnnotations{DestructiveHint: &destructive},
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdNodeTargetInput) (*sdk.CallToolResult, reconciler.EvacuateResult, error) {
+		res, err := s.client.Drain(ctx, in.Name)
+		if err != nil {
+			return nil, reconciler.EvacuateResult{}, err
+		}
+		return nil, res, nil
+	})
+}
+
+// registerLwdNodeEvacuate adds the lwd_node_evacuate tool: move every
+// scheduler-placed surface off a node onto some other fitting node, WITHOUT
+// cordoning it first — unlike lwd_node_drain, new placements can still land
+// on it afterward. Annotated destructiveHint for the same reason as drain:
+// surfaces actually move.
+func (s *Server) registerLwdNodeEvacuate(srv *sdk.Server) {
+	destructive := true
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_node_evacuate",
+		Description: "Move every scheduler-placed surface off a node onto another fitting node, without cordoning it (new placements may still land on it afterward). Pinned surfaces and compose apps are left untouched.",
+		Annotations: &sdk.ToolAnnotations{DestructiveHint: &destructive},
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdNodeTargetInput) (*sdk.CallToolResult, reconciler.EvacuateResult, error) {
+		res, err := s.client.Evacuate(ctx, in.Name)
+		if err != nil {
+			return nil, reconciler.EvacuateResult{}, err
+		}
+		return nil, res, nil
+	})
+}
+
+// lwdNodeUncordonOutput is the structured result of lwd_node_uncordon.
+type lwdNodeUncordonOutput struct {
+	OK   bool   `json:"ok"`
+	Name string `json:"name"`
+}
+
+// registerLwdNodeUncordon adds the lwd_node_uncordon tool: clear a node's
+// cordon, making it eligible for scheduler placement again. This is
+// deliberately NOT annotated destructiveHint — unlike drain/evacuate, it
+// never moves or touches anything already deployed, only lifts a placement
+// restriction.
+func (s *Server) registerLwdNodeUncordon(srv *sdk.Server) {
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_node_uncordon",
+		Description: "Clear a node's cordon, making it eligible for scheduler placement again. Never moves or touches anything already deployed on it.",
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdNodeTargetInput) (*sdk.CallToolResult, lwdNodeUncordonOutput, error) {
+		if err := s.client.Uncordon(ctx, in.Name); err != nil {
+			return nil, lwdNodeUncordonOutput{}, err
+		}
+		return nil, lwdNodeUncordonOutput{OK: true, Name: in.Name}, nil
 	})
 }

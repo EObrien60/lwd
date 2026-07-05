@@ -136,6 +136,20 @@ func (r *Reconciler) SetNudge(ch chan<- struct{}) {
 	r.nudge = ch
 }
 
+// SeedUnreachableSince directly sets the "first observed unreachable"
+// timestamp failoverLostNodes gates automatic node-loss failover on (Phase
+// 11b Task 5), for a registered node named name. It exists so black-box
+// tests outside this package (e.g. the end-to-end suite in test/e2e_test.go)
+// can simulate a grace period having already elapsed deterministically,
+// without sleeping — same-package tests (failover_test.go) do this by
+// setting r.unreachableSince directly under r.mu; this is the exported
+// equivalent for callers that can't reach the unexported field.
+func (r *Reconciler) SeedUnreachableSince(name string, since time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.unreachableSince[name] = since
+}
+
 // HealthSnapshot returns a deep copy of the reconciler's current health
 // view: a caller mutating the returned Health (or its Nodes/Apps elements)
 // cannot affect the reconciler's internal state.

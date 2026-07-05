@@ -34,6 +34,9 @@ type ClientIface interface {
 	Nodes(ctx context.Context) ([]client.NodeStatus, error)
 	AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL, pool string) error
 	RemoveNode(ctx context.Context, name string) error
+	Drain(ctx context.Context, name string) (reconciler.EvacuateResult, error)
+	Evacuate(ctx context.Context, name string) (reconciler.EvacuateResult, error)
+	Uncordon(ctx context.Context, name string) error
 	Health(ctx context.Context) (reconciler.Health, error)
 }
 
@@ -81,6 +84,9 @@ func (s *Server) registerTools(srv *sdk.Server) {
 	s.registerLwdNodeList(srv)
 	s.registerLwdNodeAdd(srv)
 	s.registerLwdNodeRemove(srv)
+	s.registerLwdNodeDrain(srv)
+	s.registerLwdNodeEvacuate(srv)
+	s.registerLwdNodeUncordon(srv)
 }
 
 // Serve runs the MCP server over stdio until the client disconnects or ctx

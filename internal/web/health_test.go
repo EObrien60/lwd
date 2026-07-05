@@ -24,7 +24,7 @@ func TestApiHealth(t *testing.T) {
 				CPUCores: 8, CPUUsed: 1.5, MemTotal: 16 << 30, MemAvailable: 10 << 30,
 				DiskTotal: 200 << 30, DiskFree: 120 << 30, Known: true,
 			}},
-			{Name: "web1", Transport: "agent", Reachable: false, UpdatedAt: now},
+			{Name: "web1", Transport: "agent", Reachable: false, UpdatedAt: now, Cordoned: true},
 		},
 		Edge: reconciler.EdgeHealth{Reachable: true, UpdatedAt: now},
 		Apps: []reconciler.AppHealth{
@@ -55,6 +55,15 @@ func TestApiHealth(t *testing.T) {
 	}
 	if got.Nodes[1].Capacity.Known {
 		t.Errorf("unexpected Capacity for web1 (no probe succeeded): %+v", got.Nodes[1].Capacity)
+	}
+	// Cordoned (Phase 11b Task 6: surfaced as a badge in the web Health
+	// panel) must round-trip through the /api/health proxy exactly as the
+	// daemon reported it.
+	if got.Nodes[0].Cordoned {
+		t.Errorf("unexpected Cordoned for local: %+v", got.Nodes[0])
+	}
+	if !got.Nodes[1].Cordoned {
+		t.Errorf("unexpected Cordoned for web1 (drained): %+v", got.Nodes[1])
 	}
 	if !got.Edge.Reachable {
 		t.Errorf("unexpected Edge: %+v", got.Edge)
