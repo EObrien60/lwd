@@ -952,15 +952,17 @@ const agentSelectionNodeName = "e2e-agent-selection"
 // TestEndToEndAgentTransportSelection proves the P9b agent-transport
 // selection path end to end WITHOUT requiring Docker: a real lwd-agent HTTP
 // server (internal/agent.Server) — backed by a fake node.Node, so its own
-// /healthz answers without any Docker daemon — is started on loopback via
-// httptest.NewServer, a node is registered in a real store.Store with that
-// server's URL as its agent_url, and a real node.RegistryResolver (the exact
-// type the daemon wires in cli.runDaemon, driven by the same store-backed
-// lookup closure) is asked to resolve and report reachability for that node.
+// authenticated /ready endpoint answers without any Docker daemon — is
+// started on loopback via httptest.NewServer, a node is registered in a real
+// store.Store with that server's URL as its agent_url, and a real
+// node.RegistryResolver (the exact type the daemon wires in cli.runDaemon,
+// driven by the same store-backed lookup closure) is asked to resolve and
+// report reachability for that node.
 //
 // This is deliberately NOT gated by LWD_DOCKER_TEST: it is the "at minimum"
 // case called out in the P9b spec — the resolver actually dials the real
-// agent's /healthz over real HTTP and prefers it over ssh (see
+// agent's authenticated /ready endpoint over real HTTP and prefers it over
+// ssh (see
 // RegistryResolver.buildTransport) — and it must stay part of the plain `go
 // test ./...` run. It never fakes the ssh_host as reachable: sshHost below is
 // a syntactically valid but never-dialed value, so if the resolver ever

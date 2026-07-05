@@ -30,6 +30,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET "+node.PathHealthz, s.handleHealthz)
+	mux.HandleFunc("GET "+node.PathReady, s.handleReady)
 
 	mux.HandleFunc("POST "+node.PathEnsureImage, s.handleEnsureImage)
 	mux.HandleFunc("POST "+node.PathImagePresent, s.handleImagePresent)
@@ -75,6 +76,18 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, err)
 		return
 	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleReady is a trivial authenticated liveness/readiness check: reaching
+// this handler at all means authMiddleware already accepted the caller's
+// bearer token (PathReady is the one path NOT exempted from auth), so a bare
+// 200 is sufficient — unlike handleHealthz, it does not consult s.node.
+// AgentNode.Ping uses this endpoint (with its token) rather than /healthz so
+// that transport selection (internal/node.RegistryResolver.buildTransport)
+// can distinguish "agent reachable with a working token" from "agent
+// reachable" and fall back to ssh on a bad token.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 

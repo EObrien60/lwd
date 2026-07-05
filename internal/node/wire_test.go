@@ -137,6 +137,7 @@ func TestRemainingTypesRoundTrip(t *testing.T) {
 func TestPathConstants(t *testing.T) {
 	paths := map[string]string{
 		PathHealthz:         "/healthz",
+		PathReady:           "/ready",
 		PathRun:             "/run",
 		PathRemove:          "/remove",
 		PathList:            "/list",

@@ -417,7 +417,11 @@ LWD_AGENT_TOKEN=changeme ./lwd-agent   # binds :8078 by default
   start without one. The controller sends this same token (its own
   `LWD_AGENT_TOKEN` env var, wired into `node.NewRegistryResolver`) as
   `Authorization: Bearer <token>` on every request except `/healthz`, which is
-  unauthenticated (used only for a liveness probe).
+  unauthenticated (used only for a liveness probe). The controller's
+  `LWD_AGENT_TOKEN` must match the agent's: if it is missing or wrong, the
+  agent's authenticated `/ready` readiness probe (used for transport
+  selection, see below) fails, the agent transport is treated as unavailable,
+  and lwd falls back to docker-over-ssh.
 - `LWD_AGENT_ADDR` (default `:8078`) — listen address. Bind this to the
   node's **WireGuard mesh interface** (e.g. `100.64.0.2:8078`), not a public
   one — `lwd-agent` has no TLS of its own; it relies entirely on the mesh for
@@ -432,16 +436,18 @@ lwd node add web1 deploy@web1.example.com 100.64.0.2 --agent http://100.64.0.2:8
 
 Once registered, every deploy targeting `node = "web1"` resolves its
 transport fresh: the daemon builds an agent client for the registered
-`agent_url` and pings its `/healthz`; if that succeeds, the entire deploy (
+`agent_url` and pings its authenticated `/ready` endpoint with the
+controller's `LWD_AGENT_TOKEN`; if that succeeds, the entire deploy (
 image presence, network setup, run/remove/health/logs, and the
 `docker save|load` image-transfer fallback) goes over the agent's HTTP API
-instead of ssh. If the agent doesn't answer (not registered, or temporarily
-down), lwd **falls back to docker-over-ssh automatically** — the exact P9a
-behavior — so registering a node without `--agent` (or with a currently
-unreachable one) keeps working exactly as before. This fallback is
+instead of ssh. If the agent doesn't answer — not registered, temporarily
+down, or answering with a missing/wrong token — lwd **falls back to
+docker-over-ssh automatically** — the exact P9a behavior — so registering a
+node without `--agent` (or with a currently unreachable one, or a
+misconfigured token) keeps working exactly as before. This fallback is
 re-evaluated on every resolve, not cached permanently, so a node's agent
-coming back up is picked up on the next deploy without restarting the
-daemon.
+coming back up (or its token being fixed) is picked up on the next deploy
+without restarting the daemon.
 
 ### Trust boundary
 
@@ -888,9 +894,9 @@ test ./...` (no Docker, no build tag) always runs
 `internal/agent.Server` (backed by a fake `node.Node`, so no Docker daemon is
 needed) on loopback via `httptest.NewServer`, registers it in a real
 `store.Store`, and asserts a real `node.RegistryResolver` — the exact type
-`cli.runDaemon` wires up — dials its `/healthz` over real HTTP and selects
-`"agent"` (via both `Reachable` and `ResolveMeta`) rather than falling back to
-ssh.
+`cli.runDaemon` wires up — dials its authenticated `/ready` endpoint over
+real HTTP and selects `"agent"` (via both `Reachable` and `ResolveMeta`)
+rather than falling back to ssh.
 
 All six Docker-gated tests clean up every container, network, node
 registration, and (for the git test) built image they create, and will

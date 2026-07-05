@@ -15,6 +15,7 @@ package node
 // HTTP path constants shared by the agent server and client.
 const (
 	PathHealthz         = "/healthz"
+	PathReady           = "/ready"
 	PathRun             = "/run"
 	PathRemove          = "/remove"
 	PathList            = "/list"

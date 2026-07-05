@@ -33,13 +33,20 @@ type AgentNode struct {
 
 // NewAgentNode returns an AgentNode that dials baseURL (trailing slash
 // trimmed) using token for bearer authentication.
+// NewAgentNode's client deliberately has no client-wide Timeout: that field
+// bounds an ENTIRE exchange, including streaming bodies, so it would abort
+// long-running SaveImage/LoadImage transfers (docker save|load'd
+// lwd-build/<app>:<sha> images with no registry) partway through. Every
+// method here instead governs its own lifetime via the caller's ctx
+// (http.NewRequestWithContext), matching the unbounded-by-default,
+// ctx-governed lifetime of the docker-over-ssh transport. The one exception
+// is Ping, which imposes its own short bound (see Ping) since it exists
+// purely as a fast reachability/readiness probe.
 func NewAgentNode(baseURL, token string) *AgentNode {
 	return &AgentNode{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		token:   token,
-		client: &http.Client{
-			Timeout: 60 * time.Second,
-		},
+		client:  &http.Client{},
 	}
 }
 
@@ -108,10 +115,25 @@ func decodeAgentError(resp *http.Response) error {
 	return &agentError{status: resp.StatusCode, msg: er.Error}
 }
 
-// Ping hits GET /healthz. No auth is required by the server, but sending the
-// bearer header is harmless since the server ignores auth on this path.
+// pingTimeout bounds how long Ping waits for the agent's authenticated
+// readiness probe (PathReady) to answer, regardless of ctx's own deadline —
+// Ping is used by transport selection (RegistryResolver.buildTransport, via
+// pingOK) as a fast "is this usable" check, not a long-running operation.
+const pingTimeout = 5 * time.Second
+
+// Ping hits GET /ready WITH the bearer token — unlike /healthz, /ready is not
+// exempt from authMiddleware, so a 200 here means both "the agent is up" and
+// "my token works". That is the contract node.Node.Ping needs for this
+// transport: RegistryResolver.buildTransport treats any Ping error —
+// including a 401 from a wrong/missing LWD_AGENT_TOKEN — as "agent
+// unavailable" and falls back to docker-over-ssh. /healthz remains served by
+// the agent, unauthenticated, purely for external liveness probes; AgentNode
+// itself no longer uses it.
 func (a *AgentNode) Ping(ctx context.Context) error {
-	req, err := a.newRequest(ctx, http.MethodGet, PathHealthz, nil)
+	ctx, cancel := context.WithTimeout(ctx, pingTimeout)
+	defer cancel()
+
+	req, err := a.newRequest(ctx, http.MethodGet, PathReady, nil)
 	if err != nil {
 		return err
 	}

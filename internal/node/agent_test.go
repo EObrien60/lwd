@@ -28,6 +28,12 @@ func newTestServer(t *testing.T, fake *node.Fake) (*node.AgentNode, *node.Fake) 
 	return node.NewAgentNode(srv.URL, testToken), fake
 }
 
+// TestAgentNode_Ping proves the happy path: Ping hits the authenticated
+// /ready endpoint with the correct token and succeeds. Ping no longer
+// consults the underlying node.Node at all (see handleReady), so unlike
+// pre-Finding-2 behavior, an underlying fake.PingErr has no bearing on
+// AgentNode.Ping — that's covered by TestHealthz_* in internal/agent, which
+// still exercises the node-backed /healthz liveness path.
 func TestAgentNode_Ping(t *testing.T) {
 	fake := node.NewFake()
 	an, _ := newTestServer(t, fake)
@@ -35,10 +41,23 @@ func TestAgentNode_Ping(t *testing.T) {
 	if err := an.Ping(context.Background()); err != nil {
 		t.Fatalf("Ping: %v", err)
 	}
+}
 
-	fake.PingErr = context.DeadlineExceeded
+// TestAgentNode_Ping_WrongToken is the core of Finding 2: because Ping now
+// probes the authenticated /ready endpoint (not the unauthenticated
+// /healthz), a wrong controller token makes Ping fail even though the agent
+// itself is perfectly healthy. This is exactly what RegistryResolver.
+// buildTransport needs: a Ping failure here makes it fall back to ssh
+// automatically instead of committing to an agent transport that will 401 on
+// every subsequent authed call.
+func TestAgentNode_Ping_WrongToken(t *testing.T) {
+	fake := node.NewFake()
+	srv := httptest.NewServer(agent.NewServer(fake, testToken).Handler())
+	t.Cleanup(srv.Close)
+
+	an := node.NewAgentNode(srv.URL, "wrong-token")
 	if err := an.Ping(context.Background()); err == nil {
-		t.Fatal("expected error when fake.PingErr set, got nil")
+		t.Fatal("expected error when token is wrong (readiness probe is now authenticated), got nil")
 	}
 }
 

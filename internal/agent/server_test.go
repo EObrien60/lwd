@@ -126,6 +126,26 @@ func TestHealthz_NoAuthRequired_UnhealthyReturns503(t *testing.T) {
 	}
 }
 
+// TestReady_RequiresAuth proves /ready (unlike /healthz) is NOT exempted by
+// authMiddleware: this is the server-side half of Finding 2 — a caller with
+// no/wrong token must be rejected here so AgentNode.Ping (which now probes
+// /ready with its bearer token) fails on a bad token instead of always
+// succeeding the way an unauthenticated /healthz-based Ping used to.
+func TestReady_RequiresAuth(t *testing.T) {
+	fake := node.NewFake()
+	h := newTestServer(fake)
+
+	if rec := doReq(t, h, http.MethodGet, node.PathReady, "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := doReq(t, h, http.MethodGet, node.PathReady, "wrong-token", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token: status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := doReq(t, h, http.MethodGet, node.PathReady, testToken, nil); rec.Code != http.StatusOK {
+		t.Fatalf("correct token: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestEnsureNetwork_Delegates(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
