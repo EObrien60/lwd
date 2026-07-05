@@ -389,16 +389,34 @@ func runNode(args []string) int {
 }
 
 func runNodeAdd(args []string) int {
-	if len(args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: lwd node add <name> <ssh-host> <mesh-addr>")
+	var positional []string
+	agentURL := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--agent" {
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "usage: lwd node add <name> <ssh-host> <mesh-addr> [--agent <url>]")
+				return 2
+			}
+			agentURL = args[i+1]
+			i++
+			continue
+		}
+		positional = append(positional, args[i])
+	}
+	if len(positional) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: lwd node add <name> <ssh-host> <mesh-addr> [--agent <url>]")
 		return 2
 	}
-	name, sshHost, meshAddr := args[0], args[1], args[2]
-	if err := newClient().AddNode(context.Background(), name, sshHost, meshAddr); err != nil {
+	name, sshHost, meshAddr := positional[0], positional[1], positional[2]
+	if err := newClient().AddNode(context.Background(), name, sshHost, meshAddr, agentURL); err != nil {
 		fmt.Fprintln(os.Stderr, "node add:", err)
 		return 1
 	}
-	fmt.Printf("added node %s (ssh %s, mesh %s)\n", name, sshHost, meshAddr)
+	if agentURL != "" {
+		fmt.Printf("added node %s (ssh %s, mesh %s, agent %s)\n", name, sshHost, meshAddr, agentURL)
+	} else {
+		fmt.Printf("added node %s (ssh %s, mesh %s)\n", name, sshHost, meshAddr)
+	}
 	return 0
 }
 
@@ -408,9 +426,13 @@ func runNodeLs() int {
 		fmt.Fprintln(os.Stderr, "node ls:", err)
 		return 1
 	}
-	fmt.Printf("%-20s %-30s %s\n", "NAME", "SSH_HOST", "MESH_ADDR")
+	fmt.Printf("%-20s %-30s %-15s %-30s %-10s %s\n", "NAME", "SSH", "MESH", "AGENT", "TRANSPORT", "REACHABLE")
 	for _, n := range nodes {
-		fmt.Printf("%-20s %-30s %s\n", n.Name, n.SSHHost, n.MeshAddr)
+		reachable := "no"
+		if n.Reachable {
+			reachable = "yes"
+		}
+		fmt.Printf("%-20s %-30s %-15s %-30s %-10s %s\n", n.Name, n.SSHHost, n.MeshAddr, n.AgentURL, n.Transport, reachable)
 	}
 	return 0
 }

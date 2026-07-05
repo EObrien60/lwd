@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,18 +25,44 @@ import (
 	"lwd/internal/store"
 )
 
-// fakeInvalidator is a NodeCacheInvalidator that records every name it was
-// asked to invalidate, so tests can assert POST/DELETE /nodes trigger the
-// resolver cache eviction without needing a real RegistryResolver.
+// fakeInvalidator is a NodeResolver that records every name it was asked to
+// invalidate, so tests can assert POST/DELETE /nodes trigger the resolver
+// cache eviction without needing a real RegistryResolver. Its Reachable is
+// configurable per-name (defaulting to ("ssh", true)) so tests can assert GET
+// /nodes surfaces both reachable and unreachable nodes.
 type fakeInvalidator struct {
-	mu    sync.Mutex
-	Calls []string
+	mu        sync.Mutex
+	Calls     []string
+	reachable map[string]reachResult
+}
+
+type reachResult struct {
+	transport string
+	ok        bool
 }
 
 func (f *fakeInvalidator) Invalidate(name string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Calls = append(f.Calls, name)
+}
+
+func (f *fakeInvalidator) Reachable(ctx context.Context, name string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r, ok := f.reachable[name]; ok {
+		return r.transport, r.ok
+	}
+	return "ssh", true
+}
+
+func (f *fakeInvalidator) setReachable(name, transport string, ok bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.reachable == nil {
+		f.reachable = make(map[string]reachResult)
+	}
+	f.reachable[name] = reachResult{transport, ok}
 }
 
 // testSecretResolver builds a real (but throwaway) secrets.Store for tests
@@ -678,5 +705,112 @@ func TestNodeAddValidatesMeshAddrShape(t *testing.T) {
 	inv.mu.Unlock()
 	if len(calls) != 2 || calls[0] != "web1" || calls[1] != "web2" {
 		t.Fatalf("invalidator calls = %+v, want [web1 web2] (only the two accepted adds)", calls)
+	}
+}
+
+// TestNodeAddPersistsAgentURL covers Phase 9b Task 6: POST /nodes accepts an
+// optional agent_url, and GET /nodes echoes it back.
+func TestNodeAddPersistsAgentURL(t *testing.T) {
+	ts, _ := newTestServerWithInvalidator(t)
+
+	body, _ := json.Marshal(map[string]string{
+		"name": "web1", "ssh_host": "deploy@web1", "mesh_addr": "100.64.0.2",
+		"agent_url": "http://100.64.0.2:8078",
+	})
+	resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /nodes: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+
+	resp, err = http.Get(ts.URL + "/nodes")
+	if err != nil {
+		t.Fatalf("GET /nodes: %v", err)
+	}
+	defer resp.Body.Close()
+	var nodes []struct {
+		store.Node
+		Transport string `json:"transport"`
+		Reachable bool   `json:"reachable"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].AgentURL != "http://100.64.0.2:8078" {
+		t.Fatalf("nodes = %+v, want agent_url http://100.64.0.2:8078", nodes)
+	}
+}
+
+// TestNodeAddValidatesAgentURL covers Phase 9b Task 6: an agent_url, when
+// present, must be a valid http/https URL with a host.
+func TestNodeAddValidatesAgentURL(t *testing.T) {
+	ts, _ := newTestServerWithInvalidator(t)
+
+	rejected := []string{"not a url", "ftp://x", "http://"}
+	for i, agentURL := range rejected {
+		body, _ := json.Marshal(map[string]string{
+			"name": fmt.Sprintf("web%d", i), "ssh_host": "deploy@webX", "mesh_addr": "100.64.0.2",
+			"agent_url": agentURL,
+		})
+		resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /nodes agent_url=%q: %v", agentURL, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("agent_url=%q: status = %d, want 400", agentURL, resp.StatusCode)
+		}
+	}
+}
+
+// TestNodeListIncludesReachability covers Phase 9b Task 6: GET /nodes reports
+// each node's transport and reachability, as decided by the resolver.
+func TestNodeListIncludesReachability(t *testing.T) {
+	ts, inv := newTestServerWithInvalidator(t)
+
+	for _, n := range []map[string]string{
+		{"name": "web1", "ssh_host": "deploy@web1", "mesh_addr": "100.64.0.2", "agent_url": "http://100.64.0.2:8078"},
+		{"name": "web2", "ssh_host": "deploy@web2", "mesh_addr": "100.64.0.3"},
+	} {
+		body, _ := json.Marshal(n)
+		resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /nodes: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	inv.setReachable("web1", "agent", true)
+	inv.setReachable("web2", "ssh", false)
+
+	resp, err := http.Get(ts.URL + "/nodes")
+	if err != nil {
+		t.Fatalf("GET /nodes: %v", err)
+	}
+	defer resp.Body.Close()
+	var nodes []struct {
+		store.Node
+		Transport string `json:"transport"`
+		Reachable bool   `json:"reachable"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	byName := map[string]struct {
+		store.Node
+		Transport string `json:"transport"`
+		Reachable bool   `json:"reachable"`
+	}{}
+	for _, n := range nodes {
+		byName[n.Name] = n
+	}
+	if got := byName["web1"]; got.Transport != "agent" || !got.Reachable {
+		t.Fatalf("web1 = %+v, want transport=agent reachable=true", got)
+	}
+	if got := byName["web2"]; got.Transport != "ssh" || got.Reachable {
+		t.Fatalf("web2 = %+v, want transport=ssh reachable=false", got)
 	}
 }
