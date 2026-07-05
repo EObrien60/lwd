@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,13 @@ import (
 // Local implements Node against the host's Docker daemon.
 type Local struct {
 	cli *client.Client
+	// remote is true when cli talks to a Docker daemon on a different host
+	// (docker-over-ssh, via NewRemoteSSH). Capacity uses this to decide
+	// between reading this process's own /proc (remote == false: the
+	// controller/agent's own host) and querying the docker daemon's Info
+	// (remote == true) — naively reading local /proc for a remote node
+	// would wrongly report the CONTROLLER's capacity.
+	remote bool
 }
 
 // NewLocal connects to the local Docker daemon using the environment.
@@ -29,14 +37,15 @@ func NewLocal() (*Local, error) {
 	if err != nil {
 		return nil, fmt.Errorf("docker client: %w", err)
 	}
-	return newLocalWithClient(cli), nil
+	return newLocalWithClient(cli, false), nil
 }
 
 // NewRemoteSSH connects to a Docker daemon on a remote host over SSH (the
 // Docker SDK's ssh connection helper; lwd manages no ssh credentials of its
 // own, relying on the host's ssh config/agent). The returned *Local behaves
 // identically to a locally-connected one — every method just talks to
-// whichever daemon its client is pointed at.
+// whichever daemon its client is pointed at — except Capacity, which knows
+// this node is remote and queries docker info instead of local /proc.
 func NewRemoteSSH(sshHost string) (*Local, error) {
 	cli, err := client.NewClientWithOpts(
 		client.WithHost("ssh://"+sshHost),
@@ -45,11 +54,11 @@ func NewRemoteSSH(sshHost string) (*Local, error) {
 	if err != nil {
 		return nil, fmt.Errorf("docker client (ssh://%s): %w", sshHost, err)
 	}
-	return newLocalWithClient(cli), nil
+	return newLocalWithClient(cli, true), nil
 }
 
-func newLocalWithClient(cli *client.Client) *Local {
-	return &Local{cli: cli}
+func newLocalWithClient(cli *client.Client, remote bool) *Local {
+	return &Local{cli: cli, remote: remote}
 }
 
 // Ping reports whether the Docker daemon is reachable.
@@ -398,6 +407,34 @@ func (l *Local) LoadImage(ctx context.Context, r io.Reader) error {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
+}
+
+// Capacity reports this node's resources. For the controller/agent's own
+// host (remote == false) it reads live /proc; on a non-Linux dev host (no
+// /proc) it degrades gracefully to Known: false rather than erroring, so the
+// daemon and tests never break on macOS. For a docker-over-ssh node
+// (remote == true) it queries the Docker daemon's Info instead of local
+// /proc — reading local /proc there would wrongly report the CONTROLLER's
+// capacity, not the remote node's. Live usage isn't available over the
+// Docker API, so only totals are set and Known is false.
+func (l *Local) Capacity(ctx context.Context) (Capacity, error) {
+	if !l.remote {
+		c, err := readProcCapacity()
+		if err != nil {
+			return Capacity{CPUCores: runtime.NumCPU(), Known: false}, nil
+		}
+		return c, nil
+	}
+	info, err := l.cli.Info(ctx)
+	if err != nil {
+		return Capacity{}, fmt.Errorf("docker info: %w", err)
+	}
+	return Capacity{
+		CPUCores:     info.NCPU,
+		MemTotal:     info.MemTotal,
+		MemAvailable: info.MemTotal,
+		Known:        false,
+	}, nil
 }
 
 // Compile-time assertion that Local implements Node.

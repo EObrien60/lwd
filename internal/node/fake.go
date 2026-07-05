@@ -74,6 +74,11 @@ type Fake struct {
 	// "starting" and later flips to "healthy" (or "unhealthy").
 	DockerHealthSeq  []string
 	dockerHealthCall int
+
+	// Cap is returned by Capacity, unless CapErr is set.
+	Cap Capacity
+	// CapErr, if set, is returned by Capacity instead of Cap.
+	CapErr error
 }
 
 // NewFake returns a ready-to-use Fake node.
@@ -282,6 +287,17 @@ func (f *Fake) LoadImage(ctx context.Context, r io.Reader) error {
 		f.Images[ref] = true
 	}
 	return nil
+}
+
+// Capacity records the call and returns Cap, or CapErr if set.
+func (f *Fake) Capacity(ctx context.Context) (Capacity, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("Capacity")
+	if f.CapErr != nil {
+		return Capacity{}, f.CapErr
+	}
+	return f.Cap, nil
 }
 
 func matches(have, want map[string]string) bool {

@@ -246,6 +246,13 @@ func (a *AgentNode) SaveImage(ctx context.Context, ref string) (io.ReadCloser, e
 	return resp.Body, nil
 }
 
+// Capacity is not yet implemented for AgentNode: Phase 11a Task 3 wires this
+// up to a real agent-side endpoint. This stub exists only so AgentNode keeps
+// satisfying the Node interface in the interim.
+func (a *AgentNode) Capacity(ctx context.Context) (Capacity, error) {
+	return Capacity{}, fmt.Errorf("AgentNode.Capacity not implemented (Task 3)")
+}
+
 // LoadImage POSTs the raw tar stream r to /load.
 func (a *AgentNode) LoadImage(ctx context.Context, r io.Reader) error {
 	req, err := a.newRequest(ctx, http.MethodPost, PathLoad, r)
