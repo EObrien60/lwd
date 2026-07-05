@@ -60,6 +60,17 @@ function statusKind(status) {
   return 'retired';
 }
 
+// healthKind maps a reconciler.SurfaceState value to the pill/dot class
+// suffix, the same way statusKind does for app status: it whitelists the
+// known values and falls back to 'retired' (the neutral/idle vocabulary) for
+// anything else, so an unrecognized state degrades gracefully to a plain
+// grey pill instead of emitting a `pill-<state>`/`dot-<state>` class that
+// matches no CSS rule at all.
+function healthKind(state) {
+  if (state === 'healthy' || state === 'degraded' || state === 'healing' || state === 'failed') return state;
+  return 'retired';
+}
+
 function timeAgo(iso) {
   if (!iso) return '—';
   const d = new Date(iso);
@@ -285,7 +296,7 @@ function dashboard() {
     theme: localStorage.getItem('lwd-theme') || '',
 
     // ---- routing ---------------------------------------------------------
-    view: 'overview', // 'overview' | 'detail' | 'nodes'
+    view: 'overview', // 'overview' | 'detail' | 'nodes' | 'health'
 
     // ---- overview ----------------------------------------------------
     apps: [],
@@ -340,6 +351,12 @@ function dashboard() {
     nodeAddBusy: false,
     nodeRemoveBusy: '',
 
+    // ---- health ------------------------------------------------------
+    health: null,
+    healthLoading: false,
+    healthError: '',
+    _healthPollHandle: null,
+
     // ---- danger zone ---------------------------------------------------
     deleteConfirm: false,
     deleteConfirmText: '',
@@ -359,7 +376,7 @@ function dashboard() {
       this.loadApps();
       this.loadNodes(); // populates the deploy modal's node <select> even before visiting the Nodes view
       this._pollHandle = setInterval(() => this.loadApps({ silent: true }), 5000);
-      window.addEventListener('beforeunload', () => this.stopLogs());
+      window.addEventListener('beforeunload', () => { this.stopLogs(); this.stopHealthPoll(); });
     },
 
     // ====================================================================
@@ -409,6 +426,7 @@ function dashboard() {
     },
 
     statusKind,
+    healthKind,
     shortImage,
     timeAgo,
     fullTime,
@@ -417,6 +435,7 @@ function dashboard() {
     // navigation
     // ====================================================================
     async openApp(name) {
+      this.stopHealthPoll();
       this.selected = name;
       this.view = 'detail';
       this.activeTab = 'logs';
@@ -429,6 +448,7 @@ function dashboard() {
 
     backToOverview() {
       this.stopLogs();
+      this.stopHealthPoll();
       this.view = 'overview';
       this.selected = null;
       this.detail = null;
@@ -439,6 +459,7 @@ function dashboard() {
 
     async openNodes() {
       this.stopLogs();
+      this.stopHealthPoll();
       this.view = 'nodes';
       await this.loadNodes();
     },
@@ -652,6 +673,46 @@ function dashboard() {
         this.notify('err', e.message || 'Failed to remove node.');
       } finally {
         this.nodeRemoveBusy = '';
+      }
+    },
+
+    // ====================================================================
+    // health (Phase 10 continuous reconciler snapshot)
+    // ====================================================================
+    async openHealth() {
+      this.stopLogs();
+      this.view = 'health';
+      await this.loadHealth();
+      // The reconciler's own loop runs on LWD_RECONCILE_INTERVAL (15s by
+      // default); polling a little faster than that keeps the panel feeling
+      // live without hammering the daemon between passes.
+      this.stopHealthPoll();
+      this._healthPollHandle = setInterval(() => this.loadHealth({ silent: true }), 5000);
+    },
+
+    stopHealthPoll() {
+      if (this._healthPollHandle) {
+        clearInterval(this._healthPollHandle);
+        this._healthPollHandle = null;
+      }
+    },
+
+    async loadHealth({ silent } = {}) {
+      if (!silent) {
+        this.healthLoading = true;
+        this.healthError = '';
+      }
+      try {
+        this.health = await apiFetch('/api/health');
+        this.healthError = '';
+      } catch (e) {
+        if (!silent) {
+          this.healthError = e.status === 502
+            ? 'Cannot reach the lwd daemon.'
+            : (e.message || 'Failed to load health.');
+        }
+      } finally {
+        this.healthLoading = false;
       }
     },
 

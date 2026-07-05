@@ -890,6 +890,51 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+// TestHealthEndpointEmptySnapshotNormalizesSlices covers the steady-state
+// case TestHealthEndpoint's happy path doesn't reach: a Health snapshot
+// before Reconcile has ever populated Nodes/Apps (or, per
+// reconciler.probeNodes' own doc comment, permanently for a daemon with no
+// Reachability configured / no image-or-git apps deployed) has both fields
+// nil, not empty. GET /health must still serve `"nodes":[]`/`"apps":[]`, not
+// `"nodes":null`/`"apps":null`, matching the non-nil-slice convention every
+// other list-shaped daemon endpoint (GET /apps, GET /nodes) already follows.
+func TestHealthEndpointEmptySnapshotNormalizesSlices(t *testing.T) {
+	f := node.NewFake()
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	rt := router.NewFakeRouter()
+	secStore := testSecretResolver(t, s, dir)
+	rec := reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
+	// Deliberately no SetReachability call and no deployed apps: the
+	// reconciler's zero-value Health has Nodes == nil and Apps == nil.
+	srv := New(rec, s, f, rt, secStore, nil)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if want := `"nodes":[]`; !strings.Contains(string(body), want) {
+		t.Errorf("body = %s, want it to contain %s", body, want)
+	}
+	if want := `"apps":[]`; !strings.Contains(string(body), want) {
+		t.Errorf("body = %s, want it to contain %s", body, want)
+	}
+}
+
 func TestNodeListIncludesReachability(t *testing.T) {
 	ts, inv := newTestServerWithInvalidator(t)
 

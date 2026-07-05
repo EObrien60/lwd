@@ -397,6 +397,20 @@ func (srv *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 // carries no secret values — just reachability booleans and heal
 // bookkeeping — so it's safe to expose read-only with no additional
 // filtering.
+//
+// Nodes/Apps are normalized to empty (rather than null) slices before
+// serializing — matching handleApps/handleNodeList's own non-nil-slice
+// convention — since both are legitimately nil in steady state (no
+// Reachability configured, or no image/git app deployed yet; see
+// reconciler.probeNodes and reconcileApp), not just during an initial
+// bootstrap race.
 func (srv *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, srv.rec.HealthSnapshot())
+	h := srv.rec.HealthSnapshot()
+	if h.Nodes == nil {
+		h.Nodes = []reconciler.NodeHealth{}
+	}
+	if h.Apps == nil {
+		h.Apps = []reconciler.AppHealth{}
+	}
+	writeJSON(w, http.StatusOK, h)
 }

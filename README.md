@@ -10,8 +10,9 @@ that replaces raw docker-over-ssh for a registered node).
 
 > This is the **router + blue-green + secrets + compose apps + web UI + git
 > deploy + backing services + multi-node federation + dumb node agent + node
-> UX** milestone (Phases 1–9b). A continuous reconciler (self-healing a
-> crashed remote surface) is next (see `docs/VISION.md`).
+> UX + continuous reconciler/self-heal** milestone (Phases 1–10). A scheduler
+> with capacity-aware placement and cross-node reschedule on node loss is
+> next (see `docs/VISION.md`).
 
 ## Build
 
@@ -392,8 +393,10 @@ tools take an optional `node` argument that does the same — see
   instead of the node the user asked for. Run a compose app on `local`, or
   reshape it as an `image`/`[git]` app with `[[services]]` if it needs to
   run on a remote node.
-- Node capacity/health reporting, continuous reconciliation (self-healing a
-  crashed remote surface), and a scheduler are later milestones (see
+- Node reachability is now continuously observed (see [Self-healing &
+  health](#self-healing--health)), and a dead surface is healed in place on
+  its existing node — but node capacity reporting, cross-node reschedule on
+  node loss, and a scheduler generally are later milestones (see
   `docs/VISION.md`'s roadmap) — placement is still apply-time only: declare
   `node = "..."`, `apply` deploys there once.
 
@@ -471,6 +474,71 @@ credential.
 `lwd_node_remove` tools manage the node registry (including `agent_url`) the
 same way the CLI's `lwd node` subcommands do — see
 [Web UI](#web-ui-lwd-web) and [Agent access](#agent-access-lwd-mcp).
+
+## Self-healing & health
+
+The daemon runs a **continuous reconciler loop** entirely off the request
+path: `lwd apply`/`lwd rollback` still return as soon as *their own* deploy
+finishes, and the loop runs in the background on its own schedule —
+`cli.runDaemon` starts it in a goroutine at daemon startup, with one pass
+immediately (so a freshly started daemon doesn't wait a full interval before
+its first check), then one pass on every tick of `LWD_RECONCILE_INTERVAL`
+(default `15s`), plus one extra, non-blocking pass nudged right after every
+successful `apply`/`rollback` (so a bad deploy gets a fast first look rather
+than waiting out the interval). Each pass recovers its own panics and logs
+its own errors — a bad reconcile never takes down the daemon.
+
+**What actually gets healed: single-service surfaces only** (`image` or
+`[git]`-built apps, with or without `[[services]]`) — the same population
+`lwd rollback` operates on. Each pass checks the current deployment's
+container; if it's gone/exited/otherwise dead, the reconciler heals it by
+running the exact blue-green flow `apply` itself uses (recreate — a git app's
+already-built image tag is reused, never rebuilt), then re-points the route
+and records a fresh deployment row, exactly as if you'd run `lwd rollback` or
+`redeploy` by hand. Repeated failures back off exponentially (15s, 30s, 1m,
+...) and give up after `LWD_HEAL_MAX_ATTEMPTS` consecutive attempts (default
+`5`), at which point the app is reported `failed` and left alone rather than
+retried forever.
+
+**What does *not* get healed:**
+
+- **`compose =` apps** — their container lifecycle belongs to `docker
+  compose`, not lwd's blue-green surface model; the reconciler doesn't
+  observe or touch them at all (no entry appears for them in the health
+  snapshot). Recover a broken compose stack with `lwd rollback`, same as
+  today.
+- **Node and edge reachability are observed, not acted on.** Every pass
+  probes every registered node (plus the implicit `local` one) and the
+  shared edge (Caddy)'s admin API, and records what it saw — but nothing is
+  rescheduled onto a different node if one goes away. Cross-node reschedule
+  on node loss is planned for a later milestone (see `docs/VISION.md`).
+
+**Checking on it:**
+
+```bash
+lwd health
+```
+
+```
+NODES
+NAME                 TRANSPORT  REACHABLE
+local                local      yes
+
+EDGE
+caddy reachable: yes
+
+APPS
+APP                  STATE      HEAL ATTEMPTS  LAST ERROR
+blog                 healthy    0
+```
+
+This reads the same snapshot the daemon exposes at `GET /health` (via
+`client.Health`, returning `nodes`/`edge`/`apps` — no secret values ever
+appear in it), which `lwd-web`'s **Health** panel (see [Web
+UI](#web-ui-lwd-web)) also renders live in the browser. `state` is one of
+`healthy`, `degraded` (observed unhealthy, not yet healing or waiting on
+backoff), `healing` (a heal attempt is in flight), or `failed` (gave up after
+`LWD_HEAL_MAX_ATTEMPTS`).
 
 ## Secrets
 
@@ -613,6 +681,13 @@ built-in TLS, so don't expose it directly to the internet. Instead:
   Git**/**Builder** tabs also gained a **Node** dropdown (populated from this
   same list, plus `local`) that adds the app's `node = "..."` line to the
   generated `lwd.toml`.
+- **Health** — a dedicated view (reachable from the header, alongside Fleet
+  and Nodes) rendering the [continuous reconciler's](#self-healing--health)
+  live snapshot from `GET /api/health`: every node's transport/reachability,
+  the shared edge (Caddy) reachability, and every self-healed app's state
+  (`healthy`/`degraded`/`healing`/`failed`) with its heal-attempt count and
+  last error, auto-refreshing every few seconds. Read-only, and carries no
+  secret values.
 
 As with the CLI, compose apps deployed or edited through the UI still need
 their compose file present on the daemon host, and a git-built app's repo
@@ -740,11 +815,13 @@ argument to pass.
   and `[git]`+`[build]` apps (with or without `[[services]]`). A `compose =`
   app can only be placed on `local` for now (validation rejects the
   combination). The single-node path (`node` unset or `"local"`) is fully
-  unchanged. Node capacity/health reporting, continuous reconciliation, and a
-  scheduler are later milestones.
+  unchanged. Node reachability is continuously observed and a dead surface is
+  healed in place (see the next bullet); node capacity reporting, cross-node
+  reschedule on node loss, and a scheduler generally are later milestones.
 - [`lwd-web`](#web-ui-lwd-web) (a separate dashboard binary) is fully live:
   overview, live logs, history/rollback, secrets, redeploy, config edit, a
-  **Nodes** view (list/add/remove, live transport + reachability), and a
+  **Nodes** view (list/add/remove, live transport + reachability), a
+  **Health** view (the continuous reconciler's live snapshot), and a
   Deploy modal with **From Git**, **Builder**, and **Paste** tabs (From Git
   and Builder support declaring backing services and picking a node), all as
   a thin client of the same daemon API the CLI uses. Deploying `lwd-web`
@@ -755,6 +832,14 @@ argument to pass.
   client of the same daemon API the CLI and `lwd-web` use — no daemon
   changes, no network listener, no secret value ever returned. Networked MCP
   transport is not built yet.
+- [Self-healing & health](#self-healing--health) — a continuous reconciler
+  loop, off the request path, self-heals dead single-service surfaces
+  (`image`/`[git]` apps) and observes (without acting on) node and edge
+  reachability, exposed via `lwd health`, `GET /health`, and `lwd-web`'s
+  **Health** panel — is fully live. `compose=` apps are not self-healed (see
+  [Known limitations](#known-limitations-this-milestone)). Cross-node
+  reschedule of a surface whose node has gone away, and node
+  capacity/scheduling generally, are later milestones (P11).
 
 ### Known limitations (this milestone)
 
@@ -902,6 +987,18 @@ needed) on loopback via `httptest.NewServer`, registers it in a real
 `cli.runDaemon` wires up — dials its authenticated `/ready` endpoint over
 real HTTP and selects `"agent"` (via both `Reachable` and `ResolveMeta`)
 rather than falling back to ssh.
+
+Neither does the **[self-heal](#self-healing--health) path**:
+`TestEndToEndSelfHeal` also always runs as part of `go test ./...`, entirely
+against fakes (`node.Fake`, `router.FakeRouter`, a real `store.Store`) — no
+Docker daemon anywhere. It builds the reconciler exactly as `cli.runDaemon`
+does, deploys an `image` app, kills its surface the way a real container
+death would be observed (removing it from the fake node so a
+`ContainerHealth` check reports it gone), calls `Reconcile` once, and asserts
+the same things an operator (or the web Health panel, or `lwd health`) would
+see: a brand-new running surface, the live route re-pointed at it, a fresh
+`running` deployment row, and the health snapshot reporting the app healthy
+again.
 
 All six Docker-gated tests clean up every container, network, node
 registration, and (for the git test) built image they create, and will
