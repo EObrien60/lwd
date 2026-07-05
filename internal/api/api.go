@@ -450,9 +450,15 @@ func (srv *Server) handleNodeUncordon(w http.ResponseWriter, r *http.Request) {
 // onto some other fitting node (see reconciler.EvacuateNode), without
 // changing the node's schedulable bit — a node can be evacuated (to drain it
 // for e.g. a one-off maintenance window) and remain eligible for new
-// placements, unlike drain which also cordons it first.
+// placements, unlike drain which also cordons it first. It shares
+// checkCordonTarget's local/unregistered-name guard with drain and uncordon:
+// the local node can't be evacuated (400) and an unknown node is a 404
+// rather than a silent no-op.
 func (srv *Server) handleNodeEvacuate(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	if !srv.checkCordonTarget(w, name) {
+		return
+	}
 	res, err := srv.rec.EvacuateNode(r.Context(), name)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)

@@ -1377,6 +1377,38 @@ func TestNodeEvacuate(t *testing.T) {
 	}
 }
 
+// TestNodeEvacuateLocalRejected covers the final-review nit for Phase 11b
+// Task 4: evacuate must share checkCordonTarget with drain/uncordon, so the
+// implicit local node can never be evacuated — 400, not a silent no-op.
+func TestNodeEvacuateLocalRejected(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	resp, err := http.Post(ts.URL+"/nodes/local/evacuate", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /nodes/local/evacuate: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestNodeEvacuateUnknown covers the final-review nit for Phase 11b Task 4:
+// evacuating a node that was never registered is a 404, not a silent no-op,
+// matching drain/uncordon.
+func TestNodeEvacuateUnknown(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	resp, err := http.Post(ts.URL+"/nodes/ghost/evacuate", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /nodes/ghost/evacuate: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
 // TestDrainLocalRejected covers Phase 11b Task 4: the implicit local node can
 // never be drained (or uncordoned) — 400, and no state changes.
 func TestDrainLocalRejected(t *testing.T) {

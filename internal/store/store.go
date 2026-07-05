@@ -606,12 +606,13 @@ func (s *Store) DeleteSecret(app, key string) error {
 	return nil
 }
 
-// AddNode upserts a node by name. An existing node with the same name will have its
-// ssh_host, mesh_addr, agent_url, and pool updated; created_at is preserved on update.
-// An empty Pool is normalized to DefaultPool before insert. A node is always
-// schedulable when (re-)added regardless of the passed-in Schedulable value —
-// cordoning is a deliberate follow-up action via SetSchedulable, not something
-// AddNode itself can leave a node in.
+// AddNode upserts a node by name. An empty Pool is normalized to DefaultPool
+// before insert. A newly-inserted node defaults to schedulable. Re-adding an
+// existing node (the ON CONFLICT upsert) updates ssh_host, mesh_addr,
+// agent_url, and pool, and preserves created_at — but it deliberately does
+// NOT touch schedulable, so re-adding a drained (cordoned) node PRESERVES its
+// cordon: `lwd node add` on a drained node does not silently return it to
+// rotation. Use `node uncordon` for that.
 func (s *Store) AddNode(n Node) error {
 	pool := n.Pool
 	if pool == "" {

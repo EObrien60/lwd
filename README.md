@@ -790,6 +790,19 @@ going dark.
   failover stays empty (of that surface) until you place something on it
   again — see the one-shot/no-rebalancing note in [Scheduling &
   pools](#scheduling--pools).
+- **Controller-partition case**: if the *controller* loses mesh connectivity
+  to its nodes (rather than a single node dying), every registered node
+  reads unreachable after `LWD_FAILOVER_GRACE`, and each one's scheduled
+  `default`-pool surfaces are evacuated onto the local node — bounded by
+  local capacity; surfaces that don't fit are left reported-degraded rather
+  than force-placed. This is the correct recovery for the realistic version
+  of this partition, since the controller also hosts Caddy and so can't
+  route to those remote surfaces either way. When the partition heals, the
+  original remote containers are orphaned on their nodes — their deployment
+  rows are already retired, so a future reconcile pass or `lwd node rm`
+  cleans them up; nothing removes them automatically today. Single
+  edge/controller is the current design; multi-edge is P13 (see
+  `docs/VISION.md`).
 
 `lwd-web`'s **Nodes** view exposes drain/evacuate/uncordon as buttons (per
 node, rendering the returned `EvacuateResult`) and a schedulable/cordoned
