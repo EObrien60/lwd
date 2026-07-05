@@ -35,6 +35,12 @@ type RunSpec struct {
 	// before exec'ing caddy, so the admin API binds correctly from the first
 	// instant the container runs (see router.EnsureUp).
 	Cmd []string
+	// CPUs is the CPU limit in cores (e.g. 0.5 = half a core); 0 means no
+	// limit. Applied to the container's HostConfig as NanoCPUs.
+	CPUs float64
+	// MemoryBytes is the memory limit in bytes; 0 means no limit. Applied to
+	// the container's HostConfig as Memory.
+	MemoryBytes int64
 }
 
 // Container describes a container known to a node.

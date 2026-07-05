@@ -127,6 +127,7 @@ func (l *Local) RunContainer(ctx context.Context, spec RunSpec) (Container, erro
 		cfg.Cmd = spec.Cmd
 	}
 	hostCfg := &container.HostConfig{}
+	applyResourceLimits(hostCfg, spec.CPUs, spec.MemoryBytes)
 	cfg.ExposedPorts = nat.PortSet{}
 	if spec.Port != 0 {
 		p := nat.Port(strconv.Itoa(spec.Port) + "/tcp")
@@ -221,6 +222,19 @@ func (l *Local) RunContainer(ctx context.Context, spec RunSpec) (Container, erro
 		HostPort: primaryHostPort,
 		IP:       ip,
 	}, nil
+}
+
+// applyResourceLimits sets HostConfig.Resources fields from cpus (cores) and
+// memBytes when positive, leaving Docker's defaults (no limit) untouched
+// otherwise. Split out as a pure helper so the CPU/memory-limit translation
+// is testable without a Docker daemon.
+func applyResourceLimits(hostCfg *container.HostConfig, cpus float64, memBytes int64) {
+	if cpus > 0 {
+		hostCfg.Resources.NanoCPUs = int64(cpus * 1e9)
+	}
+	if memBytes > 0 {
+		hostCfg.Resources.Memory = memBytes
+	}
 }
 
 // RemoveContainer stops (with a short timeout) and force-removes a container.
