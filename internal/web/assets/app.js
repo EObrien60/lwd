@@ -167,7 +167,14 @@ function specToToml(json) {
   kv('image', spec.Image);
   kv('domain', spec.Domain);
   if (spec.Port) lines.push(`port = ${spec.Port}`);
-  if (spec.Node && spec.Node !== 'local') kv('node', spec.Node);
+  // Preserve an explicit node pin — INCLUDING "local" — so the "Edit &
+  // apply" flow (openDeployEdit pre-fills the Paste textarea with this
+  // output, submitDeploy posts it verbatim) never silently drops a
+  // node = "local" line and thereby converts a local-pinned app into an
+  // unset/scheduled one under Phase 11a's new unset=schedule semantics. Only
+  // a genuinely empty/unset Node omits the line. Matches buildGitToml /
+  // buildBuilderToml.
+  if (spec.Node) kv('node', spec.Node);
   kv('pool', spec.Pool);
   if (spec.Compose) kv('compose', spec.Compose);
   if (spec.Service) kv('service', spec.Service);
