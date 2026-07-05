@@ -52,6 +52,12 @@ func newLocalWithClient(cli *client.Client) *Local {
 	return &Local{cli: cli}
 }
 
+// Ping reports whether the Docker daemon is reachable.
+func (l *Local) Ping(ctx context.Context) error {
+	_, err := l.cli.Ping(ctx)
+	return err
+}
+
 // EnsureImage makes the image available for RunContainer. Pinned digests
 // (@sha256:...) are immutable, so a present copy is used as-is. For mutable
 // refs (tags like :latest) it re-pulls so a moved tag is picked up; if the

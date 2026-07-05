@@ -10,6 +10,7 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"lwd/internal/api"
+	"lwd/internal/client"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -204,6 +205,7 @@ func deploymentOutput(d *store.Deployment) lwdDeploymentOutput {
 type lwdApplyInput struct {
 	Dir  string `json:"dir,omitempty" jsonschema:"local directory containing an lwd.toml to deploy (mutually exclusive with toml)"`
 	Toml string `json:"toml,omitempty" jsonschema:"inline lwd.toml document to deploy (mutually exclusive with dir)"`
+	Node string `json:"node,omitempty" jsonschema:"name of a registered node to place this app on (overrides the toml's own node field); omitted or \"local\" deploys to the controller"`
 }
 
 // registerLwdApply adds the lwd_apply tool: deploy an app from either a
@@ -232,6 +234,9 @@ func (s *Server) registerLwdApply(srv *sdk.Server) {
 		}
 		if err != nil {
 			return nil, lwdDeploymentOutput{}, err
+		}
+		if in.Node != "" {
+			app.Node = in.Node
 		}
 		if err := app.Validate(); err != nil {
 			return nil, lwdDeploymentOutput{}, err
@@ -265,6 +270,7 @@ type lwdDeployGitInput struct {
 	Domain     string                     `json:"domain" jsonschema:"the domain to route to this app"`
 	Port       int                        `json:"port" jsonschema:"the container port the app listens on"`
 	Services   []lwdDeployGitServiceInput `json:"services,omitempty" jsonschema:"optional backing services (e.g. a database) to deploy alongside the app"`
+	Node       string                     `json:"node,omitempty" jsonschema:"name of a registered node to place this app on; omitted or \"local\" deploys to the controller"`
 }
 
 const (
@@ -315,6 +321,9 @@ func (s *Server) registerLwdDeployGit(srv *sdk.Server) {
 				Dockerfile: dockerfile,
 			},
 			Services: services,
+		}
+		if in.Node != "" {
+			app.Node = in.Node
 		}
 		if err := app.Validate(); err != nil {
 			return nil, lwdDeploymentOutput{}, err
@@ -467,5 +476,85 @@ func (s *Server) registerLwdSecretDelete(srv *sdk.Server) {
 			return nil, lwdSecretDeleteOutput{}, err
 		}
 		return nil, lwdSecretDeleteOutput{OK: true, App: in.App, Key: in.Key}, nil
+	})
+}
+
+// lwdNodeListOutput is the structured result of lwd_node_list.
+type lwdNodeListOutput struct {
+	Nodes []client.NodeStatus `json:"nodes"`
+}
+
+// registerLwdNodeList adds the lwd_node_list tool: every registered node
+// (ssh host, mesh address, agent URL if any) plus its live transport and
+// reachability, as reported by the daemon.
+func (s *Server) registerLwdNodeList(srv *sdk.Server) {
+	readOnly := true
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_node_list",
+		Description: "List every registered node, its ssh host/mesh address/agent URL, and its live transport (agent/ssh) and reachability.",
+		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: readOnly},
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, _ any) (*sdk.CallToolResult, lwdNodeListOutput, error) {
+		nodes, err := s.client.Nodes(ctx)
+		if err != nil {
+			return nil, lwdNodeListOutput{}, err
+		}
+		return nil, lwdNodeListOutput{Nodes: nodes}, nil
+	})
+}
+
+// lwdNodeAddInput is the input of lwd_node_add.
+type lwdNodeAddInput struct {
+	Name     string `json:"name" jsonschema:"the node's name, used as the node= value in lwd.toml"`
+	SSHHost  string `json:"ssh_host" jsonschema:"anything ssh accepts for this node (user@host, or a ~/.ssh/config Host alias)"`
+	MeshAddr string `json:"mesh_addr" jsonschema:"the WireGuard mesh address the controller reaches this node's app traffic at"`
+	AgentURL string `json:"agent_url,omitempty" jsonschema:"base URL of this node's lwd-agent (e.g. http://<mesh-addr>:8078); omit if the node has no agent registered"`
+}
+
+// lwdNodeAddOutput is the structured result of lwd_node_add.
+type lwdNodeAddOutput struct {
+	OK   bool   `json:"ok"`
+	Name string `json:"name"`
+}
+
+// registerLwdNodeAdd adds the lwd_node_add tool: register (or update) a node
+// in the daemon's registry. This mutates live state, so the MCP host should
+// confirm with the user before invoking it.
+func (s *Server) registerLwdNodeAdd(srv *sdk.Server) {
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_node_add",
+		Description: "Register (or update) a node lwd can place apps on: name, ssh host, mesh address, and an optional lwd-agent URL.",
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdNodeAddInput) (*sdk.CallToolResult, lwdNodeAddOutput, error) {
+		if err := s.client.AddNode(ctx, in.Name, in.SSHHost, in.MeshAddr, in.AgentURL); err != nil {
+			return nil, lwdNodeAddOutput{}, err
+		}
+		return nil, lwdNodeAddOutput{OK: true, Name: in.Name}, nil
+	})
+}
+
+// lwdNodeRemoveInput is the input of lwd_node_remove.
+type lwdNodeRemoveInput struct {
+	Name string `json:"name" jsonschema:"the node's name"`
+}
+
+// lwdNodeRemoveOutput is the structured result of lwd_node_remove.
+type lwdNodeRemoveOutput struct {
+	Name    string `json:"name"`
+	Removed bool   `json:"removed"`
+}
+
+// registerLwdNodeRemove adds the lwd_node_remove tool: deregister a node.
+// Annotated destructiveHint, consistent with lwd_remove/lwd_secret_delete, so
+// the MCP host prompts for confirmation before calling it.
+func (s *Server) registerLwdNodeRemove(srv *sdk.Server) {
+	destructive := true
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_node_remove",
+		Description: "Deregister a node from lwd. Apps already placed on it are not moved or removed.",
+		Annotations: &sdk.ToolAnnotations{DestructiveHint: &destructive},
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdNodeRemoveInput) (*sdk.CallToolResult, lwdNodeRemoveOutput, error) {
+		if err := s.client.RemoveNode(ctx, in.Name); err != nil {
+			return nil, lwdNodeRemoveOutput{}, err
+		}
+		return nil, lwdNodeRemoveOutput{Name: in.Name, Removed: true}, nil
 	})
 }

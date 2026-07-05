@@ -30,6 +30,9 @@ type ClientIface interface {
 	SetSecret(ctx context.Context, app, key, value string) error
 	ListSecrets(ctx context.Context, app string) ([]string, error)
 	DeleteSecret(ctx context.Context, app, key string) error
+	Nodes(ctx context.Context) ([]client.NodeStatus, error)
+	AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL string) error
+	RemoveNode(ctx context.Context, name string) error
 }
 
 // The real daemon client must satisfy ClientIface. This assertion fails the
@@ -73,6 +76,9 @@ func (s *Server) registerTools(srv *sdk.Server) {
 	s.registerLwdSecretSet(srv)
 	s.registerLwdSecretList(srv)
 	s.registerLwdSecretDelete(srv)
+	s.registerLwdNodeList(srv)
+	s.registerLwdNodeAdd(srv)
+	s.registerLwdNodeRemove(srv)
 }
 
 // Serve runs the MCP server over stdio until the client disconnects or ctx

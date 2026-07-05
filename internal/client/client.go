@@ -211,9 +211,23 @@ func (c *Client) DeleteSecret(ctx context.Context, app, key string) error {
 	return nil
 }
 
-// AddNode registers (or updates) a node in the daemon's registry.
-func (c *Client) AddNode(ctx context.Context, name, sshHost, meshAddr string) error {
-	body, err := json.Marshal(map[string]string{"name": name, "ssh_host": sshHost, "mesh_addr": meshAddr})
+// NodeStatus is a registered node plus its live reachability, as reported by
+// the daemon's GET /nodes. It mirrors the api package's private
+// nodeStatusResponse — the HTTP round-trip between the two is covered by api
+// tests.
+type NodeStatus struct {
+	store.Node
+	Transport string `json:"transport"`
+	Reachable bool   `json:"reachable"`
+}
+
+// AddNode registers (or updates) a node in the daemon's registry. agentURL
+// may be empty (no lwd-agent registered for this node); if non-empty, the
+// daemon validates it is a well-formed http(s) URL.
+func (c *Client) AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL string) error {
+	body, err := json.Marshal(map[string]string{
+		"name": name, "ssh_host": sshHost, "mesh_addr": meshAddr, "agent_url": agentURL,
+	})
 	if err != nil {
 		return err
 	}
@@ -230,8 +244,8 @@ func (c *Client) AddNode(ctx context.Context, name, sshHost, meshAddr string) er
 	return nil
 }
 
-// Nodes lists all registered nodes.
-func (c *Client) Nodes(ctx context.Context) ([]store.Node, error) {
+// Nodes lists all registered nodes along with their live reachability.
+func (c *Client) Nodes(ctx context.Context) ([]NodeStatus, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/nodes"), nil)
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -241,7 +255,7 @@ func (c *Client) Nodes(ctx context.Context) ([]store.Node, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, decodeErr(resp)
 	}
-	var nodes []store.Node
+	var nodes []NodeStatus
 	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
 		return nil, err
 	}

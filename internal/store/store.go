@@ -41,6 +41,7 @@ type Node struct {
 	Name      string    `json:"name"`
 	SSHHost   string    `json:"ssh_host"`
 	MeshAddr  string    `json:"mesh_addr"`
+	AgentURL  string    `json:"agent_url"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -71,7 +72,8 @@ CREATE TABLE IF NOT EXISTS nodes (
 	name      TEXT    PRIMARY KEY,
 	ssh_host  TEXT    NOT NULL,
 	mesh_addr TEXT    NOT NULL,
-	created_at INTEGER NOT NULL
+	created_at INTEGER NOT NULL,
+	agent_url TEXT    NOT NULL DEFAULT ''
 );
 `
 
@@ -95,6 +97,10 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	if err := migrateAddComposeColumn(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	if err := migrateAddAgentURLColumn(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -191,6 +197,53 @@ func migrateAddComposeColumn(db *sql.DB) error {
 			return nil
 		}
 		return fmt.Errorf("add compose column: %w", err)
+	}
+	return nil
+}
+
+// migrateAddAgentURLColumn adds the "agent_url" column to a pre-Phase-9b nodes
+// table that predates it. Safe to call on every Open: it first checks
+// PRAGMA table_info for the column and only issues ALTER TABLE if missing,
+// and additionally tolerates a concurrent/duplicate "add column" error
+// (e.g. "duplicate column name: agent_url") so it never fails on a DB that
+// already has the column, including one created by the base schema above.
+func migrateAddAgentURLColumn(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(nodes)`)
+	if err != nil {
+		return fmt.Errorf("table_info: %w", err)
+	}
+	hasAgentURL := false
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			ctype     string
+			notnull   int
+			dfltValue any
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan table_info: %w", err)
+		}
+		if name == "agent_url" {
+			hasAgentURL = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("table_info rows: %w", err)
+	}
+	rows.Close()
+	if hasAgentURL {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE nodes ADD COLUMN agent_url TEXT NOT NULL DEFAULT ''`); err != nil {
+		// Tolerate a race/duplicate add: some other process (or a prior
+		// partial run) already added it between our check and this call.
+		if strings.Contains(err.Error(), "duplicate column name") {
+			return nil
+		}
+		return fmt.Errorf("add agent_url column: %w", err)
 	}
 	return nil
 }
@@ -380,12 +433,12 @@ func (s *Store) DeleteSecret(app, key string) error {
 }
 
 // AddNode upserts a node by name. An existing node with the same name will have its
-// ssh_host and mesh_addr updated; created_at is preserved on update.
+// ssh_host, mesh_addr, and agent_url updated; created_at is preserved on update.
 func (s *Store) AddNode(n Node) error {
 	_, err := s.db.Exec(
-		`INSERT INTO nodes (name, ssh_host, mesh_addr, created_at) VALUES (?, ?, ?, ?)
-		 ON CONFLICT(name) DO UPDATE SET ssh_host=excluded.ssh_host, mesh_addr=excluded.mesh_addr`,
-		n.Name, n.SSHHost, n.MeshAddr, n.CreatedAt.Unix(),
+		`INSERT INTO nodes (name, ssh_host, mesh_addr, created_at, agent_url) VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(name) DO UPDATE SET ssh_host=excluded.ssh_host, mesh_addr=excluded.mesh_addr, agent_url=excluded.agent_url`,
+		n.Name, n.SSHHost, n.MeshAddr, n.CreatedAt.Unix(), n.AgentURL,
 	)
 	if err != nil {
 		return fmt.Errorf("add node: %w", err)
@@ -395,10 +448,10 @@ func (s *Store) AddNode(n Node) error {
 
 // GetNode returns a node by name, or (nil, nil) if not found.
 func (s *Store) GetNode(name string) (*Node, error) {
-	row := s.db.QueryRow(`SELECT name, ssh_host, mesh_addr, created_at FROM nodes WHERE name = ?`, name)
+	row := s.db.QueryRow(`SELECT name, ssh_host, mesh_addr, created_at, agent_url FROM nodes WHERE name = ?`, name)
 	var n Node
 	var ts int64
-	switch err := row.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts); err {
+	switch err := row.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts, &n.AgentURL); err {
 	case nil:
 		n.CreatedAt = time.Unix(ts, 0)
 		return &n, nil
@@ -411,7 +464,7 @@ func (s *Store) GetNode(name string) (*Node, error) {
 
 // ListNodes returns all nodes sorted by name ascending.
 func (s *Store) ListNodes() ([]Node, error) {
-	rows, err := s.db.Query(`SELECT name, ssh_host, mesh_addr, created_at FROM nodes ORDER BY name ASC`)
+	rows, err := s.db.Query(`SELECT name, ssh_host, mesh_addr, created_at, agent_url FROM nodes ORDER BY name ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
@@ -420,7 +473,7 @@ func (s *Store) ListNodes() ([]Node, error) {
 	for rows.Next() {
 		var n Node
 		var ts int64
-		if err := rows.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts); err != nil {
+		if err := rows.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts, &n.AgentURL); err != nil {
 			return nil, fmt.Errorf("scan node: %w", err)
 		}
 		n.CreatedAt = time.Unix(ts, 0)

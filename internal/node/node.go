@@ -57,6 +57,9 @@ type HealthSpec struct {
 // Node is the set of operations lwd performs on a deployment target.
 // image refs are the only cross-node currency; a Node never assumes locality.
 type Node interface {
+	// Ping reports whether the node's backing Docker daemon is reachable.
+	// Used by lwd-agent's unauthenticated /healthz probe.
+	Ping(ctx context.Context) error
 	EnsureImage(ctx context.Context, imageRef string) error
 	// EnsureNetwork makes sure a private bridge network named name exists,
 	// creating it if absent. Idempotent.

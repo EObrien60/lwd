@@ -1,15 +1,16 @@
 package node
 
 import (
+	"context"
 	"fmt"
 	"testing"
 )
 
 func TestRegistryResolverLocalEmptyAndNamed(t *testing.T) {
 	local := NewFake()
-	rr := NewRegistryResolver(local, func(name string) (string, string, bool, error) {
+	rr := NewRegistryResolver(local, "", func(name string) (string, string, string, bool, error) {
 		t.Fatalf("lookup should not be called for a local node name, got %q", name)
-		return "", "", false, nil
+		return "", "", "", false, nil
 	})
 
 	for _, name := range []string{"", "local"} {
@@ -28,18 +29,23 @@ func TestRegistryResolverLocalEmptyAndNamed(t *testing.T) {
 		if n != local || meshAddr != "" || dockerHost != "" || !isLocal {
 			t.Errorf("ResolveMeta(%q) = (%v, %q, %q, %v), want (local, \"\", \"\", true)", name, n, meshAddr, dockerHost, isLocal)
 		}
+
+		transport, ok := rr.Reachable(context.Background(), name)
+		if transport != "local" || !ok {
+			t.Errorf("Reachable(%q) = (%q, %v), want (local, true)", name, transport, ok)
+		}
 	}
 }
 
 func TestRegistryResolverRemoteIsCached(t *testing.T) {
 	local := NewFake()
 	var calls int
-	rr := NewRegistryResolver(local, func(name string) (string, string, bool, error) {
+	rr := NewRegistryResolver(local, "", func(name string) (string, string, string, bool, error) {
 		calls++
 		if name != "web1" {
 			t.Fatalf("lookup called with unexpected name %q", name)
 		}
-		return "deploy@web1", "100.64.0.2", true, nil
+		return "deploy@web1", "100.64.0.2", "", true, nil
 	})
 
 	n1, meshAddr, dockerHost, isLocal, err := rr.ResolveMeta("web1")
@@ -91,9 +97,9 @@ func TestRegistryResolverInvalidate(t *testing.T) {
 	local := NewFake()
 	sshHost := "deploy@web1"
 	var calls int
-	rr := NewRegistryResolver(local, func(name string) (string, string, bool, error) {
+	rr := NewRegistryResolver(local, "", func(name string) (string, string, string, bool, error) {
 		calls++
-		return sshHost, "100.64.0.2", true, nil
+		return sshHost, "100.64.0.2", "", true, nil
 	})
 
 	n1, err := rr.Resolve("web1")
@@ -135,8 +141,8 @@ func TestRegistryResolverInvalidate(t *testing.T) {
 
 func TestRegistryResolverUnknownNode(t *testing.T) {
 	local := NewFake()
-	rr := NewRegistryResolver(local, func(name string) (string, string, bool, error) {
-		return "", "", false, nil
+	rr := NewRegistryResolver(local, "", func(name string) (string, string, string, bool, error) {
+		return "", "", "", false, nil
 	})
 	if _, err := rr.Resolve("ghost"); err == nil {
 		t.Fatal("want an error for an unregistered node name")
@@ -146,12 +152,204 @@ func TestRegistryResolverUnknownNode(t *testing.T) {
 func TestRegistryResolverLookupError(t *testing.T) {
 	local := NewFake()
 	wantErr := fmt.Errorf("store unavailable")
-	rr := NewRegistryResolver(local, func(name string) (string, string, bool, error) {
-		return "", "", false, wantErr
+	rr := NewRegistryResolver(local, "", func(name string) (string, string, string, bool, error) {
+		return "", "", "", false, wantErr
 	})
 	_, err := rr.Resolve("web1")
 	if err == nil {
 		t.Fatal("want the lookup error propagated")
+	}
+}
+
+// TestRegistryResolverAgentPreferredWhenReachable covers the P9b transport
+// choice: a registered node with an agent_url whose agent answers /healthz
+// gets an agent-transport Node, not the ssh one, and Reachable reports
+// "agent".
+func TestRegistryResolverAgentPreferredWhenReachable(t *testing.T) {
+	local := NewFake()
+	agentFake := NewFake()
+	sshFake := NewFake()
+
+	rr := NewRegistryResolver(local, "tok", func(name string) (string, string, string, bool, error) {
+		return "deploy@web1", "100.64.0.2", "http://100.64.0.2:8078", true, nil
+	})
+	rr.newAgent = func(baseURL, token string) Node {
+		if baseURL != "http://100.64.0.2:8078" || token != "tok" {
+			t.Errorf("newAgent called with (%q, %q), want (http://100.64.0.2:8078, tok)", baseURL, token)
+		}
+		return agentFake
+	}
+	rr.newSSH = func(sshHost string) (Node, error) {
+		t.Fatalf("newSSH should not be called when the agent is reachable, got sshHost=%q", sshHost)
+		return sshFake, nil
+	}
+
+	n, meshAddr, dockerHost, isLocal, err := rr.ResolveMeta("web1")
+	if err != nil {
+		t.Fatalf("ResolveMeta: %v", err)
+	}
+	if n != agentFake {
+		t.Errorf("ResolveMeta node = %v, want the agent fake", n)
+	}
+	if isLocal {
+		t.Error("want isLocal=false")
+	}
+	if meshAddr != "100.64.0.2" {
+		t.Errorf("meshAddr = %q, want 100.64.0.2 (unchanged by transport choice)", meshAddr)
+	}
+	if dockerHost != "ssh://deploy@web1" {
+		t.Errorf("dockerHost = %q, want ssh://deploy@web1 (unchanged by transport choice)", dockerHost)
+	}
+
+	transport, ok := rr.Reachable(context.Background(), "web1")
+	if transport != "agent" || !ok {
+		t.Errorf("Reachable = (%q, %v), want (agent, true)", transport, ok)
+	}
+}
+
+// TestRegistryResolverAgentUnreachableFallsBackToSSH covers the fallback: an
+// agent_url is set but the agent's Ping fails, so the ssh transport (P9a) is
+// used instead.
+func TestRegistryResolverAgentUnreachableFallsBackToSSH(t *testing.T) {
+	local := NewFake()
+	agentFake := NewFake()
+	agentFake.PingErr = fmt.Errorf("connection refused")
+	sshFake := NewFake()
+
+	rr := NewRegistryResolver(local, "tok", func(name string) (string, string, string, bool, error) {
+		return "deploy@web1", "100.64.0.2", "http://100.64.0.2:8078", true, nil
+	})
+	rr.newAgent = func(baseURL, token string) Node { return agentFake }
+	rr.newSSH = func(sshHost string) (Node, error) {
+		if sshHost != "deploy@web1" {
+			t.Errorf("newSSH called with sshHost=%q, want deploy@web1", sshHost)
+		}
+		return sshFake, nil
+	}
+
+	n, meshAddr, dockerHost, isLocal, err := rr.ResolveMeta("web1")
+	if err != nil {
+		t.Fatalf("ResolveMeta: %v", err)
+	}
+	if n != sshFake {
+		t.Errorf("ResolveMeta node = %v, want the ssh fake (fallback)", n)
+	}
+	if isLocal {
+		t.Error("want isLocal=false")
+	}
+	if meshAddr != "100.64.0.2" {
+		t.Errorf("meshAddr = %q, want 100.64.0.2", meshAddr)
+	}
+	if dockerHost != "ssh://deploy@web1" {
+		t.Errorf("dockerHost = %q, want ssh://deploy@web1", dockerHost)
+	}
+
+	transport, ok := rr.Reachable(context.Background(), "web1")
+	if transport != "ssh" || !ok {
+		t.Errorf("Reachable = (%q, %v), want (ssh, true)", transport, ok)
+	}
+}
+
+// TestRegistryResolverNoAgentURLUsesSSH covers the plain P9a case: no
+// agent_url registered at all, so ssh is used directly without ever
+// attempting to build/ping an agent.
+func TestRegistryResolverNoAgentURLUsesSSH(t *testing.T) {
+	local := NewFake()
+	sshFake := NewFake()
+
+	rr := NewRegistryResolver(local, "", func(name string) (string, string, string, bool, error) {
+		return "deploy@web1", "100.64.0.2", "", true, nil
+	})
+	rr.newAgent = func(baseURL, token string) Node {
+		t.Fatalf("newAgent should not be called when agent_url is empty")
+		return nil
+	}
+	rr.newSSH = func(sshHost string) (Node, error) { return sshFake, nil }
+
+	n, _, dockerHost, _, err := rr.ResolveMeta("web1")
+	if err != nil {
+		t.Fatalf("ResolveMeta: %v", err)
+	}
+	if n != sshFake {
+		t.Errorf("ResolveMeta node = %v, want the ssh fake", n)
+	}
+	if dockerHost != "ssh://deploy@web1" {
+		t.Errorf("dockerHost = %q, want ssh://deploy@web1", dockerHost)
+	}
+
+	transport, ok := rr.Reachable(context.Background(), "web1")
+	if transport != "ssh" || !ok {
+		t.Errorf("Reachable = (%q, %v), want (ssh, true)", transport, ok)
+	}
+}
+
+// TestRegistryResolverReachableUnknownNode covers Reachable's error path: an
+// unregistered name (or a lookup error) reports not-reachable with no
+// transport, and never panics.
+func TestRegistryResolverReachableUnknownNode(t *testing.T) {
+	local := NewFake()
+	rr := NewRegistryResolver(local, "", func(name string) (string, string, string, bool, error) {
+		return "", "", "", false, nil
+	})
+	transport, ok := rr.Reachable(context.Background(), "ghost")
+	if transport != "" || ok {
+		t.Errorf("Reachable(ghost) = (%q, %v), want (\"\", false)", transport, ok)
+	}
+}
+
+// TestRegistryResolverAgentPingIsBounded locks in that the agent /healthz
+// ping is always invoked with a context carrying a deadline — through both
+// ResolveMeta (via buildTransport) and Reachable (cold path and cached
+// path) — so no resolver path can ever hang on an unresponsive agent, even
+// when the caller passes context.Background().
+func TestRegistryResolverAgentPingIsBounded(t *testing.T) {
+	local := NewFake()
+	agentFake := NewFake()
+	var sawDeadline []bool
+	agentFake.PingFunc = func(ctx context.Context) error {
+		_, has := ctx.Deadline()
+		sawDeadline = append(sawDeadline, has)
+		return nil
+	}
+
+	rr := NewRegistryResolver(local, "tok", func(name string) (string, string, string, bool, error) {
+		return "deploy@web1", "100.64.0.2", "http://100.64.0.2:8078", true, nil
+	})
+	rr.newAgent = func(baseURL, token string) Node { return agentFake }
+	rr.newSSH = func(sshHost string) (Node, error) {
+		t.Fatalf("newSSH should not be called when the agent pings OK")
+		return nil, nil
+	}
+
+	// ResolveMeta selects the agent transport, pinging it once (bounded).
+	if _, _, _, _, err := rr.ResolveMeta("web1"); err != nil {
+		t.Fatalf("ResolveMeta: %v", err)
+	}
+	// Reachable on the now-cached entry pings again — with the raw
+	// context.Background() (no deadline of its own), which pingOK must still
+	// bound.
+	if transport, ok := rr.Reachable(context.Background(), "web1"); transport != "agent" || !ok {
+		t.Fatalf("Reachable (cached) = (%q, %v), want (agent, true)", transport, ok)
+	}
+
+	// Fresh resolver to exercise Reachable's COLD path (no cache) with a
+	// bare Background context.
+	rr2 := NewRegistryResolver(local, "tok", func(name string) (string, string, string, bool, error) {
+		return "deploy@web1", "100.64.0.2", "http://100.64.0.2:8078", true, nil
+	})
+	rr2.newAgent = func(baseURL, token string) Node { return agentFake }
+	rr2.newSSH = func(sshHost string) (Node, error) { return NewFake(), nil }
+	if transport, ok := rr2.Reachable(context.Background(), "web1"); transport != "agent" || !ok {
+		t.Fatalf("Reachable (cold) = (%q, %v), want (agent, true)", transport, ok)
+	}
+
+	if len(sawDeadline) == 0 {
+		t.Fatal("agent Ping was never invoked")
+	}
+	for i, has := range sawDeadline {
+		if !has {
+			t.Errorf("agent Ping call #%d had no context deadline; every resolver ping must be bounded", i)
+		}
 	}
 }
 

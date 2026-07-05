@@ -2,15 +2,16 @@
 
 A suckless, self-hosted deployment engine for Docker apps. Point it at an app,
 deploy with one command, get automatic HTTPS and zero-downtime rollouts for
-free. Single static Go binary that is both the daemon and the CLI, plus two
-optional client binaries: [`lwd-web`](#web-ui-lwd-web) (a browser dashboard)
-and [`lwd-mcp`](#agent-access-lwd-mcp) (an MCP server for coding agents).
+free. Single static Go binary that is both the daemon and the CLI, plus three
+optional client/worker binaries: [`lwd-web`](#web-ui-lwd-web) (a browser
+dashboard), [`lwd-mcp`](#agent-access-lwd-mcp) (an MCP server for coding
+agents), and [`lwd-agent`](#the-lwd-agent-transport) (a dumb per-node worker
+that replaces raw docker-over-ssh for a registered node).
 
 > This is the **router + blue-green + secrets + compose apps + web UI + git
-> deploy + backing services + agent access + multi-node federation**
-> milestone (Phases 1–9a). Continuous reconciliation, a scheduler, surface
-> replicas, and multi-edge routing arrive in later milestones (see
-> `docs/VISION.md`).
+> deploy + backing services + multi-node federation + dumb node agent + node
+> UX** milestone (Phases 1–9b). A continuous reconciler (self-healing a
+> crashed remote surface) is next (see `docs/VISION.md`).
 
 ## Build
 
@@ -302,6 +303,7 @@ Git](#deploy-from-git)'s use of the box's own git).
 
 ```bash
 lwd node add web1 deploy@web1.example.com 100.64.0.2
+lwd node add web1 deploy@web1.example.com 100.64.0.2 --agent http://100.64.0.2:8078
 lwd node ls
 lwd node rm web1
 ```
@@ -314,8 +316,17 @@ lwd node rm web1
   private, trusted network, not a public IP. Standing up the mesh itself
   (WireGuard keys/peers) is outside lwd's scope, same as ssh — bring your
   own.
+- `--agent <url>` is optional: the base URL of a running
+  [`lwd-agent`](#the-lwd-agent-transport) on that node (typically
+  `http://<mesh-addr>:8078`). If set, lwd prefers talking to that agent over
+  docker-over-ssh whenever it's reachable — see
+  [The lwd-agent transport](#the-lwd-agent-transport).
 - `local` is implicit and never appears in `lwd node ls`; registering a node
   named `local` is not meaningful and not supported.
+- `lwd node ls`, `lwd-web`'s **Nodes** view, and `lwd-mcp`'s `lwd_node_list`
+  tool all show each node's live **transport** (`agent`, `ssh`, or `local`)
+  and **reachability**, probed fresh on every call — see
+  [Web UI](#web-ui-lwd-web) and [Agent access](#agent-access-lwd-mcp).
 
 ### Place an app on a node
 
@@ -331,7 +342,11 @@ node   = "web1"
 
 Omitting `node` (or setting it to `"local"`) keeps the app on the
 controller — every existing single-node `lwd.toml` is unaffected by this
-feature.
+feature. `lwd-web`'s Deploy modal (both **From Git** and **Builder** tabs) has
+a **Node** dropdown, populated from the registry plus `local`, that adds the
+`node = "..."` line for you; `lwd-mcp`'s `lwd_apply` and `lwd_deploy_git`
+tools take an optional `node` argument that does the same — see
+[Web UI](#web-ui-lwd-web) and [Agent access](#agent-access-lwd-mcp).
 
 ### How a remote deploy works
 
@@ -344,21 +359,25 @@ feature.
    flowing through the controller); if that doesn't produce the image (e.g.
    a locally-built `lwd-build/<app>:<sha>` tag that was never pushed
    anywhere), lwd transfers it directly — `docker save` on the controller,
-   piped over the ssh connection into `docker load` on the target.
-3. The surface container runs on the target node's own Docker daemon,
-   reached via the Docker SDK's ssh connection helper (the same mechanism
-   `docker -H ssh://<ssh-host>` uses). A **local** surface publishes no host
-   port at all — Caddy reaches it by container name on the shared `lwd`
-   network, unchanged from single-node. A **remote** surface instead
-   publishes an ephemeral host port bound to the node's mesh address, and
-   the central Caddy's upstream for that route becomes
+   piped over the transport (agent or ssh) into `docker load` on the target.
+3. The surface container runs on the target node, reached over whichever
+   [transport](#the-lwd-agent-transport) is currently selected for it — a
+   registered `lwd-agent` if one is reachable, otherwise the Docker SDK's ssh
+   connection helper (the same mechanism `docker -H ssh://<ssh-host>` uses).
+   Either way the behavior is identical from here: a **local** surface
+   publishes no host port at all — Caddy reaches it by container name on the
+   shared `lwd` network, unchanged from single-node. A **remote** surface
+   instead publishes an ephemeral host port bound to the node's mesh address,
+   and the central Caddy's upstream for that route becomes
    `<mesh-addr>:<published-port>`. Blue-green staging, health-checking
    (through Caddy), and cutover all work exactly as described in [How
    deploys work](#how-deploys-work) — only the upstream address differs.
 4. A remote app's declared [`[[services]]`](#backing-services) are brought
    up with `docker compose` **targeting the node's own daemon**
    (`DOCKER_HOST=ssh://<ssh-host>` in the process env passed to the compose
-   CLI) — pinned alongside the surface on that node, not the controller.
+   CLI — backing services always go over ssh/`DOCKER_HOST`, independent of
+   which transport runs the surface container itself) — pinned alongside the
+   surface on that node, not the controller.
 
 ### What's remote-capable today
 
@@ -373,11 +392,85 @@ feature.
   instead of the node the user asked for. Run a compose app on `local`, or
   reshape it as an `image`/`[git]` app with `[[services]]` if it needs to
   run on a remote node.
-- A dumb `lwd-agent` transport (replacing raw docker-over-ssh), node
-  capacity/health reporting, continuous reconciliation (self-healing a
-  crashed remote surface), a scheduler, and web/MCP node UX are later
-  milestones (see `docs/VISION.md`'s roadmap) — this milestone is
-  placement-only: declare `node = "..."`, `apply` deploys there once.
+- Node capacity/health reporting, continuous reconciliation (self-healing a
+  crashed remote surface), and a scheduler are later milestones (see
+  `docs/VISION.md`'s roadmap) — placement is still apply-time only: declare
+  `node = "..."`, `apply` deploys there once.
+
+## The lwd-agent transport
+
+`lwd-agent` is a **fourth, optional binary**: a dumb per-node worker that
+replaces raw docker-over-ssh as the transport a registered node's containers
+run over. It performs **no orchestration of its own** — every request it gets
+is delegated straight through to a local `node.Node` (the same abstraction
+the controller uses for its own Docker daemon); all placement, scheduling,
+and blue-green logic still lives entirely on the controller.
+
+### Build and run
+
+```bash
+CGO_ENABLED=0 go build -o lwd-agent ./cmd/lwd-agent
+LWD_AGENT_TOKEN=changeme ./lwd-agent   # binds :8078 by default
+```
+
+- `LWD_AGENT_TOKEN` (required) — a shared bearer token; `lwd-agent` refuses to
+  start without one. The controller sends this same token (its own
+  `LWD_AGENT_TOKEN` env var, wired into `node.NewRegistryResolver`) as
+  `Authorization: Bearer <token>` on every request except `/healthz`, which is
+  unauthenticated (used only for an external liveness probe). The controller's
+  `LWD_AGENT_TOKEN` must match the agent's: if it is missing or wrong, the
+  agent's authenticated `/ready` readiness probe (used for transport
+  selection, see below) fails, the agent transport is treated as unavailable,
+  and lwd falls back to docker-over-ssh. `/ready` returns 200 only when the
+  request is authenticated **and** the agent's own Docker daemon is reachable,
+  so a node whose agent is up and authorized but whose Docker is down is also
+  treated as unavailable and likewise falls back to ssh.
+- `LWD_AGENT_ADDR` (default `:8078`) — listen address. Bind this to the
+  node's **WireGuard mesh interface** (e.g. `100.64.0.2:8078`), not a public
+  one — `lwd-agent` has no TLS of its own; it relies entirely on the mesh for
+  transport privacy, same as the plain-HTTP mesh traffic described in
+  [Networking model](#networking-model).
+
+### Registering and using it
+
+```bash
+lwd node add web1 deploy@web1.example.com 100.64.0.2 --agent http://100.64.0.2:8078
+```
+
+Once registered, every deploy targeting `node = "web1"` resolves its
+transport fresh: the daemon builds an agent client for the registered
+`agent_url` and pings its authenticated `/ready` endpoint with the
+controller's `LWD_AGENT_TOKEN`; that endpoint returns 200 only when the agent
+is up, the token is valid, **and** the agent's own Docker daemon is reachable.
+If it succeeds, the entire deploy (
+image presence, network setup, run/remove/health/logs, and the
+`docker save|load` image-transfer fallback) goes over the agent's HTTP API
+instead of ssh. If the agent doesn't answer — not registered, temporarily
+down, answering with a missing/wrong token, or up but with an unreachable
+Docker daemon — lwd **falls back to docker-over-ssh automatically** — the exact P9a behavior — so registering a
+node without `--agent` (or with a currently unreachable one, or a
+misconfigured token) keeps working exactly as before. This fallback is
+re-evaluated on every resolve, not cached permanently, so a node's agent
+coming back up (or its token being fixed) is picked up on the next deploy
+without restarting the daemon.
+
+### Trust boundary
+
+**A registered `lwd-agent`'s bearer token is effectively root on that node.**
+Its HTTP API exposes raw Docker primitives (run/remove any container, load
+arbitrary image tarballs, read any container's logs) with no per-app or
+per-namespace restriction — anyone who can reach `LWD_AGENT_ADDR` with a
+valid token can run anything on that machine, exactly as anyone with access
+to `ssh://<ssh-host>`'s Docker socket could in the P9a ssh transport. This is
+why `lwd-agent` must bind only the mesh interface (never a public one) and
+why the shared token must be treated like an ssh private key: keep it out of
+version control, rotate it if it leaks, and don't reuse it as any other
+credential.
+
+`lwd-web`'s **Nodes** view and `lwd-mcp`'s `lwd_node_list`/`lwd_node_add`/
+`lwd_node_remove` tools manage the node registry (including `agent_url`) the
+same way the CLI's `lwd node` subcommands do — see
+[Web UI](#web-ui-lwd-web) and [Agent access](#agent-access-lwd-mcp).
 
 ## Secrets
 
@@ -511,6 +604,15 @@ built-in TLS, so don't expose it directly to the internet. Instead:
 - **Redeploy** — re-apply an app's current deployment spec snapshot (e.g.
   after fixing something on the daemon host, or just to restart it).
 - **Config edit** — view and edit an app's `lwd.toml` and re-apply it.
+- **Nodes** — a dedicated view (reachable from the header, alongside the
+  Fleet overview) listing every registered [node](#multi-node-federation):
+  ssh host, mesh address, agent URL, live **transport** (`agent`/`ssh`), and
+  a **reachable/unreachable** indicator, probed fresh on every load; an
+  inline form to register a new node (name, ssh host, mesh address, optional
+  agent URL) and a **Remove** action per node. The Deploy modal's **From
+  Git**/**Builder** tabs also gained a **Node** dropdown (populated from this
+  same list, plus `local`) that adds the app's `node = "..."` line to the
+  generated `lwd.toml`.
 
 As with the CLI, compose apps deployed or edited through the UI still need
 their compose file present on the daemon host, and a git-built app's repo
@@ -521,7 +623,9 @@ UI end to end.
 
 ## Agent access (lwd-mcp)
 
-`lwd-mcp` is a **third, optional binary**: a local
+`lwd-mcp` is a **third, optional binary** (the fourth being
+[`lwd-agent`](#the-lwd-agent-transport), a node worker rather than a daemon
+client): a local
 [Model Context Protocol](https://modelcontextprotocol.io) server that lets a
 coding agent (Claude Code, or any other MCP host) drive lwd directly. Like
 `lwd-web`, it is just another client of the daemon's existing unix-socket
@@ -569,19 +673,23 @@ ever returned by any tool):
 | `lwd_status` | Get the current status and deployment history of a single app. |
 | `lwd_logs` | Get the most recent logs (`tail`-limited, default 200 lines) for an app. |
 | `lwd_history` | List recorded deployments (image, status, time) for an app. |
-| `lwd_apply` | Deploy an app from an `lwd.toml`, given inline (`toml`) or a local directory (`dir`). |
-| `lwd_deploy_git` | Deploy an app built from a git repo, from discrete fields (url/ref/dockerfile/name/domain/port/services), without hand-authoring an `lwd.toml`. |
+| `lwd_apply` | Deploy an app from an `lwd.toml`, given inline (`toml`) or a local directory (`dir`); an optional `node` argument places it on a registered node, overriding whatever the toml itself says. |
+| `lwd_deploy_git` | Deploy an app built from a git repo, from discrete fields (url/ref/dockerfile/name/domain/port/services), without hand-authoring an `lwd.toml`; also takes an optional `node` argument. |
 | `lwd_rollback` | Roll back an app to its previous deployment. |
 | `lwd_remove` | Permanently stop and remove an app. |
 | `lwd_secret_set` | Set (or overwrite) a secret value for an app. The value is never echoed back. |
 | `lwd_secret_list` | List the names of secrets set for an app — names only, never values. |
 | `lwd_secret_delete` | Delete a secret from an app. |
+| `lwd_node_list` | List every registered [node](#multi-node-federation): ssh host, mesh address, agent URL, and its live transport (`agent`/`ssh`) and reachability. |
+| `lwd_node_add` | Register (or update) a node: `name`, `ssh_host`, `mesh_addr`, and an optional `agent_url`. |
+| `lwd_node_remove` | Deregister a node. Apps already placed on it are not moved or removed. |
 
-`lwd_list`, `lwd_status`, `lwd_logs`, `lwd_history`, and `lwd_secret_list` are
-annotated `readOnlyHint: true`; `lwd_remove` and `lwd_secret_delete` are
-annotated `destructiveHint: true`. lwd-mcp itself asks nothing before calling
-the daemon — it relies entirely on **the MCP host's own per-call approval
-UI** (e.g. Claude Code's tool-permission prompt) to gate destructive and
+`lwd_list`, `lwd_status`, `lwd_logs`, `lwd_history`, `lwd_secret_list`, and
+`lwd_node_list` are annotated `readOnlyHint: true`; `lwd_remove`,
+`lwd_secret_delete`, and `lwd_node_remove` are annotated
+`destructiveHint: true`. lwd-mcp itself asks nothing before calling the
+daemon — it relies entirely on **the MCP host's own per-call approval UI**
+(e.g. Claude Code's tool-permission prompt) to gate destructive and
 state-changing tools before they run; there is no additional confirmation
 argument to pass.
 
@@ -625,26 +733,28 @@ argument to pass.
   shapes; the surfaces-outside-compose blue-green model discussed for the web
   tier of a compose app is deliberately not built (YAGNI for now).
 - **Multi-node (federation)** — `lwd node add/ls/rm`, `node = "..."`
-  placement, docker-over-ssh transport, and `docker save|load` image
-  movement (see [Multi-node](#multi-node-federation)) — is live for `image`
+  placement, a **dumb `lwd-agent` transport** preferred over docker-over-ssh
+  when reachable (automatic fallback to ssh otherwise), and `docker
+  save|load` image movement (see [Multi-node](#multi-node-federation) and
+  [The lwd-agent transport](#the-lwd-agent-transport)) — is live for `image`
   and `[git]`+`[build]` apps (with or without `[[services]]`). A `compose =`
   app can only be placed on `local` for now (validation rejects the
   combination). The single-node path (`node` unset or `"local"`) is fully
-  unchanged. A dumb `lwd-agent` transport, node capacity/health reporting,
-  continuous reconciliation, a scheduler, and web/MCP node UX are later
-  milestones.
+  unchanged. Node capacity/health reporting, continuous reconciliation, and a
+  scheduler are later milestones.
 - [`lwd-web`](#web-ui-lwd-web) (a separate dashboard binary) is fully live:
-  overview, live logs, history/rollback, secrets, redeploy, config edit, and
-  a Deploy modal with **From Git**, **Builder**, and **Paste** tabs (both
-  From Git and Builder support declaring backing services), all as a thin
-  client of the same daemon API the CLI uses. Deploying `lwd-web` itself as
-  an lwd-managed app and multi-user auth are not built yet.
+  overview, live logs, history/rollback, secrets, redeploy, config edit, a
+  **Nodes** view (list/add/remove, live transport + reachability), and a
+  Deploy modal with **From Git**, **Builder**, and **Paste** tabs (From Git
+  and Builder support declaring backing services and picking a node), all as
+  a thin client of the same daemon API the CLI uses. Deploying `lwd-web`
+  itself as an lwd-managed app and multi-user auth are not built yet.
 - [`lwd-mcp`](#agent-access-lwd-mcp) (a separate stdio MCP server binary) is
-  fully live: all eleven tools (list/status/logs/history/apply/deploy_git/
-  rollback/remove/secret set-list-delete), as a thin client of the same
-  daemon API the CLI and `lwd-web` use — no daemon changes, no network
-  listener, no secret value ever returned. Networked MCP transport and
-  multi-node targeting are not built yet.
+  fully live: all fourteen tools (list/status/logs/history/apply/deploy_git/
+  rollback/remove/secret set-list-delete/node list-add-remove), as a thin
+  client of the same daemon API the CLI and `lwd-web` use — no daemon
+  changes, no network listener, no secret value ever returned. Networked MCP
+  transport is not built yet.
 
 ### Known limitations (this milestone)
 
@@ -694,13 +804,15 @@ argument to pass.
 - **A `compose =` app cannot be placed on a remote node** — see [What's
   remote-capable today](#whats-remote-capable-today). Placement is also
   apply-time only: nothing yet detects a node going away and reschedules
-  what was running on it, reports node capacity/health, or exposes node
-  choice from `lwd-web`/`lwd-mcp` (CLI/API only for now) — all later
-  milestones per `docs/VISION.md`.
+  what was running on it, or reports node capacity/health — later milestones
+  per `docs/VISION.md`.
 - A remote surface's mesh-address traffic between the controller's Caddy and
   the node is **plain HTTP** — lwd relies on the mesh itself (e.g.
   WireGuard) for transport encryption between nodes; it adds none of its
-  own on top.
+  own on top. This is unchanged by the `lwd-agent` transport: its own
+  controller↔agent HTTP traffic is likewise unencrypted at the application
+  layer and relies entirely on the mesh — see
+  [The lwd-agent transport](#the-lwd-agent-transport)'s trust-boundary note.
 
 ## Testing
 
@@ -721,7 +833,7 @@ stack, drives `lwd-web`'s HTTP handler over real HTTP through a real
 tag): it starts the same kind of fake-backed daemon on a temp unix socket,
 builds a real `internal/client`, wires it into `mcp.NewServer`, and drives
 the real go-sdk MCP server over an in-memory transport — `tools/list`
-(asserting every one of the eleven tools is registered), then `lwd_list`
+(asserting every one of the fourteen tools is registered), then `lwd_list`
 (empty), `lwd_apply` with an inline `lwd.toml`, and `lwd_list` again to
 confirm the app appears — proving the agent tool call → `lwd-mcp` →
 `internal/client` → daemon chain end to end.
@@ -767,7 +879,30 @@ compose test also `redis`) — against real Docker:
   ssh://localhost version` must succeed); it probes for that first and
   `t.Skip`s with a clear message — it never fakes a pass — if unusable, which
   is the common case in a sandboxed/CI environment with no sshd running.
+- `TestEndToEndAgentNodeDeploy` exercises the [`lwd-agent`
+  transport](#the-lwd-agent-transport) end to end: it starts a real
+  `internal/agent.Server` (backed by a real `node.NewLocal()`) on loopback,
+  registers a node pointing at it, asserts the resolver actually selects the
+  `agent` transport (not ssh — the registered ssh host is deliberately left
+  undialable, so a silent fallback would fail the test rather than pass by
+  coincidence), and deploys `traefik/whoami` through it, asserting it's
+  reachable through Caddy. Because it stands in for a second machine with a
+  loopback address, it first probes whether a *sibling* container can reach a
+  host-published `127.0.0.1` port at all — some Docker setups (notably Docker
+  Desktop's Linux VM) restrict that to the host itself, a limitation a real
+  WireGuard mesh address would not have — and `t.Skip`s with a clear message,
+  rather than failing, if that probe itself fails.
 
-All five tests clean up every container, network, node registration, and (for
-the git test) built image they create, and will `t.Skip` (rather than fail)
-if ports 80/443 are already in use on the host.
+The **agent transport-selection path** doesn't need any of the above: `go
+test ./...` (no Docker, no build tag) always runs
+`TestEndToEndAgentTransportSelection`, which starts a real
+`internal/agent.Server` (backed by a fake `node.Node`, so no Docker daemon is
+needed) on loopback via `httptest.NewServer`, registers it in a real
+`store.Store`, and asserts a real `node.RegistryResolver` — the exact type
+`cli.runDaemon` wires up — dials its authenticated `/ready` endpoint over
+real HTTP and selects `"agent"` (via both `Reachable` and `ResolveMeta`)
+rather than falling back to ssh.
+
+All six Docker-gated tests clean up every container, network, node
+registration, and (for the git test) built image they create, and will
+`t.Skip` (rather than fail) if ports 80/443 are already in use on the host.

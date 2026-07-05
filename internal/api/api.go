@@ -3,12 +3,15 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"lwd/internal/node"
@@ -26,24 +29,30 @@ import (
 // never be dialed as a docker-over-ssh host.
 var hostnamePattern = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$`)
 
-// NodeCacheInvalidator lets the API evict a resolver's cached remote node
-// entry when a node's registry row changes — added, updated, or removed via
-// POST/DELETE /nodes — so a stale docker-over-ssh client never lingers past
-// the change. *node.RegistryResolver satisfies this in production; tests may
-// pass nil (checked before use) or a fake that records calls.
-type NodeCacheInvalidator interface {
+// NodeResolver lets the API evict a resolver's cached remote node entry when
+// a node's registry row changes — added, updated, or removed via POST/DELETE
+// /nodes — so a stale docker-over-ssh client never lingers past the change,
+// and lets it report a node's live reachability for GET /nodes.
+// *node.RegistryResolver satisfies this in production; tests may pass nil
+// (checked before use) or a fake that records calls.
+type NodeResolver interface {
 	Invalidate(name string)
+	// Reachable reports which transport would be used for name ("agent",
+	// "ssh", or "local") and whether that transport currently answers a
+	// ping. It never errors — an unknown name or a failed lookup reports
+	// ("", false).
+	Reachable(ctx context.Context, name string) (transport string, ok bool)
 }
 
 // Server wires HTTP routes to the reconciler, store, node, router, and
 // secrets store.
 type Server struct {
-	rec         *reconciler.Reconciler
-	store       *store.Store
-	node        node.Node
-	router      router.Router
-	secrets     *secrets.Store
-	invalidator NodeCacheInvalidator
+	rec      *reconciler.Reconciler
+	store    *store.Store
+	node     node.Node
+	router   router.Router
+	secrets  *secrets.Store
+	resolver NodeResolver
 }
 
 // AppStatus is the wire representation of an app's current state.
@@ -56,10 +65,12 @@ type AppStatus struct {
 }
 
 // New returns a Server. inv may be nil, in which case node registry changes
-// (POST/DELETE /nodes) skip cache invalidation — fine for tests that don't
-// exercise a resolver, but the daemon must pass its real RegistryResolver.
-func New(r *reconciler.Reconciler, s *store.Store, n node.Node, rt router.Router, sec *secrets.Store, inv NodeCacheInvalidator) *Server {
-	return &Server{rec: r, store: s, node: n, router: rt, secrets: sec, invalidator: inv}
+// (POST/DELETE /nodes) skip cache invalidation, and GET /nodes reports every
+// node's transport as "" and reachable as false (no ping) — fine for tests
+// that don't exercise a resolver, but the daemon must pass its real
+// RegistryResolver.
+func New(r *reconciler.Reconciler, s *store.Store, n node.Node, rt router.Router, sec *secrets.Store, inv NodeResolver) *Server {
+	return &Server{rec: r, store: s, node: n, router: rt, secrets: sec, resolver: inv}
 }
 
 // Handler returns the HTTP handler for all routes.
@@ -257,15 +268,26 @@ type nodeRequest struct {
 	Name     string `json:"name"`
 	SSHHost  string `json:"ssh_host"`
 	MeshAddr string `json:"mesh_addr"`
+	AgentURL string `json:"agent_url"`
+}
+
+// nodeStatusResponse is the wire shape for entries in the GET /nodes
+// response: a registered node plus its live reachability, as reported by the
+// Server's NodeResolver. It mirrors client.NodeStatus, which decodes it —
+// the round-trip between the two is covered by api tests.
+type nodeStatusResponse struct {
+	store.Node
+	Transport string `json:"transport"`
+	Reachable bool   `json:"reachable"`
 }
 
 // invalidateNode evicts the resolver's cached remote node for name, if the
-// Server was given an invalidator. Called after every registry mutation
+// Server was given a resolver. Called after every registry mutation
 // (add/update via POST, remove via DELETE) so a stale docker-over-ssh client
 // from before the change never lingers.
 func (srv *Server) invalidateNode(name string) {
-	if srv.invalidator != nil {
-		srv.invalidator.Invalidate(name)
+	if srv.resolver != nil {
+		srv.resolver.Invalidate(name)
 	}
 }
 
@@ -306,7 +328,14 @@ func (srv *Server) handleNodeAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("mesh_addr %q is not a valid IP address or hostname", req.MeshAddr))
 		return
 	}
-	n := store.Node{Name: req.Name, SSHHost: req.SSHHost, MeshAddr: req.MeshAddr, CreatedAt: time.Now()}
+	if req.AgentURL != "" {
+		u, err := url.Parse(req.AgentURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("agent_url %q is not a valid http(s) URL", req.AgentURL))
+			return
+		}
+	}
+	n := store.Node{Name: req.Name, SSHHost: req.SSHHost, MeshAddr: req.MeshAddr, AgentURL: req.AgentURL, CreatedAt: time.Now()}
 	if err := srv.store.AddNode(n); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -319,13 +348,36 @@ func (srv *Server) handleNodeAdd(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleNodeList lists registered nodes along with each one's live
+// reachability. Reachability is probed in parallel, one goroutine per node,
+// so an N-node list never serializes N pings (each bounded to a few seconds
+// by the resolver) into an N*ping-timeout response. If the Server has no
+// resolver (nil — test servers that don't exercise one), every node reports
+// transport "" and reachable false without any ping.
 func (srv *Server) handleNodeList(w http.ResponseWriter, r *http.Request) {
 	nodes, err := srv.store.ListNodes()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, nodes)
+	out := make([]nodeStatusResponse, len(nodes))
+	for i, n := range nodes {
+		out[i] = nodeStatusResponse{Node: n}
+	}
+	if srv.resolver != nil {
+		var wg sync.WaitGroup
+		for i, n := range nodes {
+			wg.Add(1)
+			go func(i int, name string) {
+				defer wg.Done()
+				transport, ok := srv.resolver.Reachable(r.Context(), name)
+				out[i].Transport = transport
+				out[i].Reachable = ok
+			}(i, n.Name)
+		}
+		wg.Wait()
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (srv *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {

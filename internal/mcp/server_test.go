@@ -13,6 +13,7 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"lwd/internal/api"
+	"lwd/internal/client"
 	"lwd/internal/store"
 )
 
@@ -635,5 +636,149 @@ func TestToolSecretDelete(t *testing.T) {
 	delRes = callTool(t, cs, "lwd_secret_delete", map[string]any{"app": "web", "key": "DB_PASSWORD"})
 	if !delRes.IsError {
 		t.Errorf("lwd_secret_delete should surface a daemon error as a tool error, got %+v", delRes)
+	}
+}
+
+func TestToolNodeList(t *testing.T) {
+	fc := newFakeClient()
+	fc.nodes = []client.NodeStatus{
+		{Node: store.Node{Name: "web1", SSHHost: "deploy@web1.example.com", MeshAddr: "100.64.0.2", AgentURL: "http://100.64.0.2:8078"}, Transport: "agent", Reachable: true},
+		{Node: store.Node{Name: "web2", SSHHost: "deploy@web2.example.com", MeshAddr: "100.64.0.3"}, Transport: "ssh", Reachable: false},
+	}
+	cs := connectTestServer(t, fc)
+
+	lr, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	tool := findTool(lr.Tools, "lwd_node_list")
+	if tool == nil {
+		t.Fatalf("lwd_node_list tool not registered; got %+v", lr.Tools)
+	}
+	if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint {
+		t.Errorf("lwd_node_list should be annotated readOnlyHint=true, got %+v", tool.Annotations)
+	}
+
+	res := callTool(t, cs, "lwd_node_list", map[string]any{})
+	if res.IsError {
+		t.Fatalf("lwd_node_list returned tool error: %+v", res.Content)
+	}
+	var out lwdNodeListOutput
+	decodeStructured(t, res, &out)
+	if len(out.Nodes) != 2 {
+		t.Fatalf("expected 2 nodes, got %d: %+v", len(out.Nodes), out.Nodes)
+	}
+	if out.Nodes[0].Name != "web1" || out.Nodes[0].Transport != "agent" || !out.Nodes[0].Reachable {
+		t.Errorf("unexpected node[0]: %+v", out.Nodes[0])
+	}
+	if out.Nodes[1].Name != "web2" || out.Nodes[1].Transport != "ssh" || out.Nodes[1].Reachable {
+		t.Errorf("unexpected node[1]: %+v", out.Nodes[1])
+	}
+}
+
+func TestToolNodeAdd(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	lr, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	if tool := findTool(lr.Tools, "lwd_node_add"); tool == nil {
+		t.Fatalf("lwd_node_add tool not registered; got %+v", lr.Tools)
+	}
+
+	res := callTool(t, cs, "lwd_node_add", map[string]any{
+		"name": "web1", "ssh_host": "deploy@web1.example.com", "mesh_addr": "100.64.0.2", "agent_url": "http://100.64.0.2:8078",
+	})
+	if res.IsError {
+		t.Fatalf("lwd_node_add returned tool error: %+v", res.Content)
+	}
+	if len(fc.addedNodes) != 1 {
+		t.Fatalf("expected AddNode called once, got %d", len(fc.addedNodes))
+	}
+	got := fc.addedNodes[0]
+	if got.Name != "web1" || got.SSHHost != "deploy@web1.example.com" || got.MeshAddr != "100.64.0.2" || got.AgentURL != "http://100.64.0.2:8078" {
+		t.Errorf("unexpected AddNode call: %+v", got)
+	}
+
+	// agent_url is optional.
+	res = callTool(t, cs, "lwd_node_add", map[string]any{"name": "web2", "ssh_host": "deploy@web2.example.com", "mesh_addr": "100.64.0.3"})
+	if res.IsError {
+		t.Fatalf("lwd_node_add (no agent_url) returned tool error: %+v", res.Content)
+	}
+	if len(fc.addedNodes) != 2 || fc.addedNodes[1].AgentURL != "" {
+		t.Fatalf("expected second AddNode with empty agent_url, got %+v", fc.addedNodes)
+	}
+
+	fc.addNodeErr = fmt.Errorf("add failed")
+	res = callTool(t, cs, "lwd_node_add", map[string]any{"name": "web3", "ssh_host": "h", "mesh_addr": "m"})
+	if !res.IsError {
+		t.Errorf("lwd_node_add should surface a daemon error as a tool error, got %+v", res)
+	}
+}
+
+func TestToolNodeRemove(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	lr, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	tool := findTool(lr.Tools, "lwd_node_remove")
+	if tool == nil {
+		t.Fatalf("lwd_node_remove tool not registered; got %+v", lr.Tools)
+	}
+	if tool.Annotations == nil || tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint {
+		t.Errorf("lwd_node_remove should be annotated destructiveHint=true, got %+v", tool.Annotations)
+	}
+
+	res := callTool(t, cs, "lwd_node_remove", map[string]any{"name": "web1"})
+	if res.IsError {
+		t.Fatalf("lwd_node_remove returned tool error: %+v", res.Content)
+	}
+	if len(fc.removedNodes) != 1 || fc.removedNodes[0] != "web1" {
+		t.Fatalf("expected RemoveNode called with \"web1\", got %+v", fc.removedNodes)
+	}
+
+	fc.removeNodeErr = fmt.Errorf("remove failed")
+	res = callTool(t, cs, "lwd_node_remove", map[string]any{"name": "web1"})
+	if !res.IsError {
+		t.Errorf("lwd_node_remove should surface a daemon error as a tool error, got %+v", res)
+	}
+}
+
+func TestToolApplyWithNode(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	res := callTool(t, cs, "lwd_apply", map[string]any{"toml": validSingleServiceToml, "node": "web1"})
+	if res.IsError {
+		t.Fatalf("lwd_apply(node) returned tool error: %+v", res.Content)
+	}
+	if len(fc.applied) != 1 {
+		t.Fatalf("expected Apply called once, got %d", len(fc.applied))
+	}
+	if fc.applied[0].Node != "web1" {
+		t.Errorf("expected applied App.Node = %q, got %q", "web1", fc.applied[0].Node)
+	}
+}
+
+func TestToolDeployGitWithNode(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	res := callTool(t, cs, "lwd_deploy_git", map[string]any{
+		"url": "https://github.com/example/app.git", "name": "app", "domain": "app.example.com", "port": 3000, "node": "web1",
+	})
+	if res.IsError {
+		t.Fatalf("lwd_deploy_git(node) returned tool error: %+v", res.Content)
+	}
+	if len(fc.applied) != 1 {
+		t.Fatalf("expected Apply called once, got %d", len(fc.applied))
+	}
+	if fc.applied[0].Node != "web1" {
+		t.Errorf("expected applied App.Node = %q, got %q", "web1", fc.applied[0].Node)
 	}
 }

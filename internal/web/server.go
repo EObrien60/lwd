@@ -28,6 +28,9 @@ type DaemonClient interface {
 	SetSecret(ctx context.Context, app, key, value string) error
 	ListSecrets(ctx context.Context, app string) ([]string, error)
 	DeleteSecret(ctx context.Context, app, key string) error
+	Nodes(ctx context.Context) ([]client.NodeStatus, error)
+	AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL string) error
+	RemoveNode(ctx context.Context, name string) error
 }
 
 // The real daemon client must satisfy DaemonClient. This assertion fails the
@@ -67,6 +70,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/apps/{name}/secrets", s.handleSecretSet)
 	mux.HandleFunc("DELETE /api/apps/{name}/secrets/{key}", s.handleSecretDelete)
 	mux.HandleFunc("GET /api/apps/{name}/logs", s.handleLogs)
+
+	mux.HandleFunc("GET /api/nodes", s.handleNodes)
+	mux.HandleFunc("POST /api/nodes", s.handleNodeAdd)
+	mux.HandleFunc("DELETE /api/nodes/{name}", s.handleNodeRemove)
 
 	// Embedded static assets (placeholder UI; Task 5 replaces the contents
 	// of internal/web/assets/ with the crafted design). "/", "/login", and

@@ -226,6 +226,7 @@ function buildGitToml(f) {
   lines.push(`name = ${tomlString((f.name || '').trim())}`);
   lines.push(`domain = ${tomlString((f.domain || '').trim())}`);
   if (String(f.port || '').trim()) lines.push(`port = ${parseInt(f.port, 10)}`);
+  if (f.node && f.node !== 'local') lines.push(`node = ${tomlString(f.node)}`);
   const env = envRowsToInline(f.env);
   if (env) lines.push(`env = ${env}`);
   const secrets = namesToArray(f.secrets);
@@ -256,6 +257,7 @@ function buildBuilderToml(f) {
   lines.push(`image = ${tomlString((f.image || '').trim())}`);
   lines.push(`domain = ${tomlString((f.domain || '').trim())}`);
   if (String(f.port || '').trim()) lines.push(`port = ${parseInt(f.port, 10)}`);
+  if (f.node && f.node !== 'local') lines.push(`node = ${tomlString(f.node)}`);
   const env = envRowsToInline(f.env);
   if (env) lines.push(`env = ${env}`);
   const secrets = namesToArray(f.secrets);
@@ -283,7 +285,7 @@ function dashboard() {
     theme: localStorage.getItem('lwd-theme') || '',
 
     // ---- routing ---------------------------------------------------------
-    view: 'overview', // 'overview' | 'detail'
+    view: 'overview', // 'overview' | 'detail' | 'nodes'
 
     // ---- overview ----------------------------------------------------
     apps: [],
@@ -330,6 +332,14 @@ function dashboard() {
       builder: null,
     },
 
+    // ---- nodes -----------------------------------------------------------
+    nodes: [],
+    nodesLoading: false,
+    nodesError: '',
+    newNode: { name: '', sshHost: '', meshAddr: '', agentUrl: '' },
+    nodeAddBusy: false,
+    nodeRemoveBusy: '',
+
     // ---- danger zone ---------------------------------------------------
     deleteConfirm: false,
     deleteConfirmText: '',
@@ -347,6 +357,7 @@ function dashboard() {
     init() {
       this.applyTheme();
       this.loadApps();
+      this.loadNodes(); // populates the deploy modal's node <select> even before visiting the Nodes view
       this._pollHandle = setInterval(() => this.loadApps({ silent: true }), 5000);
       window.addEventListener('beforeunload', () => this.stopLogs());
     },
@@ -424,6 +435,12 @@ function dashboard() {
       this.deleteConfirm = false;
       this.deleteConfirmText = '';
       this.loadApps({ silent: true });
+    },
+
+    async openNodes() {
+      this.stopLogs();
+      this.view = 'nodes';
+      await this.loadNodes();
     },
 
     async setTab(tab) {
@@ -583,6 +600,62 @@ function dashboard() {
     },
 
     // ====================================================================
+    // nodes
+    // ====================================================================
+    async loadNodes() {
+      this.nodesLoading = true;
+      this.nodesError = '';
+      try {
+        this.nodes = await apiFetch('/api/nodes') || [];
+      } catch (e) {
+        this.nodesError = e.message || 'Failed to load nodes.';
+      } finally {
+        this.nodesLoading = false;
+      }
+    },
+
+    newNodeForm() {
+      return { name: '', sshHost: '', meshAddr: '', agentUrl: '' };
+    },
+
+    async addNode() {
+      const name = this.newNode.name.trim();
+      const sshHost = this.newNode.sshHost.trim();
+      const meshAddr = this.newNode.meshAddr.trim();
+      if (!name || !sshHost || !meshAddr) return;
+      this.nodeAddBusy = true;
+      this.nodesError = '';
+      try {
+        await apiFetch('/api/nodes', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, ssh_host: sshHost, mesh_addr: meshAddr, agent_url: this.newNode.agentUrl.trim() }),
+        });
+        this.notify('ok', `Node "${name}" added.`);
+        this.newNode = this.newNodeForm();
+        await this.loadNodes();
+      } catch (e) {
+        this.nodesError = e.message || 'Failed to add node.';
+      } finally {
+        this.nodeAddBusy = false;
+      }
+    },
+
+    async removeNode(name) {
+      if (!confirm(`Remove node "${name}"? Apps already placed on it are not moved or removed.`)) return;
+      this.nodeRemoveBusy = name;
+      try {
+        await apiFetch(`/api/nodes/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        this.notify('ok', `Node "${name}" removed.`);
+        await this.loadNodes();
+      } catch (e) {
+        this.notify('err', e.message || 'Failed to remove node.');
+      } finally {
+        this.nodeRemoveBusy = '';
+      }
+    },
+
+    // ====================================================================
     // danger zone
     // ====================================================================
     async deleteApp() {
@@ -614,7 +687,7 @@ function dashboard() {
     newGitForm() {
       return {
         url: '', ref: 'main', subdir: '', dockerfile: 'Dockerfile',
-        name: '', domain: '', port: '',
+        name: '', domain: '', port: '', node: 'local',
         env: [], secrets: [], services: [],
       };
     },
@@ -622,7 +695,7 @@ function dashboard() {
     newBuilderForm() {
       return {
         image: '',
-        name: '', domain: '', port: '',
+        name: '', domain: '', port: '', node: 'local',
         env: [], secrets: [], services: [],
       };
     },
@@ -632,6 +705,7 @@ function dashboard() {
         open: true, mode: 'create', tab: 'git', toml: '', error: '', busy: false,
         git: this.newGitForm(), builder: this.newBuilderForm(),
       };
+      this.loadNodes(); // refresh the node <select> options in case one was just registered
     },
 
     openDeployEdit() {

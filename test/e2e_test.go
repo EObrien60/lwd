@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"lwd/internal/agent"
 	"lwd/internal/build"
 	"lwd/internal/compose"
 	"lwd/internal/node"
@@ -807,15 +809,15 @@ func TestEndToEndRemoteNode(t *testing.T) {
 	// A real RegistryResolver over the store, exactly like the daemon builds
 	// in cli.runDaemon — the thing actually under test here, not a
 	// node.FakeResolver.
-	resolver := node.NewRegistryResolver(n, func(name string) (string, string, bool, error) {
+	resolver := node.NewRegistryResolver(n, "", func(name string) (string, string, string, bool, error) {
 		rec, err := s.GetNode(name)
 		if err != nil {
-			return "", "", false, err
+			return "", "", "", false, err
 		}
 		if rec == nil {
-			return "", "", false, nil
+			return "", "", "", false, nil
 		}
-		return rec.SSHHost, rec.MeshAddr, true, nil
+		return rec.SSHHost, rec.MeshAddr, rec.AgentURL, true, nil
 	})
 	rec := reconciler.New(resolver, rtr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
 
@@ -941,6 +943,264 @@ func cleanupRemoteNodeResources(t *testing.T, rec *reconciler.Reconciler, s *sto
 	}
 
 	cleanupLWDResources(t, remoteNodeAppLabel, remoteNodeLocalAppLabel)
+}
+
+// agentSelectionNodeName is the node name used by
+// TestEndToEndAgentTransportSelection.
+const agentSelectionNodeName = "e2e-agent-selection"
+
+// TestEndToEndAgentTransportSelection proves the P9b agent-transport
+// selection path end to end WITHOUT requiring Docker: a real lwd-agent HTTP
+// server (internal/agent.Server) — backed by a fake node.Node, so its own
+// authenticated /ready endpoint answers without any Docker daemon — is
+// started on loopback via httptest.NewServer, a node is registered in a real
+// store.Store with that server's URL as its agent_url, and a real
+// node.RegistryResolver (the exact type the daemon wires in cli.runDaemon,
+// driven by the same store-backed lookup closure) is asked to resolve and
+// report reachability for that node.
+//
+// This is deliberately NOT gated by LWD_DOCKER_TEST: it is the "at minimum"
+// case called out in the P9b spec — the resolver actually dials the real
+// agent's authenticated /ready endpoint over real HTTP and prefers it over
+// ssh (see
+// RegistryResolver.buildTransport) — and it must stay part of the plain `go
+// test ./...` run. It never fakes the ssh_host as reachable: sshHost below is
+// a syntactically valid but never-dialed value, so if the resolver ever
+// silently fell back to ssh instead of using the agent, the assertions below
+// would fail rather than pass by coincidence.
+//
+// Deploying an actual container through the agent's other endpoints
+// (EnsureImage, RunContainer, ...) requires a real Docker daemon and is
+// exercised separately by TestEndToEndAgentNodeDeploy, guarded behind
+// LWD_DOCKER_TEST.
+func TestEndToEndAgentTransportSelection(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	// Registered before the DeleteNode cleanup below so it runs LAST (t.Cleanup
+	// is LIFO) — the store must still be open when that cleanup runs.
+	t.Cleanup(func() { s.Close() })
+
+	backing := node.NewFake()
+	agentSrv := agent.NewServer(backing, "test-agent-token")
+	ts := httptest.NewServer(agentSrv.Handler())
+	defer ts.Close()
+
+	if err := s.AddNode(store.Node{
+		Name:      agentSelectionNodeName,
+		SSHHost:   "deploy@127.0.0.1", // never dialed: the agent transport answers and is preferred
+		MeshAddr:  "127.0.0.1",
+		AgentURL:  ts.URL,
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.DeleteNode(agentSelectionNodeName); err != nil {
+			t.Logf("cleanup: DeleteNode(%s): %v", agentSelectionNodeName, err)
+		}
+	})
+
+	local := node.NewFake()
+	resolver := node.NewRegistryResolver(local, "test-agent-token", func(name string) (string, string, string, bool, error) {
+		rec, err := s.GetNode(name)
+		if err != nil {
+			return "", "", "", false, err
+		}
+		if rec == nil {
+			return "", "", "", false, nil
+		}
+		return rec.SSHHost, rec.MeshAddr, rec.AgentURL, true, nil
+	})
+
+	transport, reachable := resolver.Reachable(context.Background(), agentSelectionNodeName)
+	if transport != "agent" {
+		t.Fatalf("Reachable transport = %q, want %q", transport, "agent")
+	}
+	if !reachable {
+		t.Fatal("Reachable = false, want true")
+	}
+
+	// ResolveMeta is the actual path a deploy takes: it must select the same
+	// agent transport, and the resolved Node must be a real *node.AgentNode
+	// that can reach the (fake-backed) agent for a trivial primitive.
+	n, meshAddr, dockerHost, isLocal, err := resolver.ResolveMeta(agentSelectionNodeName)
+	if err != nil {
+		t.Fatalf("ResolveMeta: %v", err)
+	}
+	if isLocal {
+		t.Fatalf("ResolveMeta(%q).isLocal = true, want false", agentSelectionNodeName)
+	}
+	if meshAddr != "127.0.0.1" {
+		t.Fatalf("meshAddr = %q, want %q", meshAddr, "127.0.0.1")
+	}
+	if dockerHost != "ssh://deploy@127.0.0.1" {
+		t.Fatalf("dockerHost = %q, want %q (dockerHost always mirrors the registry row's ssh_host, independent of the selected transport)", dockerHost, "ssh://deploy@127.0.0.1")
+	}
+	if _, ok := n.(*node.AgentNode); !ok {
+		t.Fatalf("resolved Node is %T, want *node.AgentNode", n)
+	}
+	if err := n.Ping(context.Background()); err != nil {
+		t.Fatalf("resolved agent Node Ping: %v", err)
+	}
+}
+
+// agentDeployNodeName, agentDeployAppLabel, and agentDeployDomain are the
+// node name/app label/domain used by TestEndToEndAgentNodeDeploy.
+const agentDeployNodeName = "e2e-agent-node"
+const agentDeployAppLabel = "e2e-agent-whoami"
+const agentDeployDomain = "agent-whoami.localhost"
+
+// TestEndToEndAgentNodeDeploy drives a full deploy through the P9b agent
+// transport against a real Docker daemon: a real lwd-agent HTTP server
+// (internal/agent.Server, backed by a real node.NewLocal()) is started on
+// loopback, a node is registered pointing at it, and a real
+// node.RegistryResolver deploys traefik/whoami to it — proving the resolver
+// selects "agent" (not "ssh") and that a full
+// EnsureImage/EnsureNetwork/RunContainer/Health round-trip over real HTTP
+// through internal/agent.Server actually produces a reachable container.
+//
+// Because the agent's backing Docker client loops back to the exact same
+// physical daemon as the "controller" side (node.NewLocal()) — there being no
+// second machine available in this harness — this can't distinguish "the
+// container ran on a genuinely separate node" from "it ran locally via the
+// agent"; that caveat is identical to TestEndToEndRemoteNode's use of
+// ssh://localhost. What it DOES prove end to end, honestly: transport
+// selection picks the agent (sshHost below is deliberately a value with no
+// real ssh session available, so a silent ssh fallback would fail this test
+// rather than pass by coincidence), and the agent's HTTP surface performs a
+// real, working deploy.
+//
+// Run with: LWD_DOCKER_TEST=1 go test ./test/ -run TestEndToEndAgentNodeDeploy -v
+func TestEndToEndAgentNodeDeploy(t *testing.T) {
+	if os.Getenv("LWD_DOCKER_TEST") == "" {
+		t.Skip("set LWD_DOCKER_TEST=1 to run the end-to-end test against real Docker")
+	}
+
+	n, err := node.NewLocal()
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	if err := n.Ping(context.Background()); err != nil {
+		t.Skipf("no local Docker daemon reachable, skipping: %v", err)
+	}
+	if !agentDeployMeshLoopbackUsable(t) {
+		t.Skip("this Docker setup does not let a sibling container reach a host-published 127.0.0.1 port (a real WireGuard mesh address would not have this restriction) — skipping, since this test stands in for a mesh address with loopback in the absence of a second machine")
+	}
+
+	dir := t.TempDir()
+
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	// Registered before the cleanupAgentNodeResources below so it runs LAST
+	// (t.Cleanup is LIFO) — the store must still be open when that cleanup's
+	// rec.Remove/s.DeleteNode calls run.
+	t.Cleanup(func() { s.Close() })
+
+	const agentToken = "e2e-agent-token"
+	agentBacking, err := node.NewLocal()
+	if err != nil {
+		t.Fatalf("NewLocal (agent backing): %v", err)
+	}
+	agentSrv := agent.NewServer(agentBacking, agentToken)
+	ts := httptest.NewServer(agentSrv.Handler())
+	defer ts.Close()
+
+	rtr := router.NewCaddyRouter(n, dir)
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	secStore := secrets.NewStore(cipher, s)
+
+	resolver := node.NewRegistryResolver(n, agentToken, func(name string) (string, string, string, bool, error) {
+		rec, err := s.GetNode(name)
+		if err != nil {
+			return "", "", "", false, err
+		}
+		if rec == nil {
+			return "", "", "", false, nil
+		}
+		return rec.SSHHost, rec.MeshAddr, rec.AgentURL, true, nil
+	})
+	rec := reconciler.New(resolver, rtr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
+
+	if err := s.AddNode(store.Node{
+		Name:      agentDeployNodeName,
+		SSHHost:   "localhost", // never dialed: the agent transport is preferred and reachable
+		MeshAddr:  "127.0.0.1",
+		AgentURL:  ts.URL,
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+
+	t.Cleanup(func() {
+		cleanupAgentNodeResources(t, rec, s)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := rtr.EnsureUp(ctx); err != nil {
+		if portsInUse(t) {
+			t.Skipf("ports 80/443 appear to be in use and EnsureUp failed: %v", err)
+		}
+		t.Fatalf("EnsureUp: %v", err)
+	}
+
+	// Prove transport selection BEFORE deploying, so a silent ssh fallback
+	// (which would fail below since sshHost="localhost" here has no
+	// guaranteed working ssh session in a sandboxed environment) is caught
+	// explicitly rather than surfacing as a confusing Apply failure.
+	if transport, reachable := resolver.Reachable(ctx, agentDeployNodeName); transport != "agent" || !reachable {
+		t.Fatalf("Reachable(%q) = (%q, %v), want (\"agent\", true)", agentDeployNodeName, transport, reachable)
+	}
+
+	app := &spec.App{
+		Name:   agentDeployAppLabel,
+		Image:  "traefik/whoami:latest",
+		Domain: agentDeployDomain,
+		Port:   80,
+		Node:   agentDeployNodeName,
+	}
+	app.Health.Path = "/"
+	app.Health.Timeout = 30 * time.Second
+
+	applyCtx, applyCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	dep, err := rec.Apply(applyCtx, app)
+	applyCancel()
+	if err != nil {
+		t.Fatalf("agent-node Apply: %v", err)
+	}
+	if dep.Status != store.StatusRunning {
+		t.Fatalf("agent-node deploy status = %q, want running", dep.Status)
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	assertReachableDomain(t, client, agentDeployDomain, "agent-node deploy")
+}
+
+// cleanupAgentNodeResources is TestEndToEndAgentNodeDeploy's defensive
+// teardown: it asks the reconciler to remove the app (torn down through the
+// same agent transport it was deployed with), deregisters the node, then
+// reuses the shared lwd-caddy/lwd-network cleanup+verification. Each step is
+// best-effort (logged, not fatal).
+func cleanupAgentNodeResources(t *testing.T, rec *reconciler.Reconciler, s *store.Store) {
+	t.Helper()
+
+	if err := rec.Remove(context.Background(), agentDeployAppLabel); err != nil {
+		t.Logf("cleanup: reconciler.Remove(%s): %v", agentDeployAppLabel, err)
+	}
+	if err := s.DeleteNode(agentDeployNodeName); err != nil {
+		t.Logf("cleanup: DeleteNode(%s): %v", agentDeployNodeName, err)
+	}
+
+	cleanupLWDResources(t, agentDeployAppLabel)
 }
 
 // composeServiceContainerID resolves the running container ID for service
@@ -1112,6 +1372,64 @@ func portsInUse(t *testing.T) bool {
 			return true
 		}
 	}
+	return false
+}
+
+// agentMeshProbeContainerName is the throwaway container
+// agentDeployMeshLoopbackUsable creates to probe loopback-as-mesh-address
+// reachability.
+const agentMeshProbeContainerName = "e2e-agent-mesh-probe"
+
+// agentDeployMeshLoopbackUsable probes whether a container-published port
+// bound to 127.0.0.1 — the stand-in this test uses for a node's WireGuard
+// mesh address, in the absence of a second real machine — is reachable from
+// a SIBLING container, exactly the path lwd-caddy needs for a remote-node
+// route (see reconciler.deployBlueGreenSurface's meshAddr upstream). Some
+// Docker setups (notably Docker Desktop's Linux VM) bind a 127.0.0.1 host
+// publish to the VM's own loopback only, unreachable from any container
+// including lwd-caddy; a real WireGuard mesh address would not have this
+// restriction, so this is a property of the sandbox, not of lwd. It never
+// fakes success: any probe failure returns false so the caller SKIPs with a
+// clear message instead of failing on an environment limitation unrelated to
+// the agent transport itself.
+func agentDeployMeshLoopbackUsable(t *testing.T) bool {
+	t.Helper()
+
+	_ = exec.Command("docker", "rm", "-f", agentMeshProbeContainerName).Run()
+	runOut, err := exec.Command("docker", "run", "-d", "--rm", "--name", agentMeshProbeContainerName, "-p", "127.0.0.1:0:80", "traefik/whoami:latest").CombinedOutput()
+	if err != nil {
+		t.Logf("mesh-loopback probe: docker run failed: %v: %s", err, runOut)
+		return false
+	}
+	defer exec.Command("docker", "rm", "-f", agentMeshProbeContainerName).Run()
+
+	portOut, err := exec.Command("docker", "port", agentMeshProbeContainerName, "80/tcp").CombinedOutput()
+	if err != nil {
+		t.Logf("mesh-loopback probe: docker port failed: %v: %s", err, portOut)
+		return false
+	}
+	addr := strings.TrimSpace(strings.Split(string(portOut), "\n")[0])
+	idx := strings.LastIndex(addr, ":")
+	if idx < 0 {
+		t.Logf("mesh-loopback probe: unexpected docker port output %q", addr)
+		return false
+	}
+	port := addr[idx+1:]
+
+	// Give the probe container a moment to start listening before a sibling
+	// container tries to reach it.
+	var lastErr error
+	var lastOut []byte
+	for i := 0; i < 10; i++ {
+		out, err := exec.Command("docker", "run", "--rm", "curlimages/curl:latest",
+			"curl", "-sf", "-o", "/dev/null", "-m", "3", "http://127.0.0.1:"+port+"/").CombinedOutput()
+		if err == nil {
+			return true
+		}
+		lastErr, lastOut = err, out
+		time.Sleep(300 * time.Millisecond)
+	}
+	t.Logf("mesh-loopback probe: a sibling container could not reach 127.0.0.1:%s (this is a known Docker-Desktop-style host-loopback-publish limitation, not an lwd bug): %v: %s", port, lastErr, lastOut)
 	return false
 }
 

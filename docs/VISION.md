@@ -105,11 +105,22 @@ Everything on plain Linux. WireGuard mesh. No custom kernel/init/fs, no service 
   thread a resolved node's `DOCKER_HOST` through). Single-node path fully
   unchanged. See `README.md`'s [Multi-node](../README.md#multi-node-federation)
   section.
-- **P9b — next:** the dumb `lwd-agent` (replacing raw docker-over-ssh transport),
-  node capacity/health reporting, and web/MCP node UX (node choice + node list
-  surfaced in `lwd-web`/`lwd-mcp`, currently CLI/API-only).
-- **P10 — Continuous reconciler:** apply-time → control loop; self-heal crashed
-  replicas/containers; observe node/edge health.
+- **P9b — Dumb agent + node UX — DONE (merged):** the dumb `lwd-agent` binary
+  (bearer-token-authed HTTP wrapper over `node.Node`, no orchestration of its
+  own) as a `node.Node` transport (`node.AgentNode`) the resolver prefers over
+  docker-over-ssh whenever a registered node's agent answers `/healthz`,
+  falling back to ssh automatically otherwise (`RegistryResolver.buildTransport`
+  is the single decision point both `ResolveMeta` and `Reachable` route
+  through); daemon API/CLI node UX (`agent_url` on `store.Node`, `lwd node add
+  --agent`, transport+reachability in `lwd node ls`); and web/MCP node UX —
+  `lwd-web`'s **Nodes** view (list/add/remove, live transport+reachability)
+  plus a node picker in the Deploy modal, and `lwd-mcp`'s
+  `lwd_node_list`/`lwd_node_add`/`lwd_node_remove` tools plus an optional
+  `node` argument on `lwd_apply`/`lwd_deploy_git`. Node capacity/health
+  reporting is deferred to P11. See `README.md`'s
+  [The lwd-agent transport](../README.md#the-lwd-agent-transport) section.
+- **P10 — next — Continuous reconciler:** apply-time → control loop; self-heal
+  crashed replicas/containers; observe node/edge health.
 - **P11 — Scheduler + capacity + pools:** nodes report capacity; apps declare
   requirements; placement across nodes/pools; `node inspect/capacity/drain/evacuate`,
   `pool create`. **Surface failover reschedules here** on node loss.
