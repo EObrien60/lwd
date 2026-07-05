@@ -77,7 +77,7 @@ func (r *Reconciler) resolvePlacement(ctx context.Context, app *spec.App) (strin
 	}
 
 	pool := poolOf(app)
-	candidates := r.schedulableCandidates(ctx, app, "")
+	candidates := r.schedulableCandidates(ctx, app, nil)
 
 	req := scheduler.Requirements{CPUCores: reqCPU(app), MemBytes: reqMem(app)}
 	chosen, err := scheduler.Place(candidates, pool, req)
@@ -94,7 +94,23 @@ func (r *Reconciler) resolvePlacement(ctx context.Context, app *spec.App) (strin
 // since this is only ever called to reschedule a surface the scheduler
 // already placed (and may therefore move) off a specific node, e.g. because
 // that node was just cordoned or went unreachable.
+//
+// It is a thin wrapper over placeExcludingSet (Phase 12 Task 3), which
+// generalizes this to an exclude SET for replica spread.
 func (r *Reconciler) placeExcluding(ctx context.Context, app *spec.App, exclude string) (string, error) {
+	return r.placeExcludingSet(ctx, app, []string{exclude})
+}
+
+// placeExcludingSet picks a node for app exactly like resolvePlacement's
+// scheduling branch, except every name in exclude (node names, or "local")
+// is dropped from the candidate set before scheduler.Place runs. It always
+// invokes the scheduler — unlike resolvePlacement there is no pinned
+// short-circuit. placeExcluding(x) is the exclude-one-node special case
+// (used to reschedule a surface off a single cordoned/unreachable node);
+// placeReplicas (Phase 12 Task 3) uses the general set form to spread a
+// surface's replicas across distinct nodes, excluding every node already
+// chosen for an earlier replica.
+func (r *Reconciler) placeExcludingSet(ctx context.Context, app *spec.App, exclude []string) (string, error) {
 	pool := poolOf(app)
 	candidates := r.schedulableCandidates(ctx, app, exclude)
 
@@ -102,15 +118,26 @@ func (r *Reconciler) placeExcluding(ctx context.Context, app *spec.App, exclude 
 	return scheduler.Place(candidates, pool, req)
 }
 
+// excludes reports whether name appears in the exclude set.
+func excludes(exclude []string, name string) bool {
+	for _, x := range exclude {
+		if x == name {
+			return true
+		}
+	}
+	return false
+}
+
 // schedulableCandidates gathers every scheduler.NodeInfo candidate for app's
 // pool: the local node (always Schedulable: true — you cannot cordon the
 // controller) plus every registered store node in the pool, each carrying
 // its store Schedulable flag through so scheduler.Place can exclude cordoned
-// nodes. If exclude is non-empty, the candidate whose Name matches it (the
-// local node if exclude=="local", or a named store node) is dropped
-// entirely — used by placeExcluding to reschedule a surface off a specific
-// node. resolvePlacement calls this with exclude="".
-func (r *Reconciler) schedulableCandidates(ctx context.Context, app *spec.App, exclude string) []scheduler.NodeInfo {
+// nodes. Every candidate whose Name appears in exclude (the local node if
+// exclude contains "local", or a named store node) is dropped entirely —
+// used by placeExcludingSet to reschedule a surface off a specific node, or
+// spread replicas across the nodes not already chosen. resolvePlacement
+// calls this with exclude==nil.
+func (r *Reconciler) schedulableCandidates(ctx context.Context, app *spec.App, exclude []string) []scheduler.NodeInfo {
 	pool := poolOf(app)
 	var candidates []scheduler.NodeInfo
 
@@ -128,7 +155,7 @@ func (r *Reconciler) schedulableCandidates(ctx context.Context, app *spec.App, e
 	// unreadable. The only case local is left out of candidates entirely is
 	// if it somehow fails to resolve at all (which never happens in
 	// practice), or if the caller explicitly excluded it.
-	if pool == "default" && exclude != "local" {
+	if pool == "default" && !excludes(exclude, "local") {
 		if local, err := r.localNode(); err == nil {
 			localCap, _ := capacityBounded(ctx, local)
 			candidates = append(candidates, scheduler.NodeInfo{
@@ -143,7 +170,7 @@ func (r *Reconciler) schedulableCandidates(ctx context.Context, app *spec.App, e
 
 	nodes, _ := r.store.ListNodes()
 	for _, n := range nodes {
-		if n.Pool != pool || n.Name == exclude {
+		if n.Pool != pool || excludes(exclude, n.Name) {
 			continue
 		}
 		reachable := true
@@ -188,4 +215,61 @@ func (r *Reconciler) schedulableCandidates(ctx context.Context, app *spec.App, e
 	}
 
 	return candidates
+}
+
+// placeReplicas decides the node for each of n replicas of app, spreading
+// them across distinct nodes for failure isolation (Phase 12): if one node
+// goes down, only the replicas on that node are lost. n<=0 is treated as 1
+// (belt-and-suspenders — an old snapshot could carry a zero Replicas).
+//
+// A pinned app (Node set to anything other than "" or "local") places every
+// replica on that same node: a pin is an explicit operator choice with no
+// spread, and scheduled is reported false (Phase 11b placement provenance —
+// this call never touched the scheduler).
+//
+// An unpinned app schedules every replica: replica 0 is placed via
+// placeExcludingSet with an empty exclude set (the plain most-free-node
+// pick); each subsequent replica calls placeExcludingSet with every node
+// chosen so far excluded, preferring a fresh distinct node. If that errors —
+// fewer schedulable nodes than replicas, so every remaining candidate is
+// either already used or unschedulable — placement falls back to
+// placeExcludingSet with an empty exclude set again, allowing that replica
+// to stack onto the most-free node overall rather than failing the whole
+// call. Only replica 0 failing to place (no schedulable node at all) fails
+// placeReplicas itself. scheduled is reported true.
+func (r *Reconciler) placeReplicas(ctx context.Context, app *spec.App, n int) ([]string, bool, error) {
+	if n <= 0 {
+		n = 1
+	}
+
+	if app.Node != "" && app.Node != "local" {
+		nodes := make([]string, n)
+		for i := range nodes {
+			nodes[i] = app.Node
+		}
+		return nodes, false, nil
+	}
+
+	nodes := make([]string, 0, n)
+	first, err := r.placeExcludingSet(ctx, app, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	nodes = append(nodes, first)
+
+	for i := 1; i < n; i++ {
+		next, err := r.placeExcludingSet(ctx, app, nodes)
+		if err != nil {
+			// Fewer schedulable nodes than replicas: stack this replica onto
+			// the most-free node overall rather than failing the whole
+			// placement just because we ran out of distinct nodes.
+			next, err = r.placeExcludingSet(ctx, app, nil)
+			if err != nil {
+				return nil, false, err
+			}
+		}
+		nodes = append(nodes, next)
+	}
+
+	return nodes, true, nil
 }

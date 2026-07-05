@@ -3,6 +3,7 @@ package reconciler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"lwd/internal/node"
@@ -338,6 +339,201 @@ func TestPlaceExcludingDropsLocal(t *testing.T) {
 	}
 	if got != "web1" {
 		t.Fatalf("placeExcluding(app, %q) = %q, want web1 (local excluded)", "local", got)
+	}
+}
+
+// TestPlaceExcludingSetDropsAll covers Phase 12 Task 3's generalization of
+// placeExcluding to an exclude SET: every name in the set must be dropped
+// from the candidate pool, not just the first one.
+func TestPlaceExcludingSetDropsAll(t *testing.T) {
+	r, resolver, _, _, _ := newSchedulingReconciler(t, "web1", "web2", "web3")
+	ctx := context.Background()
+
+	// web1 and web2 are both more free than web3, but both are excluded, so
+	// web3 (the only remaining candidate) must be chosen.
+	resolver["web1"].(*node.Fake).Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 9000}
+	resolver["web2"].(*node.Fake).Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 8000}
+	resolver["web3"].(*node.Fake).Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 1000}
+
+	s := r.store
+	for i, n := range []string{"web1", "web2", "web3"} {
+		if err := s.AddNode(store.Node{Name: n, SSHHost: "deploy@" + n, MeshAddr: fmt.Sprintf("100.64.0.%d", i+2), Pool: "default"}); err != nil {
+			t.Fatalf("AddNode %s: %v", n, err)
+		}
+	}
+
+	app := unpinnedApp("blog")
+
+	got, err := r.placeExcludingSet(ctx, app, []string{"local", "web1", "web2"})
+	if err != nil {
+		t.Fatalf("placeExcludingSet: %v", err)
+	}
+	if got != "web3" {
+		t.Fatalf("placeExcludingSet(app, [local, web1, web2]) = %q, want web3", got)
+	}
+}
+
+// TestPlaceReplicasSpreadsAcrossNodes covers Phase 12 Task 3: with 3
+// schedulable nodes and 3 replicas, each replica must land on its own
+// distinct node.
+func TestPlaceReplicasSpreadsAcrossNodes(t *testing.T) {
+	r, resolver, _, _, _ := newSchedulingReconciler(t, "web1", "web2", "web3")
+	ctx := context.Background()
+
+	resolver["web1"].(*node.Fake).Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 3000}
+	resolver["web2"].(*node.Fake).Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 2000}
+	resolver["web3"].(*node.Fake).Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 1000}
+
+	s := r.store
+	for i, n := range []string{"web1", "web2", "web3"} {
+		if err := s.AddNode(store.Node{Name: n, SSHHost: "deploy@" + n, MeshAddr: fmt.Sprintf("100.64.0.%d", i+2), Pool: "default"}); err != nil {
+			t.Fatalf("AddNode %s: %v", n, err)
+		}
+	}
+
+	app := unpinnedApp("blog")
+
+	nodes, scheduled, err := r.placeReplicas(ctx, app, 3)
+	if err != nil {
+		t.Fatalf("placeReplicas: %v", err)
+	}
+	if !scheduled {
+		t.Errorf("scheduled = false, want true (unpinned app)")
+	}
+	if len(nodes) != 3 {
+		t.Fatalf("len(nodes) = %d, want 3", len(nodes))
+	}
+	seen := map[string]bool{}
+	for _, n := range nodes {
+		if seen[n] {
+			t.Fatalf("nodes = %v, want 3 distinct nodes, got duplicate %q", nodes, n)
+		}
+		seen[n] = true
+	}
+}
+
+// TestPlaceReplicasStacksWhenFewerNodes covers Phase 12 Task 3's
+// stack-fallback: with only 2 schedulable nodes (local + web1) and 3
+// replicas, placement must not fail — it spreads across the 2 distinct
+// nodes then reuses the most-free one for the 3rd replica.
+func TestPlaceReplicasStacksWhenFewerNodes(t *testing.T) {
+	r, resolver, _, _, _ := newSchedulingReconciler(t, "web1")
+	ctx := context.Background()
+
+	resolver["web1"].(*node.Fake).Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 9000}
+
+	s := r.store
+	if err := s.AddNode(store.Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", Pool: "default"}); err != nil {
+		t.Fatalf("AddNode web1: %v", err)
+	}
+
+	app := unpinnedApp("blog")
+
+	nodes, scheduled, err := r.placeReplicas(ctx, app, 3)
+	if err != nil {
+		t.Fatalf("placeReplicas: %v", err)
+	}
+	if !scheduled {
+		t.Errorf("scheduled = false, want true (unpinned app)")
+	}
+	if len(nodes) != 3 {
+		t.Fatalf("len(nodes) = %d, want 3", len(nodes))
+	}
+
+	counts := map[string]int{}
+	for _, n := range nodes {
+		counts[n]++
+	}
+	if len(counts) != 2 {
+		t.Fatalf("nodes = %v, want exactly 2 distinct nodes used (stack fallback)", nodes)
+	}
+	total := 0
+	for _, c := range counts {
+		total += c
+	}
+	if total != 3 {
+		t.Fatalf("nodes = %v, want 3 total placements", nodes)
+	}
+	// web1 is the most-free node, so it must be the one reused.
+	if counts["web1"] != 2 {
+		t.Fatalf("counts = %v, want web1 reused twice (most-free stack target)", counts)
+	}
+}
+
+// TestPlaceReplicasPinnedAllOnPin covers Phase 12 Task 3: a pinned app
+// (Node set to a concrete node) places every replica on that same node,
+// bypassing the scheduler entirely (scheduled=false, no spread).
+func TestPlaceReplicasPinnedAllOnPin(t *testing.T) {
+	r, _, _, _, _ := newSchedulingReconciler(t, "web1")
+	ctx := context.Background()
+
+	app := unpinnedApp("blog")
+	app.Node = "web1"
+
+	nodes, scheduled, err := r.placeReplicas(ctx, app, 3)
+	if err != nil {
+		t.Fatalf("placeReplicas: %v", err)
+	}
+	if scheduled {
+		t.Errorf("scheduled = true, want false (pinned app)")
+	}
+	want := []string{"web1", "web1", "web1"}
+	if len(nodes) != len(want) {
+		t.Fatalf("nodes = %v, want %v", nodes, want)
+	}
+	for i, n := range nodes {
+		if n != want[i] {
+			t.Fatalf("nodes = %v, want %v", nodes, want)
+		}
+	}
+}
+
+// TestPlaceReplicasSingleNode covers Phase 12 Task 3's non-regression case:
+// an unpinned app with no registered nodes places every replica on local
+// (via stack fallback), never failing just because there's only one node.
+func TestPlaceReplicasSingleNode(t *testing.T) {
+	r, _, _, _ := newTestReconciler(t)
+	ctx := context.Background()
+
+	app := unpinnedApp("blog")
+
+	nodes, scheduled, err := r.placeReplicas(ctx, app, 3)
+	if err != nil {
+		t.Fatalf("placeReplicas: %v", err)
+	}
+	if !scheduled {
+		t.Errorf("scheduled = false, want true (unpinned app)")
+	}
+	want := []string{"local", "local", "local"}
+	if len(nodes) != len(want) {
+		t.Fatalf("nodes = %v, want %v", nodes, want)
+	}
+	for i, n := range nodes {
+		if n != want[i] {
+			t.Fatalf("nodes = %v, want %v", nodes, want)
+		}
+	}
+}
+
+// TestPlaceReplicasZeroTreatedAsOne covers Phase 12 Task 3's
+// belt-and-suspenders n<=0 guard: an old snapshot could carry Replicas: 0,
+// which must be treated as 1 rather than producing an empty/invalid node
+// list.
+func TestPlaceReplicasZeroTreatedAsOne(t *testing.T) {
+	r, _, _, _ := newTestReconciler(t)
+	ctx := context.Background()
+
+	app := unpinnedApp("blog")
+
+	nodes, _, err := r.placeReplicas(ctx, app, 0)
+	if err != nil {
+		t.Fatalf("placeReplicas: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("len(nodes) = %d, want 1 (n<=0 treated as 1)", len(nodes))
+	}
+	if nodes[0] != "local" {
+		t.Fatalf("nodes[0] = %q, want local", nodes[0])
 	}
 }
 
