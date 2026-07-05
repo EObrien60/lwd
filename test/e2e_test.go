@@ -66,6 +66,17 @@ const gitDomain = "git-whoami.localhost"
 const gitBackingProject = "lwd-" + gitAppLabel
 const gitBuiltImageRepo = "lwd-build/" + gitAppLabel
 
+// remoteNodeName, remoteNodeAppLabel, and remoteNodeDomain are the node
+// name/app label/domain used by TestEndToEndRemoteNode for the app placed on
+// the registered "remote" node. remoteNodeLocalAppLabel/Domain are a second,
+// distinct app deployed with node="local" in the same test, to prove the
+// single-node path still works unchanged alongside a multi-node one.
+const remoteNodeName = "e2e-remote"
+const remoteNodeAppLabel = "e2e-remote-whoami"
+const remoteNodeDomain = "remote-whoami.localhost"
+const remoteNodeLocalAppLabel = "e2e-remote-local-whoami"
+const remoteNodeLocalDomain = "remote-node-local.localhost"
+
 // caddyContainerName mirrors router.caddyContainerName (unexported), needed
 // here only for best-effort cleanup via the docker CLI.
 const caddyContainerName = "lwd-caddy"
@@ -737,6 +748,199 @@ func cleanupGitDeployResources(t *testing.T, rec *reconciler.Reconciler) {
 	} else if remaining := splitLines(string(verifyOut)); len(remaining) > 0 {
 		t.Errorf("cleanup verification: %d stray container(s) for backing project %s remain: %v", len(remaining), gitBackingProject, remaining)
 	}
+}
+
+// TestEndToEndRemoteNode drives the full Phase 9a federation path — node
+// registry, docker-over-ssh transport, image save|load transfer, node=
+// placement, mesh-address Caddy routing — against a real Docker daemon,
+// using ssh://localhost as the "remote" node.
+//
+// This only works in an environment where the host's own sshd is running,
+// key-based ssh to localhost works non-interactively, and that ssh session
+// can reach the same Docker daemon (i.e. `docker -H ssh://localhost version`
+// succeeds). That is NOT assumed to be true generally — most CI/sandboxed
+// environments have no sshd at all — so this test probes for it first and
+// SKIPs with a clear message if unusable. It never fakes a pass.
+//
+// Because ssh://localhost loops back to the exact same physical Docker
+// daemon as node.NewLocal(), this exercises the real resolver/RegistryResolver
+// -> node.NewRemoteSSH code path and the mesh-address routing/publish logic
+// end to end, but it can't distinguish "the image was pulled directly by the
+// target" from "the image was save|load transferred from the controller" —
+// both leave the same observable state (the image present on the one
+// underlying daemon). A genuinely separate second Docker host would be
+// needed to exercise the save|load byte-transfer branch specifically; that
+// is out of scope for a single-machine e2e harness.
+//
+// Run with: LWD_DOCKER_TEST=1 go test ./test/ -run TestEndToEndRemoteNode -v
+func TestEndToEndRemoteNode(t *testing.T) {
+	if os.Getenv("LWD_DOCKER_TEST") == "" {
+		t.Skip("set LWD_DOCKER_TEST=1 to run the end-to-end test against real Docker")
+	}
+
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	probeOut, probeErr := exec.CommandContext(probeCtx, "docker", "-H", "ssh://localhost", "version").CombinedOutput()
+	probeCancel()
+	if probeErr != nil {
+		t.Skipf("ssh://localhost Docker is not usable in this environment (key-based ssh to localhost + a reachable Docker daemon are required): docker -H ssh://localhost version failed: %v: %s", probeErr, probeOut)
+	}
+
+	dir := t.TempDir()
+
+	n, err := node.NewLocal()
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+
+	rtr := router.NewCaddyRouter(n, dir)
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	secStore := secrets.NewStore(cipher, s)
+
+	// A real RegistryResolver over the store, exactly like the daemon builds
+	// in cli.runDaemon — the thing actually under test here, not a
+	// node.FakeResolver.
+	resolver := node.NewRegistryResolver(n, func(name string) (string, string, bool, error) {
+		rec, err := s.GetNode(name)
+		if err != nil {
+			return "", "", false, err
+		}
+		if rec == nil {
+			return "", "", false, nil
+		}
+		return rec.SSHHost, rec.MeshAddr, true, nil
+	})
+	rec := reconciler.New(resolver, rtr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
+
+	if err := s.AddNode(store.Node{Name: remoteNodeName, SSHHost: "localhost", MeshAddr: "127.0.0.1", CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+
+	t.Cleanup(func() {
+		cleanupRemoteNodeResources(t, rec, s)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := rtr.EnsureUp(ctx); err != nil {
+		if portsInUse(t) {
+			t.Skipf("ports 80/443 appear to be in use and EnsureUp failed: %v", err)
+		}
+		t.Fatalf("EnsureUp: %v", err)
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	// --- Deploy pinned to the registered "remote" node ---
+	remoteApp := &spec.App{
+		Name:   remoteNodeAppLabel,
+		Image:  "traefik/whoami:latest",
+		Domain: remoteNodeDomain,
+		Port:   80,
+		Node:   remoteNodeName,
+	}
+	remoteApp.Health.Path = "/"
+	remoteApp.Health.Timeout = 30 * time.Second
+
+	applyCtx, applyCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	dep, err := rec.Apply(applyCtx, remoteApp)
+	applyCancel()
+	if err != nil {
+		t.Fatalf("remote Apply: %v", err)
+	}
+	if dep.Status != store.StatusRunning {
+		t.Fatalf("remote deploy status = %q, want running", dep.Status)
+	}
+
+	assertReachableDomain(t, client, remoteNodeDomain, "remote node deploy")
+
+	// The image must be present and the surface container running as seen
+	// THROUGH the node's own docker-over-ssh endpoint — i.e. resolved via the
+	// exact ssh://localhost client the reconciler used, not just the plain
+	// local daemon view (which happens to be the same underlying daemon in
+	// this loopback setup, but asserting through the ssh endpoint proves the
+	// node= placement path actually ran, rather than relying on that
+	// coincidence).
+	if out, err := exec.Command("docker", "-H", "ssh://localhost", "image", "inspect", "traefik/whoami:latest").CombinedOutput(); err != nil {
+		t.Fatalf("docker -H ssh://localhost image inspect traefik/whoami:latest: %v: %s", err, out)
+	}
+	psOut, err := exec.Command("docker", "-H", "ssh://localhost", "ps", "--filter", "label=lwd.app="+remoteNodeAppLabel, "--filter", "status=running", "--format", "{{.ID}}").CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker -H ssh://localhost ps (lwd.app=%s): %v: %s", remoteNodeAppLabel, err, psOut)
+	}
+	if len(splitLines(string(psOut))) == 0 {
+		t.Fatalf("no running container labeled lwd.app=%s found on ssh://localhost — the surface did not run on the remote node", remoteNodeAppLabel)
+	}
+
+	// --- A LOCAL app deployed in the same run still works unchanged ---
+	localApp := &spec.App{
+		Name:   remoteNodeLocalAppLabel,
+		Image:  "traefik/whoami:latest",
+		Domain: remoteNodeLocalDomain,
+		Port:   80,
+		Node:   "local",
+	}
+	localApp.Health.Path = "/"
+	localApp.Health.Timeout = 30 * time.Second
+
+	applyCtx2, applyCancel2 := context.WithTimeout(context.Background(), 60*time.Second)
+	dep2, err := rec.Apply(applyCtx2, localApp)
+	applyCancel2()
+	if err != nil {
+		t.Fatalf("local Apply: %v", err)
+	}
+	if dep2.Status != store.StatusRunning {
+		t.Fatalf("local deploy status = %q, want running", dep2.Status)
+	}
+
+	assertReachableDomain(t, client, remoteNodeLocalDomain, "local app alongside a remote-node deploy")
+}
+
+// cleanupRemoteNodeResources is TestEndToEndRemoteNode's defensive teardown.
+// It asks the reconciler to remove both apps it deployed (the product path:
+// Remove resolves each app's own node from its stored spec snapshot, so the
+// remote app is torn down via the same ssh endpoint it was deployed to),
+// removes the registered node from the store, falls back to a direct
+// docker-over-ssh cleanup of any stray remote-app containers in case Remove
+// never ran, then reuses the shared lwd-caddy/lwd-network cleanup+verification
+// from the other e2e tests (which also catches the remote app's container,
+// since ssh://localhost loops back to the same underlying daemon in this
+// harness). Each step is best-effort (logged, not fatal).
+func cleanupRemoteNodeResources(t *testing.T, rec *reconciler.Reconciler, s *store.Store) {
+	t.Helper()
+
+	if err := rec.Remove(context.Background(), remoteNodeAppLabel); err != nil {
+		t.Logf("cleanup: reconciler.Remove(%s): %v", remoteNodeAppLabel, err)
+	}
+	if err := rec.Remove(context.Background(), remoteNodeLocalAppLabel); err != nil {
+		t.Logf("cleanup: reconciler.Remove(%s): %v", remoteNodeLocalAppLabel, err)
+	}
+	if err := s.DeleteNode(remoteNodeName); err != nil {
+		t.Logf("cleanup: DeleteNode(%s): %v", remoteNodeName, err)
+	}
+
+	// Fallback: directly remove any stray remote-app containers via the same
+	// ssh endpoint, in case Remove never ran (e.g. the test failed before any
+	// deploy succeeded).
+	out, err := exec.Command("docker", "-H", "ssh://localhost", "ps", "-aq", "--filter", "label=lwd.app="+remoteNodeAppLabel).CombinedOutput()
+	if err != nil {
+		t.Logf("cleanup: docker -H ssh://localhost ps (lwd.app=%s) failed: %v: %s", remoteNodeAppLabel, err, out)
+	} else {
+		for _, id := range splitLines(string(out)) {
+			if rmOut, rmErr := exec.Command("docker", "-H", "ssh://localhost", "rm", "-f", id).CombinedOutput(); rmErr != nil {
+				t.Logf("cleanup: docker -H ssh://localhost rm -f %s failed: %v: %s", id, rmErr, rmOut)
+			}
+		}
+	}
+
+	cleanupLWDResources(t, remoteNodeAppLabel, remoteNodeLocalAppLabel)
 }
 
 // composeServiceContainerID resolves the running container ID for service

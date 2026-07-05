@@ -11,8 +11,13 @@ import (
 
 // Route is one active domain -> container mapping.
 type Route struct {
-	Domain      string
-	Upstream    string // container name on the lwd network
+	Domain string
+	// Upstream is the reverse_proxy target host: a container name on the
+	// shared lwd network for a local surface (Caddy resolves it by Docker
+	// DNS), or a remote node's WireGuard mesh IP for a surface placed via
+	// node= (Caddy, running on the controller, reaches it over the mesh
+	// instead — see internal/reconciler's deployBlueGreenSurface).
+	Upstream    string
 	Port        int
 	TLSInternal bool // use Caddy self-signed certs (local/non-public domains)
 }

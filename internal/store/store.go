@@ -38,10 +38,10 @@ type Deployment struct {
 // Node represents a registered cluster node (remote or local).
 // The implicit "local" node is never stored; only explicit registered nodes appear in the registry.
 type Node struct {
-	Name      string
-	SSHHost   string
-	MeshAddr  string
-	CreatedAt time.Time
+	Name      string    `json:"name"`
+	SSHHost   string    `json:"ssh_host"`
+	MeshAddr  string    `json:"mesh_addr"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Store wraps the SQLite database.

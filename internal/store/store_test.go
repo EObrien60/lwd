@@ -498,11 +498,12 @@ func TestAddGetNode(t *testing.T) {
 
 func TestAddNodeUpsert(t *testing.T) {
 	s := openTemp(t)
+	firstCreatedAt := time.Now()
 	n1 := Node{
 		Name:      "web1",
 		SSHHost:   "deploy@web1",
 		MeshAddr:  "100.64.0.1",
-		CreatedAt: time.Now(),
+		CreatedAt: firstCreatedAt,
 	}
 	if err := s.AddNode(n1); err != nil {
 		t.Fatalf("AddNode (first): %v", err)
@@ -527,6 +528,12 @@ func TestAddNodeUpsert(t *testing.T) {
 	}
 	if got.SSHHost != "deploy@web1-new" || got.MeshAddr != "100.64.0.2" {
 		t.Fatalf("GetNode upsert failed: got %+v, want new values", got)
+	}
+	// created_at is NOT part of the upsert's SET clause (only ssh_host and
+	// mesh_addr are), so it must be preserved from the original AddNode, not
+	// overwritten by n2's CreatedAt.
+	if !got.CreatedAt.Equal(firstCreatedAt.Truncate(time.Second)) {
+		t.Fatalf("GetNode.CreatedAt = %v, want preserved original %v", got.CreatedAt, firstCreatedAt.Truncate(time.Second))
 	}
 }
 

@@ -93,9 +93,21 @@ Everything on plain Linux. WireGuard mesh. No custom kernel/init/fs, no service 
 - **P1–P8 — DONE (merged):** core deploy; HTTPS/blue-green/rollback; secrets; compose
   apps; web UI (lwd-web); git deploy + build-from-source + backing services; lwd.toml
   authoring skill; local MCP (lwd-mcp).
-- **P9 — Federation foundation:** node registry + agent (dumb) / ssh transports +
-  `docker save|ssh|load` image movement + explicit `node=` placement + WireGuard mesh
-  (central Caddy). Deploy an app to a chosen node.
+- **P9a — Federation foundation — DONE (merged):** node registry (`lwd node
+  add/ls/rm`) + docker-over-ssh transport (Docker SDK ssh conn-helper, no custom
+  agent yet) + `docker save|load` image movement (registry pull on the target
+  tried first) + explicit `node=` placement, resolved per-deploy via
+  `node.Resolver` + WireGuard-mesh-address routing (central Caddy's upstream
+  becomes `<meshAddr>:<port>` for a remote surface; unchanged container-name
+  routing for local). `image`/`[git]` apps (with or without `[[services]]`,
+  backing services also targeted at the node's own daemon) are remote-capable;
+  `compose=` apps are guarded local-only for now (`applyCompose` doesn't yet
+  thread a resolved node's `DOCKER_HOST` through). Single-node path fully
+  unchanged. See `README.md`'s [Multi-node](../README.md#multi-node-federation)
+  section.
+- **P9b — next:** the dumb `lwd-agent` (replacing raw docker-over-ssh transport),
+  node capacity/health reporting, and web/MCP node UX (node choice + node list
+  surfaced in `lwd-web`/`lwd-mcp`, currently CLI/API-only).
 - **P10 — Continuous reconciler:** apply-time → control loop; self-heal crashed
   replicas/containers; observe node/edge health.
 - **P11 — Scheduler + capacity + pools:** nodes report capacity; apps declare
