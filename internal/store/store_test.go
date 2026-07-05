@@ -572,6 +572,124 @@ func TestListNodesSorted(t *testing.T) {
 	}
 }
 
+func TestAddNodeAgentURLRoundTrip(t *testing.T) {
+	s := openTemp(t)
+	n := Node{
+		Name:      "web1",
+		SSHHost:   "deploy@web1",
+		MeshAddr:  "100.64.0.2",
+		AgentURL:  "http://100.64.0.2:8078",
+		CreatedAt: time.Now(),
+	}
+	if err := s.AddNode(n); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	got, err := s.GetNode("web1")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("GetNode returned nil, want node")
+	}
+	if got.AgentURL != "http://100.64.0.2:8078" {
+		t.Fatalf("GetNode.AgentURL = %q, want http://100.64.0.2:8078", got.AgentURL)
+	}
+}
+
+func TestAddNodeUpsertUpdatesAgentURL(t *testing.T) {
+	s := openTemp(t)
+	n1 := Node{
+		Name:      "web1",
+		SSHHost:   "deploy@web1",
+		MeshAddr:  "100.64.0.1",
+		AgentURL:  "http://100.64.0.1:8078",
+		CreatedAt: time.Now(),
+	}
+	if err := s.AddNode(n1); err != nil {
+		t.Fatalf("AddNode (first): %v", err)
+	}
+
+	n2 := Node{
+		Name:      "web1",
+		SSHHost:   "deploy@web1",
+		MeshAddr:  "100.64.0.1",
+		AgentURL:  "http://100.64.0.1:9999",
+		CreatedAt: time.Now(),
+	}
+	if err := s.AddNode(n2); err != nil {
+		t.Fatalf("AddNode (second): %v", err)
+	}
+
+	got, err := s.GetNode("web1")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("GetNode returned nil")
+	}
+	if got.AgentURL != "http://100.64.0.1:9999" {
+		t.Fatalf("GetNode.AgentURL upsert failed: got %q, want http://100.64.0.1:9999", got.AgentURL)
+	}
+}
+
+func TestMigrationFromPreAgentURLSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lwd.db")
+
+	// Step 1: Create a pre-Phase-9b nodes table (no agent_url column).
+	// Use raw sql.Open to bypass Open() which would create the new schema.
+	rawDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+
+	oldSchema := `
+	CREATE TABLE nodes (
+		name      TEXT    PRIMARY KEY,
+		ssh_host  TEXT    NOT NULL,
+		mesh_addr TEXT    NOT NULL,
+		created_at INTEGER NOT NULL
+	);
+	`
+	if _, err := rawDB.Exec(oldSchema); err != nil {
+		rawDB.Close()
+		t.Fatalf("create old schema: %v", err)
+	}
+
+	if _, err := rawDB.Exec(
+		`INSERT INTO nodes (name, ssh_host, mesh_addr, created_at) VALUES (?, ?, ?, ?)`,
+		"legacy", "deploy@legacy", "100.64.0.9", time.Now().Unix(),
+	); err != nil {
+		rawDB.Close()
+		t.Fatalf("insert legacy row: %v", err)
+	}
+
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close raw DB: %v", err)
+	}
+
+	// Step 2: Open via the package's Open(), which runs migrateAddAgentURLColumn.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (migrated): %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	// Step 3: Verify the legacy row was preserved and AgentURL defaulted to "".
+	got, err := s.GetNode("legacy")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("GetNode returned nil, want legacy row")
+	}
+	if got.SSHHost != "deploy@legacy" || got.MeshAddr != "100.64.0.9" {
+		t.Fatalf("GetNode data mismatch: got %+v", got)
+	}
+	if got.AgentURL != "" {
+		t.Fatalf("GetNode.AgentURL = %q, want empty string for migrated row", got.AgentURL)
+	}
+}
+
 func TestDeleteNode(t *testing.T) {
 	s := openTemp(t)
 	n := Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", CreatedAt: time.Now()}
