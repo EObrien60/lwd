@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"lwd/internal/build"
@@ -22,6 +23,20 @@ import (
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
+
+// fakeInvalidator is a NodeCacheInvalidator that records every name it was
+// asked to invalidate, so tests can assert POST/DELETE /nodes trigger the
+// resolver cache eviction without needing a real RegistryResolver.
+type fakeInvalidator struct {
+	mu    sync.Mutex
+	Calls []string
+}
+
+func (f *fakeInvalidator) Invalidate(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, name)
+}
 
 // testSecretResolver builds a real (but throwaway) secrets.Store for tests
 // that need a reconciler.SecretResolver — the reconciler's tests already
@@ -47,7 +62,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *node.Fake) {
 	t.Cleanup(func() { s.Close() })
 	rt := router.NewFakeRouter()
 	secStore := testSecretResolver(t, s, dir)
-	srv := New(reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore)
+	srv := New(reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore, nil)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f
@@ -67,7 +82,7 @@ func newTestServerWithRouter(t *testing.T) (*httptest.Server, *node.Fake, *route
 	t.Cleanup(func() { s.Close() })
 	rt := router.NewFakeRouter()
 	secStore := testSecretResolver(t, s, dir)
-	srv := New(reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore)
+	srv := New(reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore, nil)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f, rt
@@ -89,7 +104,7 @@ func newTestServerWithCompose(t *testing.T) (*httptest.Server, *router.FakeRoute
 	rt := router.NewFakeRouter()
 	cf := compose.NewFake()
 	secStore := testSecretResolver(t, s, dir)
-	srv := New(reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, cf, source.NewFake(), build.NewFake()), s, f, rt, secStore)
+	srv := New(reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, cf, source.NewFake(), build.NewFake()), s, f, rt, secStore, nil)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, rt, cf
@@ -460,5 +475,114 @@ func TestSecretSetMissingKey(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// newTestServerWithInvalidator is like newTestServer but wires a
+// fakeInvalidator as the Server's NodeCacheInvalidator, so node tests can
+// assert POST/DELETE /nodes trigger cache eviction.
+func newTestServerWithInvalidator(t *testing.T) (*httptest.Server, *fakeInvalidator) {
+	t.Helper()
+	f := node.NewFake()
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	rt := router.NewFakeRouter()
+	secStore := testSecretResolver(t, s, dir)
+	inv := &fakeInvalidator{}
+	srv := New(reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore, inv)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts, inv
+}
+
+func TestNodeAddListRemove(t *testing.T) {
+	ts, inv := newTestServerWithInvalidator(t)
+
+	body, _ := json.Marshal(map[string]string{"name": "web1", "ssh_host": "deploy@web1", "mesh_addr": "100.64.0.2"})
+	resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /nodes: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+
+	resp, err = http.Get(ts.URL + "/nodes")
+	if err != nil {
+		t.Fatalf("GET /nodes: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var nodes []store.Node
+	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "web1" || nodes[0].SSHHost != "deploy@web1" || nodes[0].MeshAddr != "100.64.0.2" {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/nodes/web1", nil)
+	delResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE /nodes/web1: %v", err)
+	}
+	defer delResp.Body.Close()
+	if delResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", delResp.StatusCode)
+	}
+
+	resp2, err := http.Get(ts.URL + "/nodes")
+	if err != nil {
+		t.Fatalf("GET /nodes after delete: %v", err)
+	}
+	defer resp2.Body.Close()
+	var nodes2 []store.Node
+	if err := json.NewDecoder(resp2.Body).Decode(&nodes2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(nodes2) != 0 {
+		t.Fatalf("nodes after delete = %+v, want empty", nodes2)
+	}
+
+	inv.mu.Lock()
+	calls := append([]string(nil), inv.Calls...)
+	inv.mu.Unlock()
+	if len(calls) != 2 || calls[0] != "web1" || calls[1] != "web1" {
+		t.Fatalf("invalidator calls = %+v, want [web1 web1] (POST then DELETE)", calls)
+	}
+}
+
+func TestNodeAddValidatesFields(t *testing.T) {
+	ts, inv := newTestServerWithInvalidator(t)
+
+	cases := []map[string]string{
+		{"name": "", "ssh_host": "deploy@web1", "mesh_addr": "100.64.0.2"},
+		{"name": "web1", "ssh_host": "", "mesh_addr": "100.64.0.2"},
+		{"name": "web1", "ssh_host": "deploy@web1", "mesh_addr": ""},
+	}
+	for _, c := range cases {
+		body, _ := json.Marshal(c)
+		resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /nodes %+v: %v", c, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("case %+v: status = %d, want 400", c, resp.StatusCode)
+		}
+	}
+
+	inv.mu.Lock()
+	calls := len(inv.Calls)
+	inv.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("invalidator called %d times for rejected requests, want 0", calls)
 	}
 }

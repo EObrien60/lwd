@@ -49,6 +49,8 @@ func Run(args []string) int {
 		return runHistory(args[1:])
 	case "secret":
 		return runSecret(args[1:])
+	case "node":
+		return runNode(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
 		return 2
@@ -116,7 +118,10 @@ func runDaemon() int {
 		return rec.SSHHost, rec.MeshAddr, true, nil
 	})
 
-	srv := api.New(reconciler.New(resolver, r, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI()), s, n, r, secStore)
+	// resolver is passed as the api.NodeCacheInvalidator too: POST/DELETE
+	// /nodes call resolver.Invalidate so a node add/update/remove never
+	// leaves a stale cached docker-over-ssh client behind.
+	srv := api.New(reconciler.New(resolver, r, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI()), s, n, r, secStore, resolver)
 
 	sock := config.SocketPath()
 	_ = os.Remove(sock) // clean stale socket
@@ -361,5 +366,63 @@ func runSecretRm(args []string) int {
 		return 1
 	}
 	fmt.Printf("removed secret %s from %s\n", key, app)
+	return 0
+}
+
+func runNode(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: lwd node <add|ls|rm> ...")
+		return 2
+	}
+	switch args[0] {
+	case "add":
+		return runNodeAdd(args[1:])
+	case "ls":
+		return runNodeLs()
+	case "rm":
+		return runNodeRm(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown node command %q\n", args[0])
+		return 2
+	}
+}
+
+func runNodeAdd(args []string) int {
+	if len(args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: lwd node add <name> <ssh-host> <mesh-addr>")
+		return 2
+	}
+	name, sshHost, meshAddr := args[0], args[1], args[2]
+	if err := newClient().AddNode(context.Background(), name, sshHost, meshAddr); err != nil {
+		fmt.Fprintln(os.Stderr, "node add:", err)
+		return 1
+	}
+	fmt.Printf("added node %s (ssh %s, mesh %s)\n", name, sshHost, meshAddr)
+	return 0
+}
+
+func runNodeLs() int {
+	nodes, err := newClient().Nodes(context.Background())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "node ls:", err)
+		return 1
+	}
+	fmt.Printf("%-20s %-30s %s\n", "NAME", "SSH_HOST", "MESH_ADDR")
+	for _, n := range nodes {
+		fmt.Printf("%-20s %-30s %s\n", n.Name, n.SSHHost, n.MeshAddr)
+	}
+	return 0
+}
+
+func runNodeRm(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: lwd node rm <name>")
+		return 2
+	}
+	if err := newClient().RemoveNode(context.Background(), args[0]); err != nil {
+		fmt.Fprintln(os.Stderr, "node rm:", err)
+		return 1
+	}
+	fmt.Println("removed node", args[0])
 	return 0
 }

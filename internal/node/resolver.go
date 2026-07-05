@@ -92,6 +92,18 @@ func (rr *RegistryResolver) ResolveMeta(nodeName string) (Node, string, bool, er
 	return n, meshAddr, false, nil
 }
 
+// Invalidate evicts the cached remote node for name, if any, so a subsequent
+// Resolve/ResolveMeta re-runs lookup and builds a fresh docker-over-ssh Node
+// instead of returning a stale cached one. Call this whenever a node's
+// registry row changes — added/updated (ssh_host or mesh_addr may have
+// changed) or removed — so a stale ssh client never lingers. A no-op if
+// nodeName has no cached entry (e.g. it was never resolved, or is "local").
+func (rr *RegistryResolver) Invalidate(nodeName string) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	delete(rr.remotes, nodeName)
+}
+
 // FakeResolver is a Resolver backed by a plain map, for tests: it returns
 // the mapped Node for a name, or an "unknown node" error if the name isn't
 // present. Unlike RegistryResolver it does not special-case "" or "local" —

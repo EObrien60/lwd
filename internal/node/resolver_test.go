@@ -84,6 +84,52 @@ func TestRegistryResolverRemoteIsCached(t *testing.T) {
 	}
 }
 
+func TestRegistryResolverInvalidate(t *testing.T) {
+	local := NewFake()
+	sshHost := "deploy@web1"
+	var calls int
+	rr := NewRegistryResolver(local, func(name string) (string, string, bool, error) {
+		calls++
+		return sshHost, "100.64.0.2", true, nil
+	})
+
+	n1, err := rr.Resolve("web1")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("lookup calls = %d, want 1", calls)
+	}
+	n1Again, err := rr.Resolve("web1")
+	if err != nil {
+		t.Fatalf("Resolve (cached): %v", err)
+	}
+	if n1Again != n1 || calls != 1 {
+		t.Fatalf("expected cached node with no extra lookup, calls = %d", calls)
+	}
+
+	rr.Invalidate("web1")
+
+	// A changed ssh_host is picked up: lookup runs again and a fresh node is
+	// built rather than the stale cached one being returned.
+	sshHost = "deploy@web1-new"
+	n2, err := rr.Resolve("web1")
+	if err != nil {
+		t.Fatalf("Resolve after invalidate: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("lookup calls after invalidate = %d, want 2 (lookup re-run)", calls)
+	}
+	if n2 == n1 {
+		t.Error("want a freshly built node after Invalidate, not the stale cached instance")
+	}
+
+	// Invalidating a name with no cached entry (never resolved, or local) is
+	// a harmless no-op.
+	rr.Invalidate("never-resolved")
+	rr.Invalidate("local")
+}
+
 func TestRegistryResolverUnknownNode(t *testing.T) {
 	local := NewFake()
 	rr := NewRegistryResolver(local, func(name string) (string, string, bool, error) {
