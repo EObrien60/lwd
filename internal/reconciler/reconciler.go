@@ -316,6 +316,22 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 // blue-green, ensuring any declared backing services first. Callers must
 // hold r.mu; Apply does so before branching here.
 func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Deployment, error) {
+	// Resolve placement (scheduling an unpinned app, or passing a pinned
+	// Node through unchanged) BEFORE the spec snapshot is marshaled, so the
+	// recorded deployment's Spec captures the concrete node an unpinned app
+	// actually landed on, not the "" it declared.
+	chosen, err := r.resolvePlacement(ctx, app)
+	if err != nil {
+		_, _ = r.store.RecordDeployment(store.Deployment{
+			App:       app.Name,
+			Image:     app.Image,
+			Status:    store.StatusFailed,
+			CreatedAt: time.Now(),
+		})
+		return nil, fmt.Errorf("schedule: %w", err)
+	}
+	app.Node = chosen
+
 	specJSON, err := json.Marshal(app)
 	if err != nil {
 		return nil, fmt.Errorf("marshal spec snapshot: %w", err)
@@ -395,6 +411,19 @@ func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Depl
 // services, if declared, are ensured first (same as applyImage). Callers must
 // hold r.mu; Apply does so before branching here.
 func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deployment, error) {
+	// Resolve placement BEFORE the spec snapshot is marshaled, same rationale
+	// as applyImage.
+	chosen, err := r.resolvePlacement(ctx, app)
+	if err != nil {
+		_, _ = r.store.RecordDeployment(store.Deployment{
+			App:       app.Name,
+			Status:    store.StatusFailed,
+			CreatedAt: time.Now(),
+		})
+		return nil, fmt.Errorf("schedule: %w", err)
+	}
+	app.Node = chosen
+
 	specJSON, err := json.Marshal(app)
 	if err != nil {
 		return nil, fmt.Errorf("marshal spec snapshot: %w", err)
@@ -782,8 +811,10 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, ap
 			"lwd.role":   "surface",
 			"lwd.deploy": strconv.FormatInt(deployID, 10),
 		},
-		Port:    app.Port,
-		Network: lwdNetwork,
+		Port:        app.Port,
+		Network:     lwdNetwork,
+		CPUs:        reqCPU(app),
+		MemoryBytes: reqMem(app),
 	}
 	if !isLocal {
 		// HostPort 0 asks the node to assign an ephemeral port; the actual

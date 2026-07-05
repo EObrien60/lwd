@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"lwd/internal/config"
+	"lwd/internal/node"
 	"lwd/internal/store"
 )
 
@@ -207,7 +208,7 @@ func (r *Reconciler) probeNodes(ctx context.Context) []NodeHealth {
 	out := make([]NodeHealth, 0, 1)
 
 	transport, ok := r.reach.Reachable(ctx, "local")
-	out = append(out, NodeHealth{Name: "local", Transport: transport, Reachable: ok, UpdatedAt: now})
+	out = append(out, NodeHealth{Name: "local", Transport: transport, Reachable: ok, UpdatedAt: now, Capacity: r.probeCapacity(ctx, "local")})
 
 	nodes, err := r.store.ListNodes()
 	if err != nil {
@@ -215,9 +216,25 @@ func (r *Reconciler) probeNodes(ctx context.Context) []NodeHealth {
 	}
 	for _, n := range nodes {
 		transport, ok := r.reach.Reachable(ctx, n.Name)
-		out = append(out, NodeHealth{Name: n.Name, Transport: transport, Reachable: ok, UpdatedAt: now})
+		out = append(out, NodeHealth{Name: n.Name, Transport: transport, Reachable: ok, UpdatedAt: now, Capacity: r.probeCapacity(ctx, n.Name)})
 	}
 	return out
+}
+
+// probeCapacity fetches nodeName's Capacity for a health snapshot,
+// best-effort and bounded (capacityBounded): a failed/timed-out fetch (e.g.
+// the node is actually unreachable) reports a zero Capacity rather than
+// failing the whole probe pass.
+func (r *Reconciler) probeCapacity(ctx context.Context, nodeName string) node.Capacity {
+	n, err := r.resolver.Resolve(nodeName)
+	if err != nil {
+		return node.Capacity{}
+	}
+	c, err := capacityBounded(ctx, n)
+	if err != nil {
+		return node.Capacity{}
+	}
+	return c
 }
 
 // probeEdge returns the current reachability of the shared edge (router).

@@ -3,6 +3,8 @@ package reconciler
 import (
 	"context"
 	"time"
+
+	"lwd/internal/node"
 )
 
 // SurfaceState is the self-heal lifecycle state of a single app's surface,
@@ -43,6 +45,11 @@ type NodeHealth struct {
 	Transport string    `json:"transport"`
 	Reachable bool      `json:"reachable"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// Capacity is a best-effort snapshot of the node's resources, fetched
+	// alongside its reachability probe (Phase 11a Task 7). A failed/timed-out
+	// fetch leaves this zero-valued (Capacity.Known == false) rather than
+	// failing the whole probe.
+	Capacity node.Capacity `json:"capacity"`
 }
 
 // EdgeHealth is the observed reachability of the shared edge (router/Caddy).
