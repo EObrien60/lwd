@@ -1,0 +1,8 @@
+name     = "worker"
+image    = "ghcr.io/me/worker:latest"
+domain   = "worker.example.com"
+port     = 8080
+replicas = 3
+
+[health]
+path = "/healthz"

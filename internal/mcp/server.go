@@ -27,6 +27,7 @@ type ClientIface interface {
 	Logs(ctx context.Context, name string, follow bool, w io.Writer) error
 	Apply(ctx context.Context, app *spec.App) (*store.Deployment, error)
 	Rollback(ctx context.Context, name string) (*store.Deployment, error)
+	Scale(ctx context.Context, name string, replicas int) (*store.Deployment, error)
 	Remove(ctx context.Context, name string) error
 	SetSecret(ctx context.Context, app, key, value string) error
 	ListSecrets(ctx context.Context, app string) ([]string, error)
@@ -77,6 +78,7 @@ func (s *Server) registerTools(srv *sdk.Server) {
 	s.registerLwdApply(srv)
 	s.registerLwdDeployGit(srv)
 	s.registerLwdRollback(srv)
+	s.registerLwdScale(srv)
 	s.registerLwdRemove(srv)
 	s.registerLwdSecretSet(srv)
 	s.registerLwdSecretList(srv)

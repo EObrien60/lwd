@@ -58,6 +58,26 @@ func TestApiApps(t *testing.T) {
 	}
 }
 
+// TestApiAppsIncludesReplicas covers Phase 12 Task 8: GET /api/apps passes
+// api.AppStatus.Replicas straight through (no web-layer transformation), so
+// the frontend's replica count/scale control has something to render.
+func TestApiAppsIncludesReplicas(t *testing.T) {
+	fd := newFakeDaemon()
+	fd.apps = []api.AppStatus{
+		{Name: "blog", Image: "img:1", Status: store.StatusRunning, Domain: "blog.example.com", Replicas: 3},
+	}
+	srv, auth := testServer(fd)
+
+	rec := do(srv, authedRequest(t, auth, http.MethodGet, "/api/apps", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"replicas":3`) {
+		t.Fatalf("body = %s, want it to contain \"replicas\":3", rec.Body)
+	}
+}
+
 func TestApiAppDetail(t *testing.T) {
 	fd := newFakeDaemon()
 	fd.apps = []api.AppStatus{
@@ -286,6 +306,63 @@ func TestApiRollbackError(t *testing.T) {
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+}
+
+// TestApiScale covers POST /api/apps/{name}/scale: it decodes the JSON
+// {"replicas": N} body, proxies client.Scale, and renders the resulting
+// store.Deployment — mirroring rollback/redeploy's shape.
+func TestApiScale(t *testing.T) {
+	fd := newFakeDaemon()
+	fd.scaleResult = &store.Deployment{App: "blog", Image: "img:1", Status: store.StatusRunning, Replicas: make([]store.Replica, 3)}
+	srv, auth := testServer(fd)
+
+	body := strings.NewReader(`{"replicas": 3}`)
+	req := authedRequest(t, auth, http.MethodPost, "/api/apps/blog/scale", body)
+	rec := do(srv, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+	var dep store.Deployment
+	if err := json.Unmarshal(rec.Body.Bytes(), &dep); err != nil {
+		t.Fatalf("unmarshal: %v (body %s)", err, rec.Body)
+	}
+	if len(dep.Replicas) != 3 {
+		t.Fatalf("dep.Replicas = %+v, want len 3", dep.Replicas)
+	}
+	if len(fd.scaleCalls) != 1 || fd.scaleCalls[0].Name != "blog" || fd.scaleCalls[0].Replicas != 3 {
+		t.Fatalf("scaleCalls = %+v, want one call for blog with replicas=3", fd.scaleCalls)
+	}
+}
+
+func TestApiScaleError(t *testing.T) {
+	fd := newFakeDaemon()
+	fd.scaleErr = errString("replicas must be >= 1")
+	srv, auth := testServer(fd)
+
+	req := authedRequest(t, auth, http.MethodPost, "/api/apps/blog/scale", strings.NewReader(`{"replicas": 0}`))
+	rec := do(srv, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+}
+
+// TestApiScaleRequiresAuth covers that POST /api/apps/{name}/scale, like
+// every other /api route, 401s without a valid session cookie.
+func TestApiScaleRequiresAuth(t *testing.T) {
+	fd := newFakeDaemon()
+	srv, _ := testServer(fd)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/apps/blog/scale", strings.NewReader(`{"replicas": 3}`))
+	rec := do(srv, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+	if len(fd.scaleCalls) != 0 {
+		t.Fatalf("want Scale never called when unauthed, got %+v", fd.scaleCalls)
 	}
 }
 

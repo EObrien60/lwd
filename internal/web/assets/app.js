@@ -290,6 +290,18 @@ function appendServiceTables(lines, services) {
 // and BEFORE any table header ([git]/[[services]]): once a header is
 // written, subsequent bare `key = value` lines belong to that table, not the
 // root document.
+// replicasLine renders the optional `replicas = N` line for a placement form
+// (f.replicas), omitted for a blank, non-numeric, or <=1 value — Parse
+// already defaults an omitted count to 1 (see spec.go), so emitting
+// "replicas = 1" explicitly would be redundant noise in the generated
+// document. Like requirementsLines, this is a root-level scalar and must be
+// emitted before any table header ([git]/[[services]]).
+function replicasLine(f) {
+  const n = parseInt(f.replicas, 10);
+  if (!n || n <= 1) return [];
+  return [`replicas = ${n}`];
+}
+
 function requirementsLines(f) {
   const cpu = String(f.reqCpu || '').trim();
   const memory = (f.reqMemory || '').trim();
@@ -318,6 +330,7 @@ function buildGitToml(f) {
   if (env) lines.push(`env = ${env}`);
   const secrets = namesToArray(f.secrets);
   if (secrets) lines.push(`secrets = ${secrets}`);
+  lines.push(...replicasLine(f));
   lines.push(...requirementsLines(f));
 
   lines.push('');
@@ -353,6 +366,7 @@ function buildBuilderToml(f) {
   if (env) lines.push(`env = ${env}`);
   const secrets = namesToArray(f.secrets);
   if (secrets) lines.push(`secrets = ${secrets}`);
+  lines.push(...replicasLine(f));
   lines.push(...requirementsLines(f));
 
   appendServiceTables(lines, f.services);
@@ -458,6 +472,9 @@ function dashboard() {
     deleteBusy: false,
     rollbackBusyId: null,
     redeployBusy: false,
+
+    // ---- replicas / scale (Phase 12) -----------------------------------
+    scaleBusy: false,
 
     // ---- toasts ------------------------------------------------------
     toasts: [],
@@ -664,6 +681,53 @@ function dashboard() {
         this.notify('err', e.message || 'Redeploy failed.');
       } finally {
         this.redeployBusy = false;
+      }
+    },
+
+    // ====================================================================
+    // replicas / scale (Phase 12)
+    // ====================================================================
+    // currentReplicas is the live replica count from the overview/detail
+    // status (api.AppStatus.Replicas), which already defaults a legacy
+    // (pre-Phase-12) or not-yet-loaded app to 1 — see api.AppStatus's own
+    // comment. This drives the stepper's displayed count and its bounds.
+    get currentReplicas() {
+      return (this.detail && this.detail.status && this.detail.status.replicas) || 1;
+    },
+
+    // currentReplicaList is the current deployment's per-replica detail
+    // (node/container/upstream), sourced from history[0].Replicas — the
+    // same store.Deployment snapshot the Deployments tab's history table
+    // already renders, just its Replicas field instead of Image/Status.
+    // Empty for a legacy pre-Phase-12 deployment row (Replicas was never
+    // populated) or an app with no history yet; the template shows a
+    // fallback message rather than an empty table in that case.
+    get currentReplicaList() {
+      if (!this.detail || !this.detail.history || !this.detail.history.length) return [];
+      return this.detail.history[0].Replicas || [];
+    },
+
+    // scaleBy adjusts the current app's replica count by delta (+1/-1 from
+    // the stepper buttons) via POST /api/apps/{name}/scale, clamped to
+    // spec.Validate's own [1, 50] range so an out-of-range click is a no-op
+    // rather than a guaranteed-to-fail round trip.
+    async scaleBy(delta) {
+      const next = this.currentReplicas + delta;
+      if (next < 1 || next > 50) return;
+      this.scaleBusy = true;
+      try {
+        await apiFetch(`/api/apps/${encodeURIComponent(this.selected)}/scale`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ replicas: next }),
+        });
+        this.notify('ok', `Scaled ${this.selected} to ${next} ${next === 1 ? 'replica' : 'replicas'}.`);
+        await this.loadDetail();
+        await this.loadApps({ silent: true });
+      } catch (e) {
+        this.notify('err', e.message || 'Scale failed.');
+      } finally {
+        this.scaleBusy = false;
       }
     },
 
@@ -945,7 +1009,7 @@ function dashboard() {
     newGitForm() {
       return {
         url: '', ref: 'main', subdir: '', dockerfile: 'Dockerfile',
-        name: '', domain: '', port: '', node: 'local', pool: '', reqCpu: '', reqMemory: '',
+        name: '', domain: '', port: '', node: 'local', pool: '', reqCpu: '', reqMemory: '', replicas: '',
         env: [], secrets: [], services: [],
       };
     },
@@ -953,7 +1017,7 @@ function dashboard() {
     newBuilderForm() {
       return {
         image: '',
-        name: '', domain: '', port: '', node: 'local', pool: '', reqCpu: '', reqMemory: '',
+        name: '', domain: '', port: '', node: 'local', pool: '', reqCpu: '', reqMemory: '', replicas: '',
         env: [], secrets: [], services: [],
       };
     },

@@ -61,6 +61,7 @@ lwd ls                # list apps and status
 lwd logs blog -f      # stream logs
 lwd history blog      # show past deployments for an app
 lwd rollback blog     # redeploy the previous version
+lwd scale blog 3      # run 3 load-balanced replicas (see Replicas & load balancing)
 lwd rm blog           # stop and deregister
 ```
 
@@ -811,6 +812,85 @@ same three operations as `lwd_node_drain`/`lwd_node_evacuate`/
 `lwd_node_uncordon` tools — see [Web UI](#web-ui-lwd-web) and [Agent
 access](#agent-access-lwd-mcp).
 
+## Replicas & load balancing
+
+Every app so far has run as exactly one container. Phase 12 lets an `image`
+or `[git]`-built app run as **N load-balanced replicas** instead — declare it
+in `lwd.toml`:
+
+```toml
+replicas = 3
+```
+
+or scale a running app live, without touching `lwd.toml`:
+
+```bash
+lwd scale blog 3     # scale up
+lwd scale blog 1      # scale back down to a single instance
+```
+
+`lwd scale` (and the equivalent `POST /apps/{name}/scale` daemon API,
+`lwd-web`'s scale control, and `lwd-mcp`'s `lwd_scale` tool) reuses the app's
+**current recorded spec snapshot** — same as `lwd rollback` — and only
+changes `Replicas`, so scaling never accidentally picks up an unrelated
+`lwd.toml` edit sitting on disk.
+
+- **Round-robin + passive health.** Caddy load-balances across every replica
+  with a simple round-robin policy, and passively ejects one that starts
+  failing (`fail_duration`) from rotation until it recovers — no separate
+  health-check polling loop on the router's side. For `replicas = 1` (the
+  default), the Caddyfile it generates is **byte-identical** to every
+  earlier phase: a single-replica app is not a "1-wide load-balanced pool"
+  internally, it's the exact same single-upstream route as before Phase 12.
+- **Spread placement.** An unpinned (`node` unset) multi-replica app is
+  scheduled one replica per node, ranked by the same most-free-capacity
+  logic as a single-replica app (see [Scheduling &
+  pools](#scheduling--pools)) — falling back to sharing nodes if there
+  aren't enough distinct ones to go around. A **pinned** (`node = "..."`)
+  multi-replica app puts every replica on that one node.
+- **Deploy is still zero-downtime blue-green, just for the whole set at
+  once:** a fresh set of N replicas is started and health-gated (same
+  layered policy as a single-service app — `health.path`, then Docker
+  `HEALTHCHECK`, then plain liveness) before the live route flips to it;
+  if even ONE new replica fails health, the whole generation is rolled back
+  — nothing new goes live, and whatever was already running keeps serving
+  untouched. Only once every replica in the new set is confirmed healthy are
+  the old set's replicas retired, each removed on **its own node**.
+- **Per-replica self-heal and failover.** The [continuous
+  reconciler](#self-healing--health) heals a dead replica **individually, in
+  place, on its own node** — the other replicas are never touched, and
+  there's no whole-set redeploy just because one instance crashed. The same
+  granularity applies to [automatic node-loss
+  failover](#automatic-failover-on-node-loss) and manual
+  [drain/evacuate](#operator-initiated-drain-evacuate-uncordon): only the
+  replicas actually on the affected node move; siblings on other nodes are
+  left running.
+- **Not supported with `compose =` apps or `[[services]]`.** A compose app's
+  lifecycle already belongs to `docker compose`, not lwd's blue-green model.
+  Backing services run **pinned** on a single node's per-app network, so a
+  multi-node replica set would leave every replica but the pinned anchor's
+  unable to reach it — `lwd.toml` validation rejects `replicas > 1` combined
+  with either.
+- **`replicas = 1` (or omitting the field) is exactly today's single
+  surface** — one container, one upstream, nothing new to reason about. This
+  is a deliberate non-regression contract, not just a default: every
+  earlier phase's behavior, tests, and generated Caddy config are unchanged
+  for a single-replica app.
+- **Human-scaling only** — there is no autoscaler, no target-CPU/RPS policy,
+  and no continuous rebalancing of a healthy multi-replica set. You (or your
+  own external tooling, via the daemon API / `lwd-mcp`) decide when to scale;
+  lwd just executes it safely.
+
+`lwd-web`'s app detail view has a **Replicas** tab: the live count, a
+scale up/down control, and a per-replica table (node, container, upstream)
+sourced from the current deployment's recorded replica set; the Deploy
+modal's **From Git**/**Builder** tabs have an optional **Replicas** field
+that emits `replicas = N` into the generated document. `lwd-mcp` exposes
+`lwd_scale` (`{app, replicas}`, annotated `destructiveHint`) plus an optional
+`replicas` argument on `lwd_apply`/`lwd_deploy_git`; `lwd_status`/`lwd_list`
+(and the plain daemon `GET /apps`) already report the current replica count
+via `api.AppStatus.Replicas`.
+
 ## Secrets
 
 Apps can declare secret names in `lwd.toml`:
@@ -922,7 +1002,9 @@ built-in TLS, so don't expose it directly to the internet. Instead:
 ### Features
 
 - **Overview** — every app's name, domain, status, image, and health at a
-  glance, with a **Deploy** action to create a new app.
+  glance (plus a `×N` badge for a load-balanced app — see [Replicas & load
+  balancing](#replicas--load-balancing)), with a **Deploy** action to create
+  a new app.
 - **Deploy modal — From Git / Builder / Paste** — three ways to author a new
   app's `lwd.toml`, each with a live preview of the generated document:
   - **From Git** builds a [git-deployed](#deploy-from-git) app: URL, ref,
@@ -936,9 +1018,15 @@ built-in TLS, so don't expose it directly to the internet. Instead:
   `[[services]]` entries (name, image, command, env, secrets, volume) into
   the generated document — see [Backing services](#backing-services). Both
   also have a **Node** dropdown (`Auto`/`local`/a registered node), an
-  optional **Pool** dropdown, and optional **CPU**/**Memory** requirement
-  fields that emit `node`/`pool`/`[requirements]` — see
-  [Scheduling & pools](#scheduling--pools).
+  optional **Pool** dropdown, optional **CPU**/**Memory** requirement
+  fields, and an optional **Replicas** field, that emit
+  `node`/`pool`/`[requirements]`/`replicas` — see [Scheduling &
+  pools](#scheduling--pools) and [Replicas & load
+  balancing](#replicas--load-balancing).
+- **Replicas** — a tab on the app detail view: the live replica count, a
+  scale up/down control (`POST /api/apps/{name}/scale`), and a per-replica
+  table (node, container, upstream) — see [Replicas & load
+  balancing](#replicas--load-balancing).
 - **Live logs** — a per-app log stream over SSE, with a follow toggle.
 - **History + rollback** — past deployments for an app, with a one-click
   **Roll back** to any prior deployment (for a git-built app, this redeploys
@@ -1028,13 +1116,14 @@ ever returned by any tool):
 
 | Tool | Description |
 | --- | --- |
-| `lwd_list` | List all lwd-managed apps with their current status, image, and domain. |
-| `lwd_status` | Get the current status and deployment history of a single app. |
+| `lwd_list` | List all lwd-managed apps with their current status, image, domain, and replica count. |
+| `lwd_status` | Get the current status (including replica count) and deployment history of a single app. |
 | `lwd_logs` | Get the most recent logs (`tail`-limited, default 200 lines) for an app. |
 | `lwd_history` | List recorded deployments (image, status, time) for an app. |
-| `lwd_apply` | Deploy an app from an `lwd.toml`, given inline (`toml`) or a local directory (`dir`); optional `node`/`pool`/`requirements` (`cpu`, `memory`) arguments set the same-named `lwd.toml` fields before validating, overriding whatever the toml itself says — see [Scheduling & pools](#scheduling--pools). |
-| `lwd_deploy_git` | Deploy an app built from a git repo, from discrete fields (url/ref/dockerfile/name/domain/port/services), without hand-authoring an `lwd.toml`; also takes optional `node`/`pool`/`requirements` arguments. |
+| `lwd_apply` | Deploy an app from an `lwd.toml`, given inline (`toml`) or a local directory (`dir`); optional `node`/`pool`/`requirements` (`cpu`, `memory`)/`replicas` arguments set the same-named `lwd.toml` fields before validating, overriding whatever the toml itself says — see [Scheduling & pools](#scheduling--pools) and [Replicas & load balancing](#replicas--load-balancing). |
+| `lwd_deploy_git` | Deploy an app built from a git repo, from discrete fields (url/ref/dockerfile/name/domain/port/services), without hand-authoring an `lwd.toml`; also takes optional `node`/`pool`/`requirements`/`replicas` arguments. |
 | `lwd_rollback` | Roll back an app to its previous deployment. |
+| `lwd_scale` | Change an app's replica count; the router load-balances across the resulting set — see [Replicas & load balancing](#replicas--load-balancing). |
 | `lwd_remove` | Permanently stop and remove an app. |
 | `lwd_secret_set` | Set (or overwrite) a secret value for an app. The value is never echoed back. |
 | `lwd_secret_list` | List the names of secrets set for an app — names only, never values. |
@@ -1048,12 +1137,13 @@ ever returned by any tool):
 
 `lwd_list`, `lwd_status`, `lwd_logs`, `lwd_history`, `lwd_secret_list`, and
 `lwd_node_list` are annotated `readOnlyHint: true`; `lwd_remove`,
-`lwd_secret_delete`, `lwd_node_remove`, `lwd_node_drain`, and
-`lwd_node_evacuate` are annotated `destructiveHint: true` (drain/evacuate
-actually move — and tear down — running surfaces); `lwd_node_uncordon` is
-deliberately NOT annotated destructive — it only lifts a placement
-restriction and never touches anything already running. lwd-mcp itself asks
-nothing before calling the daemon — it relies entirely on **the MCP host's
+`lwd_secret_delete`, `lwd_node_remove`, `lwd_node_drain`, `lwd_node_evacuate`,
+and `lwd_scale` are annotated `destructiveHint: true` (scale, like
+drain/evacuate, actually tears down and recreates running containers);
+`lwd_node_uncordon` is deliberately NOT annotated destructive — it only
+lifts a placement restriction and never touches anything already running.
+lwd-mcp itself asks nothing before calling the daemon — it relies entirely
+on **the MCP host's
 own per-call approval UI** (e.g. Claude Code's tool-permission prompt) to
 gate destructive and state-changing tools before they run; there is no
 additional confirmation argument to pass.
@@ -1123,22 +1213,35 @@ additional confirmation argument to pass.
   (default `60s`). Only scheduler-placed surfaces ever move — pinned apps,
   compose apps, and backing services never do. Single-node installs are
   unaffected (nothing to fail over with no other node registered).
+- **Surface replicas + load balancing** (Phase 12, see [Replicas & load
+  balancing](#replicas--load-balancing)) are fully live: `replicas = N` in
+  `lwd.toml` (or `lwd scale <app> <replicas>` / the daemon API / `lwd-web` /
+  `lwd-mcp` live, no redeploy-from-source needed) for `image`/`[git]` apps —
+  Caddy round-robins with passive health across the set, placement spreads
+  one replica per node, deploy is set-based blue-green (the whole new set
+  must be healthy before it goes live), and self-heal/failover act on
+  individual replicas rather than the whole set. Human-scaling only (no
+  autoscaler). Not supported with `compose =` apps or `[[services]]`.
+  `replicas = 1` (the default) is byte-identical to every earlier phase.
 - [`lwd-web`](#web-ui-lwd-web) (a separate dashboard binary) is fully live:
   overview, live logs, history/rollback, secrets, redeploy, config edit, a
-  **Nodes** view (list/add/remove/drain/evacuate/uncordon, live transport +
-  reachability + pool + schedulable state), a **Health** view (the
-  continuous reconciler's live snapshot, including per-node CPU/memory/disk
-  and cordon state), and a Deploy modal with **From Git**, **Builder**, and
-  **Paste** tabs (From Git and Builder support declaring backing services,
-  picking a node/pool, and setting resource requirements), all as a thin
-  client of the same daemon API the CLI uses. Deploying `lwd-web` itself as
-  an lwd-managed app and multi-user auth are not built yet.
+  **Replicas** tab (live count, per-replica node/container/upstream table, a
+  scale up/down control), a **Nodes** view
+  (list/add/remove/drain/evacuate/uncordon, live transport + reachability +
+  pool + schedulable state), a **Health** view (the continuous reconciler's
+  live snapshot, including per-node CPU/memory/disk and cordon state), and a
+  Deploy modal with **From Git**, **Builder**, and **Paste** tabs (From Git
+  and Builder support declaring backing services, picking a node/pool,
+  setting resource requirements, and an optional replica count), all as a
+  thin client of the same daemon API the CLI uses. Deploying `lwd-web`
+  itself as an lwd-managed app and multi-user auth are not built yet.
 - [`lwd-mcp`](#agent-access-lwd-mcp) (a separate stdio MCP server binary) is
-  fully live: all seventeen tools (list/status/logs/history/apply/deploy_git/
-  rollback/remove/secret set-list-delete/node list-add-remove-drain-evacuate-
-  uncordon), including pool/requirements/capacity and node
-  drain/evacuate/uncordon (see [Node maintenance &
-  failover](#node-maintenance--failover)), as a thin client of the same
+  fully live: all eighteen tools
+  (list/status/logs/history/apply/deploy_git/rollback/scale/remove/secret
+  set-list-delete/node list-add-remove-drain-evacuate-uncordon), including
+  pool/requirements/replicas/capacity and node drain/evacuate/uncordon (see
+  [Node maintenance & failover](#node-maintenance--failover) and [Replicas &
+  load balancing](#replicas--load-balancing)), as a thin client of the same
   daemon API the CLI and `lwd-web` use — no daemon changes, no network
   listener, no secret value ever returned. Networked MCP transport is not
   built yet.
@@ -1203,9 +1306,15 @@ additional confirmation argument to pass.
   failover](#node-maintenance--failover) moves a surface off a lost node, it
   stays on its new node even after the old one comes back — nothing
   re-populates a recovered node automatically, and a healthy fleet is never
-  rebalanced in the background. Surface **replicas** and load-balancing
-  across them (so losing one instance is a non-event, and load can be
-  spread deliberately) are a later milestone (P12, see `docs/VISION.md`).
+  rebalanced in the background. This applies equally to a multi-replica
+  app's individual replicas (see [Replicas & load
+  balancing](#replicas--load-balancing)): a healed/failed-over replica stays
+  on its new placement, it doesn't move back or get rebalanced later.
+- **Replicas are human-scaled only** (see [Replicas & load
+  balancing](#replicas--load-balancing)) — no autoscaler, no
+  target-CPU/RPS-based policy, and not supported for `compose =` apps or
+  apps with `[[services]]`. A single edge (Caddy) load-balances across a
+  replica set's upstreams; N Caddy edges is P13 (see `docs/VISION.md`).
 - A remote surface's mesh-address traffic between the controller's Caddy and
   the node is **plain HTTP** — lwd relies on the mesh itself (e.g.
   WireGuard) for transport encryption between nodes; it adds none of its
@@ -1233,7 +1342,7 @@ stack, drives `lwd-web`'s HTTP handler over real HTTP through a real
 tag): it starts the same kind of fake-backed daemon on a temp unix socket,
 builds a real `internal/client`, wires it into `mcp.NewServer`, and drives
 the real go-sdk MCP server over an in-memory transport — `tools/list`
-(asserting every one of the seventeen tools is registered), then `lwd_list`
+(asserting every one of the eighteen tools is registered), then `lwd_list`
 (empty), `lwd_apply` with an inline `lwd.toml`, and `lwd_list` again to
 confirm the app appears — proving the agent tool call → `lwd-mcp` →
 `internal/client` → daemon chain end to end.
@@ -1341,6 +1450,20 @@ explicitly pinned to the same node, marks that node unreachable, seeds
 `Reconciler.SeedUnreachableSince`, so the test doesn't sleep), and asserts a
 plain `Reconcile` pass moves only the scheduled surface — the pinned one is
 left running untouched, reported `degraded`.
+
+Nor does the **[replicas](#replicas--load-balancing) path**:
+`TestEndToEndReplicas`, also always part of `go test ./...`, entirely against
+fakes — a real reconciler/store/scheduler and three registered `node.Fake`s
+in pool `"default"` with distinct `MemAvailable`. It deploys an unpinned
+`Replicas: 3` app and asserts all 3 land on 3 distinct nodes with a
+3-upstream live route and a 3-entry `Deployment.Replicas`; scales it down to
+1 (the same current-spec-snapshot-plus-overridden-Replicas path `POST
+/apps/{name}/scale` uses) and asserts the other two replicas' containers are
+removed on their own nodes and the route drops to 1 upstream; then scales
+back to 3, kills exactly one replica's container, and asserts a plain
+`Reconcile` pass recreates ONLY that replica, in place, on its own node —
+the deployment row updated in place (same ID) and the other two replicas
+completely untouched.
 
 All six Docker-gated tests clean up every container, network, node
 registration, and (for the git test) built image they create, and will

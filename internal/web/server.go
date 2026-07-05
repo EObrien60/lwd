@@ -25,6 +25,7 @@ type DaemonClient interface {
 	Logs(ctx context.Context, name string, follow bool, w io.Writer) error
 	Apply(ctx context.Context, app *spec.App) (*store.Deployment, error)
 	Rollback(ctx context.Context, name string) (*store.Deployment, error)
+	Scale(ctx context.Context, name string, replicas int) (*store.Deployment, error)
 	Remove(ctx context.Context, name string) error
 	SetSecret(ctx context.Context, app, key, value string) error
 	ListSecrets(ctx context.Context, app string) ([]string, error)
@@ -70,6 +71,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/apps/{name}", s.handleAppDetail)
 	mux.HandleFunc("POST /api/apps/{name}/rollback", s.handleRollback)
 	mux.HandleFunc("POST /api/apps/{name}/redeploy", s.handleRedeploy)
+	mux.HandleFunc("POST /api/apps/{name}/scale", s.handleScale)
 	mux.HandleFunc("POST /api/apply", s.handleApply)
 	mux.HandleFunc("DELETE /api/apps/{name}", s.handleDelete)
 	mux.HandleFunc("GET /api/apps/{name}/secrets", s.handleSecretList)
