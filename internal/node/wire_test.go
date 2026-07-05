@@ -1,12 +1,10 @@
-package agent
+package node
 
 import (
 	"encoding/json"
 	"reflect"
 	"testing"
 	"time"
-
-	"lwd/internal/node"
 )
 
 // roundTrip marshals v to JSON, unmarshals into a fresh zero value of the
@@ -26,14 +24,14 @@ func roundTrip[T any](t *testing.T, v T) T {
 
 func TestRunRequestRoundTrip(t *testing.T) {
 	req := RunRequest{
-		Spec: node.RunSpec{
+		Spec: RunSpec{
 			Name:    "x",
 			Image:   "i",
 			Port:    80,
 			Network: "lwd",
 			Env:     map[string]string{"A": "b"},
 			Labels:  map[string]string{"lwd.app": "x"},
-			Publish: []node.PortMapping{
+			Publish: []PortMapping{
 				{HostIP: "10.0.0.1", HostPort: 0, ContainerPort: 80},
 			},
 			Cmd: []string{"echo", "hi"},
@@ -47,7 +45,7 @@ func TestRunRequestRoundTrip(t *testing.T) {
 
 func TestRunResponseRoundTrip(t *testing.T) {
 	resp := RunResponse{
-		Container: node.Container{
+		Container: Container{
 			ID:       "abc123",
 			Name:     "x",
 			Image:    "i",
@@ -73,7 +71,7 @@ func TestImagePresentResponseRoundTrip(t *testing.T) {
 
 func TestHealthCheckRequestRoundTrip(t *testing.T) {
 	req := HealthCheckRequest{
-		Container: node.Container{
+		Container: Container{
 			ID:       "abc123",
 			Name:     "x",
 			Image:    "i",
@@ -82,7 +80,7 @@ func TestHealthCheckRequestRoundTrip(t *testing.T) {
 			HostPort: 8080,
 			IP:       "172.17.0.2",
 		},
-		Health: node.HealthSpec{
+		Health: HealthSpec{
 			Path:    "/healthz",
 			Timeout: 5 * time.Second,
 		},
@@ -104,7 +102,7 @@ func TestRemainingTypesRoundTrip(t *testing.T) {
 	if got := roundTrip(t, listReq); !reflect.DeepEqual(listReq, got) {
 		t.Fatalf("ListRequest round-trip mismatch: %+v", got)
 	}
-	listResp := ListResponse{Containers: []node.Container{
+	listResp := ListResponse{Containers: []Container{
 		{ID: "1", Name: "a", Image: "i", State: "running", Labels: map[string]string{"k": "v"}, HostPort: 1, IP: "1.2.3.4"},
 	}}
 	if got := roundTrip(t, listResp); !reflect.DeepEqual(listResp, got) {

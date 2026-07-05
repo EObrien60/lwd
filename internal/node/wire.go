@@ -1,11 +1,16 @@
-// Package agent defines the wire contract shared by the lwd-agent HTTP
-// server and the agentNode HTTP client: request/response DTOs that wrap
-// node.Node's primitives, and the HTTP path constants both sides dial
-// against. Keeping these in one file/package means the server and client
-// can't drift on field names or paths.
-package agent
+package node
 
-import "lwd/internal/node"
+// This file defines the wire contract shared by the lwd-agent HTTP server
+// (internal/agent.Server) and the AgentNode HTTP client (agent.go):
+// request/response DTOs that wrap node.Node's primitives, and the HTTP path
+// constants both sides dial against.
+//
+// It lives in package node — not internal/agent — because internal/agent
+// already imports internal/node (its Server holds a node.Node and its DTOs
+// wrap RunSpec/Container/HealthSpec). Putting the wire contract here means
+// BOTH the server (which imports node) and the client (AgentNode, which IS
+// node) reference the exact same types with no import cycle, so client and
+// server cannot drift on field names, json tags, or paths.
 
 // HTTP path constants shared by the agent server and client.
 const (
@@ -26,12 +31,12 @@ const (
 
 // RunRequest is the body of a POST PathRun request.
 type RunRequest struct {
-	Spec node.RunSpec `json:"spec"`
+	Spec RunSpec `json:"spec"`
 }
 
 // RunResponse is the body of a PathRun response.
 type RunResponse struct {
-	Container node.Container `json:"container"`
+	Container Container `json:"container"`
 }
 
 // RemoveRequest is the body of a POST PathRemove request.
@@ -46,7 +51,7 @@ type ListRequest struct {
 
 // ListResponse is the body of a PathList response.
 type ListResponse struct {
-	Containers []node.Container `json:"containers"`
+	Containers []Container `json:"containers"`
 }
 
 // EnsureImageRequest is the body of a POST PathEnsureImage request.
@@ -91,8 +96,8 @@ type ContainerHealthResponse struct {
 // nanoseconds; that round-trips losslessly, it's just carried as-is (not
 // re-encoded as a duration string).
 type HealthCheckRequest struct {
-	Container node.Container  `json:"container"`
-	Health    node.HealthSpec `json:"health"`
+	Container Container  `json:"container"`
+	Health    HealthSpec `json:"health"`
 }
 
 // ErrorResponse is the JSON body returned for non-2xx responses.

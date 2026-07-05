@@ -29,21 +29,21 @@ func NewServer(n node.Node, token string) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET "+PathHealthz, s.handleHealthz)
+	mux.HandleFunc("GET "+node.PathHealthz, s.handleHealthz)
 
-	mux.HandleFunc("POST "+PathEnsureImage, s.handleEnsureImage)
-	mux.HandleFunc("POST "+PathImagePresent, s.handleImagePresent)
-	mux.HandleFunc("POST "+PathEnsureNetwork, s.handleEnsureNetwork)
-	mux.HandleFunc("POST "+PathConnectNetwork, s.handleConnectNetwork)
-	mux.HandleFunc("POST "+PathRun, s.handleRun)
-	mux.HandleFunc("POST "+PathRemove, s.handleRemove)
-	mux.HandleFunc("POST "+PathList, s.handleList)
-	mux.HandleFunc("POST "+PathHealth, s.handleHealth)
-	mux.HandleFunc("POST "+PathContainerHealth, s.handleContainerHealth)
+	mux.HandleFunc("POST "+node.PathEnsureImage, s.handleEnsureImage)
+	mux.HandleFunc("POST "+node.PathImagePresent, s.handleImagePresent)
+	mux.HandleFunc("POST "+node.PathEnsureNetwork, s.handleEnsureNetwork)
+	mux.HandleFunc("POST "+node.PathConnectNetwork, s.handleConnectNetwork)
+	mux.HandleFunc("POST "+node.PathRun, s.handleRun)
+	mux.HandleFunc("POST "+node.PathRemove, s.handleRemove)
+	mux.HandleFunc("POST "+node.PathList, s.handleList)
+	mux.HandleFunc("POST "+node.PathHealth, s.handleHealth)
+	mux.HandleFunc("POST "+node.PathContainerHealth, s.handleContainerHealth)
 
-	mux.HandleFunc("GET "+PathLogs, s.handleLogs)
-	mux.HandleFunc("GET "+PathSave, s.handleSave)
-	mux.HandleFunc("POST "+PathLoad, s.handleLoad)
+	mux.HandleFunc("GET "+node.PathLogs, s.handleLogs)
+	mux.HandleFunc("GET "+node.PathSave, s.handleSave)
+	mux.HandleFunc("POST "+node.PathLoad, s.handleLoad)
 
 	return authMiddleware(s.token, mux)
 }
@@ -55,12 +55,12 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// writeErr writes an ErrorResponse with the given status code.
+// writeErr writes an node.ErrorResponse with the given status code.
 func writeErr(w http.ResponseWriter, code int, err error) {
-	writeJSON(w, code, ErrorResponse{Error: err.Error()})
+	writeJSON(w, code, node.ErrorResponse{Error: err.Error()})
 }
 
-// decodeJSON decodes r's body into v, writing a 400 ErrorResponse and
+// decodeJSON decodes r's body into v, writing a 400 node.ErrorResponse and
 // reporting false on failure.
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
@@ -79,7 +79,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEnsureImage(w http.ResponseWriter, r *http.Request) {
-	var req EnsureImageRequest
+	var req node.EnsureImageRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
@@ -91,7 +91,7 @@ func (s *Server) handleEnsureImage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleImagePresent(w http.ResponseWriter, r *http.Request) {
-	var req ImagePresentRequest
+	var req node.ImagePresentRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
@@ -100,11 +100,11 @@ func (s *Server) handleImagePresent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, ImagePresentResponse{Present: present})
+	writeJSON(w, http.StatusOK, node.ImagePresentResponse{Present: present})
 }
 
 func (s *Server) handleEnsureNetwork(w http.ResponseWriter, r *http.Request) {
-	var req EnsureNetworkRequest
+	var req node.EnsureNetworkRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
@@ -116,7 +116,7 @@ func (s *Server) handleEnsureNetwork(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConnectNetwork(w http.ResponseWriter, r *http.Request) {
-	var req ConnectNetworkRequest
+	var req node.ConnectNetworkRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
@@ -128,7 +128,7 @@ func (s *Server) handleConnectNetwork(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
-	var req RunRequest
+	var req node.RunRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
@@ -137,11 +137,11 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, RunResponse{Container: c})
+	writeJSON(w, http.StatusOK, node.RunResponse{Container: c})
 }
 
 func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
-	var req RemoveRequest
+	var req node.RemoveRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
@@ -153,7 +153,7 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
-	var req ListRequest
+	var req node.ListRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
@@ -162,11 +162,11 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, ListResponse{Containers: list})
+	writeJSON(w, http.StatusOK, node.ListResponse{Containers: list})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	var req HealthCheckRequest
+	var req node.HealthCheckRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
@@ -178,7 +178,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleContainerHealth(w http.ResponseWriter, r *http.Request) {
-	var req ContainerHealthRequest
+	var req node.ContainerHealthRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
@@ -187,7 +187,7 @@ func (s *Server) handleContainerHealth(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, ContainerHealthResponse{State: state, DockerHealth: dockerHealth})
+	writeJSON(w, http.StatusOK, node.ContainerHealthResponse{State: state, DockerHealth: dockerHealth})
 }
 
 // handleLogs streams a container's logs to the response, flushing after each

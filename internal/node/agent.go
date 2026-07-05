@@ -14,98 +14,17 @@ import (
 )
 
 // AgentNode is a Node implementation that talks to a remote lwd-agent server
-// (internal/agent.Server) over HTTP. It is the mirror image of that server:
-// every method here sends the request the server expects and decodes the
-// response it sends back.
+// (internal/agent.Server) over HTTP, using bearer-token auth. It is the
+// mirror image of that server: every method here sends the request the server
+// expects and decodes the response it sends back, using the wire contract
+// (Path* constants and *Request/*Response DTOs) defined in wire.go. Because
+// AgentNode lives in package node — the same package as the wire contract and
+// as the Node primitives (RunSpec/Container/HealthSpec) those DTOs wrap — the
+// client and the agent server (which imports package node) share the exact
+// same types, so drift between the two is structurally impossible.
 //
-// Wire format note: internal/agent's wire.go DTOs wrap this package's
-// RunSpec/Container/HealthSpec types, and its Server is constructed with a
-// node.Node — so internal/agent already imports internal/node. That means
-// this file CANNOT import internal/agent to reuse its DTOs/path constants
-// without creating an import cycle (node -> agent -> node), even though
-// that's the more DRY option. Instead, the request/response wire types and
-// path strings below are field-for-field/value-for-value mirrors of
-// internal/agent/wire.go. Keep them in sync by hand; a mismatch is caught
-// immediately by agent_test.go, which round-trips every AgentNode method
-// through a real agent.Server wrapping a *Fake.
-const (
-	pathHealthz         = "/healthz"
-	pathRun             = "/run"
-	pathRemove          = "/remove"
-	pathList            = "/list"
-	pathEnsureImage     = "/ensure-image"
-	pathImagePresent    = "/image-present"
-	pathLoad            = "/load"
-	pathSave            = "/save"
-	pathLogs            = "/logs"
-	pathEnsureNetwork   = "/ensure-network"
-	pathConnectNetwork  = "/connect-network"
-	pathContainerHealth = "/container-health"
-	pathHealth          = "/health"
-)
-
-type runRequest struct {
-	Spec RunSpec `json:"spec"`
-}
-
-type runResponse struct {
-	Container Container `json:"container"`
-}
-
-type removeRequest struct {
-	ID string `json:"id"`
-}
-
-type listRequest struct {
-	Labels map[string]string `json:"labels"`
-}
-
-type listResponse struct {
-	Containers []Container `json:"containers"`
-}
-
-type ensureImageRequest struct {
-	Ref string `json:"ref"`
-}
-
-type imagePresentRequest struct {
-	Ref string `json:"ref"`
-}
-
-type imagePresentResponse struct {
-	Present bool `json:"present"`
-}
-
-type ensureNetworkRequest struct {
-	Name string `json:"name"`
-}
-
-type connectNetworkRequest struct {
-	ContainerID string `json:"containerId"`
-	Network     string `json:"network"`
-}
-
-type containerHealthRequest struct {
-	ID string `json:"id"`
-}
-
-type containerHealthResponse struct {
-	State        string `json:"state"`
-	DockerHealth string `json:"dockerHealth"`
-}
-
-type healthCheckRequest struct {
-	Container Container  `json:"container"`
-	Health    HealthSpec `json:"health"`
-}
-
-type wireErrorResponse struct {
-	Error string `json:"error"`
-}
-
-// AgentNode is a Node implementation that talks to a remote lwd-agent server
-// over HTTP, using bearer-token auth. It is constructed once per remote node
-// and reused; it holds no per-request state beyond its http.Client.
+// AgentNode is constructed once per remote node and reused; it holds no
+// per-request state beyond its http.Client.
 type AgentNode struct {
 	baseURL string
 	token   string
@@ -150,7 +69,7 @@ func (a *AgentNode) newRequest(ctx context.Context, method, path string, body io
 
 // doJSON POSTs reqBody (JSON-encoded) to path and decodes a JSON response
 // into respBody (which may be nil if the caller doesn't need the body). On a
-// non-2xx response it decodes a wireErrorResponse and returns it wrapped in
+// non-2xx response it decodes a ErrorResponse and returns it wrapped in
 // an *agentError.
 func (a *AgentNode) doJSON(ctx context.Context, path string, reqBody, respBody any) error {
 	b, err := json.Marshal(reqBody)
@@ -179,10 +98,10 @@ func (a *AgentNode) doJSON(ctx context.Context, path string, reqBody, respBody a
 	return json.NewDecoder(resp.Body).Decode(respBody)
 }
 
-// decodeAgentError decodes resp's body as a wireErrorResponse and returns it
+// decodeAgentError decodes resp's body as a ErrorResponse and returns it
 // as an *agentError carrying resp's status code.
 func decodeAgentError(resp *http.Response) error {
-	var er wireErrorResponse
+	var er ErrorResponse
 	if err := json.NewDecoder(resp.Body).Decode(&er); err != nil {
 		return &agentError{status: resp.StatusCode, msg: fmt.Sprintf("unreadable error body: %v", err)}
 	}
@@ -192,7 +111,7 @@ func decodeAgentError(resp *http.Response) error {
 // Ping hits GET /healthz. No auth is required by the server, but sending the
 // bearer header is harmless since the server ignores auth on this path.
 func (a *AgentNode) Ping(ctx context.Context) error {
-	req, err := a.newRequest(ctx, http.MethodGet, pathHealthz, nil)
+	req, err := a.newRequest(ctx, http.MethodGet, PathHealthz, nil)
 	if err != nil {
 		return err
 	}
@@ -209,52 +128,52 @@ func (a *AgentNode) Ping(ctx context.Context) error {
 }
 
 func (a *AgentNode) EnsureImage(ctx context.Context, imageRef string) error {
-	return a.doJSON(ctx, pathEnsureImage, ensureImageRequest{Ref: imageRef}, nil)
+	return a.doJSON(ctx, PathEnsureImage, EnsureImageRequest{Ref: imageRef}, nil)
 }
 
 func (a *AgentNode) EnsureNetwork(ctx context.Context, name string) error {
-	return a.doJSON(ctx, pathEnsureNetwork, ensureNetworkRequest{Name: name}, nil)
+	return a.doJSON(ctx, PathEnsureNetwork, EnsureNetworkRequest{Name: name}, nil)
 }
 
 func (a *AgentNode) RunContainer(ctx context.Context, spec RunSpec) (Container, error) {
-	var resp runResponse
-	if err := a.doJSON(ctx, pathRun, runRequest{Spec: spec}, &resp); err != nil {
+	var resp RunResponse
+	if err := a.doJSON(ctx, PathRun, RunRequest{Spec: spec}, &resp); err != nil {
 		return Container{}, err
 	}
 	return resp.Container, nil
 }
 
 func (a *AgentNode) RemoveContainer(ctx context.Context, id string) error {
-	return a.doJSON(ctx, pathRemove, removeRequest{ID: id}, nil)
+	return a.doJSON(ctx, PathRemove, RemoveRequest{ID: id}, nil)
 }
 
 func (a *AgentNode) ListContainers(ctx context.Context, labels map[string]string) ([]Container, error) {
-	var resp listResponse
-	if err := a.doJSON(ctx, pathList, listRequest{Labels: labels}, &resp); err != nil {
+	var resp ListResponse
+	if err := a.doJSON(ctx, PathList, ListRequest{Labels: labels}, &resp); err != nil {
 		return nil, err
 	}
 	return resp.Containers, nil
 }
 
 func (a *AgentNode) Health(ctx context.Context, c Container, h HealthSpec) error {
-	return a.doJSON(ctx, pathHealth, healthCheckRequest{Container: c, Health: h}, nil)
+	return a.doJSON(ctx, PathHealth, HealthCheckRequest{Container: c, Health: h}, nil)
 }
 
 func (a *AgentNode) ContainerHealth(ctx context.Context, id string) (state string, dockerHealth string, err error) {
-	var resp containerHealthResponse
-	if err := a.doJSON(ctx, pathContainerHealth, containerHealthRequest{ID: id}, &resp); err != nil {
+	var resp ContainerHealthResponse
+	if err := a.doJSON(ctx, PathContainerHealth, ContainerHealthRequest{ID: id}, &resp); err != nil {
 		return "", "", err
 	}
 	return resp.State, resp.DockerHealth, nil
 }
 
 func (a *AgentNode) ConnectContainerToNetwork(ctx context.Context, containerID, network string) error {
-	return a.doJSON(ctx, pathConnectNetwork, connectNetworkRequest{ContainerID: containerID, Network: network}, nil)
+	return a.doJSON(ctx, PathConnectNetwork, ConnectNetworkRequest{ContainerID: containerID, Network: network}, nil)
 }
 
 func (a *AgentNode) ImagePresent(ctx context.Context, ref string) (bool, error) {
-	var resp imagePresentResponse
-	if err := a.doJSON(ctx, pathImagePresent, imagePresentRequest{Ref: ref}, &resp); err != nil {
+	var resp ImagePresentResponse
+	if err := a.doJSON(ctx, PathImagePresent, ImagePresentRequest{Ref: ref}, &resp); err != nil {
 		return false, err
 	}
 	return resp.Present, nil
@@ -268,7 +187,7 @@ func (a *AgentNode) ContainerLogs(ctx context.Context, id string, follow bool) (
 	q.Set("id", id)
 	q.Set("follow", strconv.FormatBool(follow))
 
-	req, err := a.newRequest(ctx, http.MethodGet, pathLogs+"?"+q.Encode(), nil)
+	req, err := a.newRequest(ctx, http.MethodGet, PathLogs+"?"+q.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -290,7 +209,7 @@ func (a *AgentNode) SaveImage(ctx context.Context, ref string) (io.ReadCloser, e
 	q := url.Values{}
 	q.Set("ref", ref)
 
-	req, err := a.newRequest(ctx, http.MethodGet, pathSave+"?"+q.Encode(), nil)
+	req, err := a.newRequest(ctx, http.MethodGet, PathSave+"?"+q.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +226,7 @@ func (a *AgentNode) SaveImage(ctx context.Context, ref string) (io.ReadCloser, e
 
 // LoadImage POSTs the raw tar stream r to /load.
 func (a *AgentNode) LoadImage(ctx context.Context, r io.Reader) error {
-	req, err := a.newRequest(ctx, http.MethodPost, pathLoad, r)
+	req, err := a.newRequest(ctx, http.MethodPost, PathLoad, r)
 	if err != nil {
 		return err
 	}

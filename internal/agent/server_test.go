@@ -43,14 +43,14 @@ func TestRun_ValidToken_CallsFakeAndReturnsContainer(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
 
-	rec := doReq(t, h, http.MethodPost, PathRun, testToken, RunRequest{
+	rec := doReq(t, h, http.MethodPost, node.PathRun, testToken, node.RunRequest{
 		Spec: node.RunSpec{Name: "web1", Image: "nginx:latest"},
 	})
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	var resp RunResponse
+	var resp node.RunResponse
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
@@ -72,12 +72,12 @@ func TestRun_MissingToken_Returns401(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
 
-	rec := doReq(t, h, http.MethodPost, PathRun, "", RunRequest{Spec: node.RunSpec{Name: "web1"}})
+	rec := doReq(t, h, http.MethodPost, node.PathRun, "", node.RunRequest{Spec: node.RunSpec{Name: "web1"}})
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
 	}
-	var errResp ErrorResponse
+	var errResp node.ErrorResponse
 	if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
 		t.Fatalf("decode error response: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestRun_WrongToken_Returns401(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
 
-	rec := doReq(t, h, http.MethodPost, PathRun, "wrong-token", RunRequest{Spec: node.RunSpec{Name: "web1"}})
+	rec := doReq(t, h, http.MethodPost, node.PathRun, "wrong-token", node.RunRequest{Spec: node.RunSpec{Name: "web1"}})
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
@@ -107,7 +107,7 @@ func TestHealthz_NoAuthRequired_HealthyReturns200(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
 
-	rec := doReq(t, h, http.MethodGet, PathHealthz, "", nil)
+	rec := doReq(t, h, http.MethodGet, node.PathHealthz, "", nil)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -119,7 +119,7 @@ func TestHealthz_NoAuthRequired_UnhealthyReturns503(t *testing.T) {
 	fake.PingErr = errors.New("docker unreachable")
 	h := newTestServer(fake)
 
-	rec := doReq(t, h, http.MethodGet, PathHealthz, "", nil)
+	rec := doReq(t, h, http.MethodGet, node.PathHealthz, "", nil)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503; body=%s", rec.Code, rec.Body.String())
@@ -130,7 +130,7 @@ func TestEnsureNetwork_Delegates(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
 
-	rec := doReq(t, h, http.MethodPost, PathEnsureNetwork, testToken, EnsureNetworkRequest{Name: "lwd-net"})
+	rec := doReq(t, h, http.MethodPost, node.PathEnsureNetwork, testToken, node.EnsureNetworkRequest{Name: "lwd-net"})
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -151,12 +151,12 @@ func TestImagePresent_Delegates(t *testing.T) {
 	fake.Images = map[string]bool{"nginx:latest": true}
 	h := newTestServer(fake)
 
-	rec := doReq(t, h, http.MethodPost, PathImagePresent, testToken, ImagePresentRequest{Ref: "nginx:latest"})
+	rec := doReq(t, h, http.MethodPost, node.PathImagePresent, testToken, node.ImagePresentRequest{Ref: "nginx:latest"})
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	var resp ImagePresentResponse
+	var resp node.ImagePresentResponse
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestRemove_Delegates(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
 
-	rec := doReq(t, h, http.MethodPost, PathRemove, testToken, RemoveRequest{ID: "abc123"})
+	rec := doReq(t, h, http.MethodPost, node.PathRemove, testToken, node.RemoveRequest{ID: "abc123"})
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -191,12 +191,12 @@ func TestContainerHealth_Delegates(t *testing.T) {
 	fake.DockerHealth = "healthy"
 	h := newTestServer(fake)
 
-	rec := doReq(t, h, http.MethodPost, PathContainerHealth, testToken, ContainerHealthRequest{ID: "abc123"})
+	rec := doReq(t, h, http.MethodPost, node.PathContainerHealth, testToken, node.ContainerHealthRequest{ID: "abc123"})
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	var resp ContainerHealthResponse
+	var resp node.ContainerHealthResponse
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
@@ -210,12 +210,12 @@ func TestRun_NodeError_Returns500WithErrorResponse(t *testing.T) {
 	fake.RunErr = errors.New("boom")
 	h := newTestServer(fake)
 
-	rec := doReq(t, h, http.MethodPost, PathRun, testToken, RunRequest{Spec: node.RunSpec{Name: "web1"}})
+	rec := doReq(t, h, http.MethodPost, node.PathRun, testToken, node.RunRequest{Spec: node.RunSpec{Name: "web1"}})
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500; body=%s", rec.Code, rec.Body.String())
 	}
-	var errResp ErrorResponse
+	var errResp node.ErrorResponse
 	if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
 		t.Fatalf("decode error response: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestRun_BadJSON_Returns400(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
 
-	req := httptest.NewRequest(http.MethodPost, PathRun, strings.NewReader("{not json"))
+	req := httptest.NewRequest(http.MethodPost, node.PathRun, strings.NewReader("{not json"))
 	req.Header.Set("Authorization", "Bearer "+testToken)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -242,7 +242,7 @@ func TestLogs_StreamsBody(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
 
-	req := httptest.NewRequest(http.MethodGet, PathLogs+"?id=abc123&follow=false", nil)
+	req := httptest.NewRequest(http.MethodGet, node.PathLogs+"?id=abc123&follow=false", nil)
 	req.Header.Set("Authorization", "Bearer "+testToken)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -268,7 +268,7 @@ func TestSave_StreamsBody(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
 
-	req := httptest.NewRequest(http.MethodGet, PathSave+"?ref=nginx:latest", nil)
+	req := httptest.NewRequest(http.MethodGet, node.PathSave+"?ref=nginx:latest", nil)
 	req.Header.Set("Authorization", "Bearer "+testToken)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -285,7 +285,7 @@ func TestLoad_ReadsBodyAsTar(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
 
-	req := httptest.NewRequest(http.MethodPost, PathLoad, strings.NewReader("fake-tar-bytes"))
+	req := httptest.NewRequest(http.MethodPost, node.PathLoad, strings.NewReader("fake-tar-bytes"))
 	req.Header.Set("Authorization", "Bearer "+testToken)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -307,13 +307,13 @@ func TestList_Delegates(t *testing.T) {
 	h := newTestServer(fake)
 
 	// seed one container via /run
-	doReq(t, h, http.MethodPost, PathRun, testToken, RunRequest{Spec: node.RunSpec{Name: "web1", Labels: map[string]string{"app": "web"}}})
+	doReq(t, h, http.MethodPost, node.PathRun, testToken, node.RunRequest{Spec: node.RunSpec{Name: "web1", Labels: map[string]string{"app": "web"}}})
 
-	rec := doReq(t, h, http.MethodPost, PathList, testToken, ListRequest{Labels: map[string]string{"app": "web"}})
+	rec := doReq(t, h, http.MethodPost, node.PathList, testToken, node.ListRequest{Labels: map[string]string{"app": "web"}})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	var resp ListResponse
+	var resp node.ListResponse
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
@@ -326,7 +326,7 @@ func TestConnectNetwork_Delegates(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
 
-	rec := doReq(t, h, http.MethodPost, PathConnectNetwork, testToken, ConnectNetworkRequest{ContainerID: "abc123", Network: "lwd-net"})
+	rec := doReq(t, h, http.MethodPost, node.PathConnectNetwork, testToken, node.ConnectNetworkRequest{ContainerID: "abc123", Network: "lwd-net"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
@@ -345,7 +345,7 @@ func TestEnsureImage_Delegates(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
 
-	rec := doReq(t, h, http.MethodPost, PathEnsureImage, testToken, EnsureImageRequest{Ref: "nginx:latest"})
+	rec := doReq(t, h, http.MethodPost, node.PathEnsureImage, testToken, node.EnsureImageRequest{Ref: "nginx:latest"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
@@ -364,7 +364,7 @@ func TestHealth_Delegates(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
 
-	rec := doReq(t, h, http.MethodPost, PathHealth, testToken, HealthCheckRequest{
+	rec := doReq(t, h, http.MethodPost, node.PathHealth, testToken, node.HealthCheckRequest{
 		Container: node.Container{ID: "abc123"},
 		Health:    node.HealthSpec{},
 	})

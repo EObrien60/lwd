@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+
+	"lwd/internal/node"
 )
 
 // checkToken reports whether provided matches configured, using a
@@ -28,11 +30,11 @@ func bearerToken(r *http.Request) string {
 }
 
 // authMiddleware requires a valid "Authorization: Bearer <token>" header
-// matching token on every request except PathHealthz. A missing or
-// mismatched token gets a 401 with an ErrorResponse body.
+// matching token on every request except node.PathHealthz. A missing or
+// mismatched token gets a 401 with an node.ErrorResponse body.
 func authMiddleware(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == PathHealthz {
+		if r.URL.Path == node.PathHealthz {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -40,7 +42,7 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 		if !checkToken(token, bearerToken(r)) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(ErrorResponse{Error: "unauthorized"})
+			_ = json.NewEncoder(w).Encode(node.ErrorResponse{Error: "unauthorized"})
 			return
 		}
 
