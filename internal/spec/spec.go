@@ -338,13 +338,17 @@ func (a *App) Validate() error {
 	// Replicas validation applies to all app types, checked after the
 	// shape-specific block above so a compose app that's already invalid for
 	// another reason (missing service/domain/port, remote node, ...) reports
-	// that error rather than a replicas one. Parse defaults an unset (0)
-	// Replicas to 1 before Validate normally sees it, but a hand-built App
-	// (bypassing Parse — e.g. a JSON-decoded API request) can still reach
-	// Validate with Replicas == 0, so 0 is rejected here just like any other
-	// value below the floor.
-	if a.Replicas < 1 {
-		return fmt.Errorf("replicas must be >= 1")
+	// that error rather than a replicas one. Replicas == 0 means "unset" and
+	// is VALID here (not an error): Parse normalizes a fresh spec's 0 to 1,
+	// but a spec.App reconstructed from a pre-Phase-12 deployment snapshot
+	// (which had no "replicas" field, so it JSON-unmarshals to 0) is
+	// re-validated by heal (healSurfaceLocked) and rollback
+	// (rollbackGit/rollbackImage) — rejecting 0 would make healing or
+	// rolling back any existing pre-12 deployment fail after this upgrade.
+	// Only a negative count is a real error. Consumers that USE Replicas as
+	// a count must treat <= 0 as 1 (Phase 12 Task 4's deployReplicaSet).
+	if a.Replicas < 0 {
+		return fmt.Errorf("replicas must be >= 0")
 	}
 	if a.Replicas > 50 {
 		return fmt.Errorf("replicas must be <= 50")

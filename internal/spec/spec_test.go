@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -855,13 +856,47 @@ replicas = 3
 	}
 }
 
-// TestValidateReplicasMin covers Phase 12 Task 2: Replicas below 1 (including
-// the zero value, reachable when Validate runs on an App that skipped
-// Parse's defaulting) is rejected.
+// TestValidateReplicasMin covers Phase 12 Task 2: a negative Replicas is
+// rejected. Zero is NOT rejected here (see TestValidateReplicasZeroIsUnset)
+// — 0 means "unset", which a spec.App reconstructed from a pre-Phase-12
+// snapshot legitimately has.
 func TestValidateReplicasMin(t *testing.T) {
-	a := &App{Name: "x", Image: "y", Port: 80, Replicas: 0}
+	a := &App{Name: "x", Image: "y", Port: 80, Replicas: -1}
 	if err := a.Validate(); err == nil {
-		t.Fatal("want error for replicas < 1")
+		t.Fatal("want error for negative replicas")
+	}
+}
+
+// TestValidateReplicasZeroIsUnset covers Phase 12 Task 2's backward-compat
+// rule: Replicas == 0 ("unset") is VALID. Parse normalizes a fresh spec's 0
+// to 1, but heal/rollback re-validate a spec.App reconstructed from a
+// pre-Phase-12 snapshot that has no replicas field (so Replicas == 0) —
+// rejecting 0 would make healing/rolling back any existing deployment fail
+// after upgrade.
+func TestValidateReplicasZeroIsUnset(t *testing.T) {
+	a := &App{Name: "x", Image: "y", Port: 80, Replicas: 0}
+	if err := a.Validate(); err != nil {
+		t.Fatalf("Validate: replicas=0 (unset) must be valid, got: %v", err)
+	}
+}
+
+// TestValidatePreV12SnapshotReplicasZero proves the upgrade path: a spec.App
+// unmarshaled from a JSON deployment snapshot that predates Phase 12 (no
+// "replicas" key → Replicas defaults to 0) validates cleanly, so heal
+// (healSurfaceLocked) and rollback (rollbackGit/rollbackImage), which
+// reconstruct and re-Validate such snapshots, are not broken by this
+// upgrade.
+func TestValidatePreV12SnapshotReplicasZero(t *testing.T) {
+	snapshot := []byte(`{"Name":"blog","Image":"img:1","Domain":"blog.example.com","Port":8080,"Node":"local"}`)
+	var a App
+	if err := json.Unmarshal(snapshot, &a); err != nil {
+		t.Fatalf("unmarshal pre-12 snapshot: %v", err)
+	}
+	if a.Replicas != 0 {
+		t.Fatalf("pre-12 snapshot Replicas = %d, want 0 (no field in JSON)", a.Replicas)
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatalf("Validate of reconstructed pre-12 snapshot must succeed, got: %v", err)
 	}
 }
 
