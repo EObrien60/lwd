@@ -472,3 +472,123 @@ func TestListSecretKeysSortedAndScoped(t *testing.T) {
 		t.Fatalf("keys = %v, want [A B]", keys)
 	}
 }
+
+func TestAddGetNode(t *testing.T) {
+	s := openTemp(t)
+	n := Node{
+		Name:      "web1",
+		SSHHost:   "deploy@web1",
+		MeshAddr:  "100.64.0.2",
+		CreatedAt: time.Now(),
+	}
+	if err := s.AddNode(n); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	got, err := s.GetNode("web1")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("GetNode returned nil, want node")
+	}
+	if got.Name != "web1" || got.SSHHost != "deploy@web1" || got.MeshAddr != "100.64.0.2" {
+		t.Fatalf("GetNode mismatch: got %+v", got)
+	}
+}
+
+func TestAddNodeUpsert(t *testing.T) {
+	s := openTemp(t)
+	n1 := Node{
+		Name:      "web1",
+		SSHHost:   "deploy@web1",
+		MeshAddr:  "100.64.0.1",
+		CreatedAt: time.Now(),
+	}
+	if err := s.AddNode(n1); err != nil {
+		t.Fatalf("AddNode (first): %v", err)
+	}
+
+	n2 := Node{
+		Name:      "web1",
+		SSHHost:   "deploy@web1-new",
+		MeshAddr:  "100.64.0.2",
+		CreatedAt: time.Now().Add(10 * time.Second),
+	}
+	if err := s.AddNode(n2); err != nil {
+		t.Fatalf("AddNode (second): %v", err)
+	}
+
+	got, err := s.GetNode("web1")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("GetNode returned nil")
+	}
+	if got.SSHHost != "deploy@web1-new" || got.MeshAddr != "100.64.0.2" {
+		t.Fatalf("GetNode upsert failed: got %+v, want new values", got)
+	}
+}
+
+func TestGetNodeAbsent(t *testing.T) {
+	s := openTemp(t)
+	got, err := s.GetNode("nope")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("GetNode want nil, got %+v", got)
+	}
+}
+
+func TestListNodesSorted(t *testing.T) {
+	s := openTemp(t)
+	n2 := Node{Name: "web2", SSHHost: "deploy@web2", MeshAddr: "100.64.0.3", CreatedAt: time.Now()}
+	n1 := Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", CreatedAt: time.Now()}
+
+	if err := s.AddNode(n2); err != nil {
+		t.Fatalf("AddNode web2: %v", err)
+	}
+	if err := s.AddNode(n1); err != nil {
+		t.Fatalf("AddNode web1: %v", err)
+	}
+
+	nodes, err := s.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes: %v", err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("ListNodes len = %d, want 2", len(nodes))
+	}
+	if nodes[0].Name != "web1" || nodes[1].Name != "web2" {
+		t.Fatalf("ListNodes order = [%s %s], want [web1 web2]", nodes[0].Name, nodes[1].Name)
+	}
+}
+
+func TestDeleteNode(t *testing.T) {
+	s := openTemp(t)
+	n := Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", CreatedAt: time.Now()}
+	if err := s.AddNode(n); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+
+	if err := s.DeleteNode("web1"); err != nil {
+		t.Fatalf("DeleteNode: %v", err)
+	}
+
+	got, err := s.GetNode("web1")
+	if err != nil {
+		t.Fatalf("GetNode after delete: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("GetNode after delete want nil, got %+v", got)
+	}
+
+	nodes, err := s.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes after delete: %v", err)
+	}
+	if len(nodes) != 0 {
+		t.Fatalf("ListNodes after delete len = %d, want 0", len(nodes))
+	}
+}

@@ -35,6 +35,15 @@ type Deployment struct {
 	Compose string
 }
 
+// Node represents a registered cluster node (remote or local).
+// The implicit "local" node is never stored; only explicit registered nodes appear in the registry.
+type Node struct {
+	Name      string
+	SSHHost   string
+	MeshAddr  string
+	CreatedAt time.Time
+}
+
 // Store wraps the SQLite database.
 type Store struct {
 	db *sql.DB
@@ -57,6 +66,12 @@ CREATE TABLE IF NOT EXISTS secrets (
 	key   TEXT NOT NULL,
 	value BLOB NOT NULL,
 	PRIMARY KEY(app,key)
+);
+CREATE TABLE IF NOT EXISTS nodes (
+	name      TEXT    PRIMARY KEY,
+	ssh_host  TEXT    NOT NULL,
+	mesh_addr TEXT    NOT NULL,
+	created_at INTEGER NOT NULL
 );
 `
 
@@ -360,6 +375,65 @@ func (s *Store) DeleteSecret(app, key string) error {
 	_, err := s.db.Exec(`DELETE FROM secrets WHERE app = ? AND key = ?`, app, key)
 	if err != nil {
 		return fmt.Errorf("delete secret: %w", err)
+	}
+	return nil
+}
+
+// AddNode upserts a node by name. An existing node with the same name will have its
+// ssh_host and mesh_addr updated; created_at is preserved on update.
+func (s *Store) AddNode(n Node) error {
+	_, err := s.db.Exec(
+		`INSERT INTO nodes (name, ssh_host, mesh_addr, created_at) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(name) DO UPDATE SET ssh_host=excluded.ssh_host, mesh_addr=excluded.mesh_addr`,
+		n.Name, n.SSHHost, n.MeshAddr, n.CreatedAt.Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("add node: %w", err)
+	}
+	return nil
+}
+
+// GetNode returns a node by name, or (nil, nil) if not found.
+func (s *Store) GetNode(name string) (*Node, error) {
+	row := s.db.QueryRow(`SELECT name, ssh_host, mesh_addr, created_at FROM nodes WHERE name = ?`, name)
+	var n Node
+	var ts int64
+	switch err := row.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts); err {
+	case nil:
+		n.CreatedAt = time.Unix(ts, 0)
+		return &n, nil
+	case sql.ErrNoRows:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("get node: %w", err)
+	}
+}
+
+// ListNodes returns all nodes sorted by name ascending.
+func (s *Store) ListNodes() ([]Node, error) {
+	rows, err := s.db.Query(`SELECT name, ssh_host, mesh_addr, created_at FROM nodes ORDER BY name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list nodes: %w", err)
+	}
+	defer rows.Close()
+	var out []Node
+	for rows.Next() {
+		var n Node
+		var ts int64
+		if err := rows.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts); err != nil {
+			return nil, fmt.Errorf("scan node: %w", err)
+		}
+		n.CreatedAt = time.Unix(ts, 0)
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// DeleteNode removes a node by name.
+func (s *Store) DeleteNode(name string) error {
+	_, err := s.db.Exec(`DELETE FROM nodes WHERE name = ?`, name)
+	if err != nil {
+		return fmt.Errorf("delete node: %w", err)
 	}
 	return nil
 }
