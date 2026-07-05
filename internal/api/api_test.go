@@ -766,6 +766,48 @@ func TestNodeAddValidatesAgentURL(t *testing.T) {
 	}
 }
 
+// TestNodeListNilResolver covers the documented nil-resolver contract: a
+// Server built without a NodeResolver (newTestServer passes nil) must still
+// serve GET /nodes, reporting every node with transport "" and reachable
+// false and running no ping — the nil-guard path Task 7's web/mcp consumers
+// rely on.
+func TestNodeListNilResolver(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	body, _ := json.Marshal(map[string]string{"name": "web1", "ssh_host": "deploy@web1", "mesh_addr": "100.64.0.2"})
+	resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /nodes: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+
+	resp, err = http.Get(ts.URL + "/nodes")
+	if err != nil {
+		t.Fatalf("GET /nodes: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var nodes []struct {
+		store.Node
+		Transport string `json:"transport"`
+		Reachable bool   `json:"reachable"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("nodes = %+v, want exactly 1", nodes)
+	}
+	if nodes[0].Name != "web1" || nodes[0].Transport != "" || nodes[0].Reachable {
+		t.Fatalf("node = %+v, want name=web1 transport=\"\" reachable=false (nil-resolver, no ping)", nodes[0])
+	}
+}
+
 // TestNodeListIncludesReachability covers Phase 9b Task 6: GET /nodes reports
 // each node's transport and reachability, as decided by the resolver.
 func TestNodeListIncludesReachability(t *testing.T) {
