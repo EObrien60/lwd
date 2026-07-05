@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -48,6 +49,10 @@ func Run(args []string) int {
 		return runRm(args[1:])
 	case "rollback":
 		return runRollback(args[1:])
+	case "scale":
+		return runScale(args[1:])
+	case "status":
+		return runStatus(args[1:])
 	case "history":
 		return runHistory(args[1:])
 	case "secret":
@@ -272,9 +277,83 @@ func runLs() int {
 		fmt.Fprintln(os.Stderr, "ls:", err)
 		return 1
 	}
-	fmt.Printf("%-20s %-10s %-30s %s\n", "APP", "STATUS", "DOMAIN", "IMAGE")
+	fmt.Printf("%-20s %-10s %-30s %-9s %s\n", "APP", "STATUS", "DOMAIN", "REPLICAS", "IMAGE")
 	for _, a := range apps {
-		fmt.Printf("%-20s %-10s %-30s %s\n", a.Name, a.Status, a.Domain, a.Image)
+		fmt.Printf("%-20s %-10s %-30s %-9d %s\n", a.Name, a.Status, a.Domain, a.Replicas, a.Image)
+	}
+	return 0
+}
+
+// runScale implements `lwd scale <app> <replicas>`: it parses replicas as a
+// positive integer (rejecting anything else client-side, before ever calling
+// the daemon) and asks the daemon to redeploy the app set-based at that
+// count, preserving its current image/config exactly (see client.Scale).
+func runScale(args []string) int {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: lwd scale <app> <replicas>")
+		return 2
+	}
+	name := args[0]
+	n, err := strconv.Atoi(args[1])
+	if err != nil || n < 1 {
+		fmt.Fprintf(os.Stderr, "scale: replicas must be a positive integer, got %q\n", args[1])
+		return 2
+	}
+	dep, err := newClient().Scale(context.Background(), name, n)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "scale:", err)
+		return 1
+	}
+	fmt.Printf("scaled %s to %d replicas\n", dep.App, len(dep.Replicas))
+	return 0
+}
+
+// runStatus implements `lwd status <app>`: a single-app summary including
+// the current replica count and, when available from the app's history, the
+// node each replica currently runs on.
+func runStatus(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: lwd status <app>")
+		return 2
+	}
+	name := args[0]
+	apps, err := newClient().Apps(context.Background())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "status:", err)
+		return 1
+	}
+	var st *api.AppStatus
+	for i := range apps {
+		if apps[i].Name == name {
+			st = &apps[i]
+			break
+		}
+	}
+	if st == nil {
+		fmt.Fprintf(os.Stderr, "status: app %q not found\n", name)
+		return 1
+	}
+	fmt.Printf("app:      %s\n", st.Name)
+	fmt.Printf("status:   %s\n", st.Status)
+	fmt.Printf("image:    %s\n", st.Image)
+	fmt.Printf("domain:   %s\n", st.Domain)
+	fmt.Printf("replicas: %d\n", st.Replicas)
+
+	// Best-effort: per-replica node detail comes from the current
+	// deployment's Replicas slice, fetched via History. A failure here (or
+	// a legacy deployment with no recorded Replicas) just means the extra
+	// detail is skipped — the summary above already answered the question.
+	if deps, err := newClient().History(context.Background(), name); err == nil {
+		for _, d := range deps {
+			if d.Status != store.StatusRunning || len(d.Replicas) == 0 {
+				continue
+			}
+			fmt.Println("nodes:")
+			for _, rep := range d.Replicas {
+				fmt.Printf("  %-20s %s\n", rep.Node, rep.ContainerID)
+			}
+			break
+		}
 	}
 	return 0
 }

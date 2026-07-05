@@ -1469,6 +1469,181 @@ func TestNodeListIncludesSchedulable(t *testing.T) {
 	_ = inv
 }
 
+// TestScaleUp covers Phase 12 Task 7: POST /apps/{name}/scale with a higher
+// replica count than the app currently runs must redeploy it set-based (via
+// the reconciler) so its current deployment ends up with that many replicas,
+// preserving the exact spec snapshot (image/domain/port unchanged).
+func TestScaleUp(t *testing.T) {
+	ts, _ := newTestServer(t)
+	body, _ := json.Marshal(spec.App{Name: "blog", Image: "img:1", Port: 8080, Node: "local", Domain: "blog.example.com", Replicas: 1})
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /apply: %v", err)
+	}
+	resp.Body.Close()
+
+	scaleBody, _ := json.Marshal(map[string]int{"replicas": 3})
+	sresp, err := http.Post(ts.URL+"/apps/blog/scale", "application/json", bytes.NewReader(scaleBody))
+	if err != nil {
+		t.Fatalf("POST scale: %v", err)
+	}
+	defer sresp.Body.Close()
+	if sresp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(sresp.Body)
+		t.Fatalf("status = %d, want 200, body = %s", sresp.StatusCode, b)
+	}
+	var dep store.Deployment
+	if err := json.NewDecoder(sresp.Body).Decode(&dep); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(dep.Replicas) != 3 {
+		t.Fatalf("len(Replicas) = %d, want 3, got %+v", len(dep.Replicas), dep.Replicas)
+	}
+	if dep.Image != "img:1" {
+		t.Errorf("image = %q, want img:1 (scale must preserve the snapshot)", dep.Image)
+	}
+}
+
+// TestScaleDown covers the inverse: scaling a running 3-replica app back down
+// to 1 must leave its current deployment with exactly 1 replica.
+func TestScaleDown(t *testing.T) {
+	ts, _ := newTestServer(t)
+	body, _ := json.Marshal(spec.App{Name: "blog", Image: "img:1", Port: 8080, Node: "local", Domain: "blog.example.com", Replicas: 3})
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /apply: %v", err)
+	}
+	resp.Body.Close()
+
+	scaleBody, _ := json.Marshal(map[string]int{"replicas": 1})
+	sresp, err := http.Post(ts.URL+"/apps/blog/scale", "application/json", bytes.NewReader(scaleBody))
+	if err != nil {
+		t.Fatalf("POST scale: %v", err)
+	}
+	defer sresp.Body.Close()
+	if sresp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(sresp.Body)
+		t.Fatalf("status = %d, want 200, body = %s", sresp.StatusCode, b)
+	}
+	var dep store.Deployment
+	if err := json.NewDecoder(sresp.Body).Decode(&dep); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(dep.Replicas) != 1 {
+		t.Fatalf("len(Replicas) = %d, want 1, got %+v", len(dep.Replicas), dep.Replicas)
+	}
+}
+
+// TestScaleInvalidCount covers 0 and negative replica counts: both must be
+// rejected with 400, without ever reaching the reconciler. This is stricter
+// than spec.Validate's own Replicas==0 rule (which treats 0 as "unset" for
+// pre-Phase-12 snapshot compatibility) — a scale request explicitly asks for
+// a concrete count, so 0 must not be silently accepted.
+func TestScaleInvalidCount(t *testing.T) {
+	ts, _ := newTestServer(t)
+	body, _ := json.Marshal(spec.App{Name: "blog", Image: "img:1", Port: 8080, Node: "local", Domain: "blog.example.com"})
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /apply: %v", err)
+	}
+	resp.Body.Close()
+
+	for _, n := range []int{0, -1} {
+		scaleBody, _ := json.Marshal(map[string]int{"replicas": n})
+		sresp, err := http.Post(ts.URL+"/apps/blog/scale", "application/json", bytes.NewReader(scaleBody))
+		if err != nil {
+			t.Fatalf("POST scale(%d): %v", n, err)
+		}
+		sresp.Body.Close()
+		if sresp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("replicas=%d: status = %d, want 400", n, sresp.StatusCode)
+		}
+	}
+}
+
+// TestScaleComposeRejected covers the T5 guard surfacing through scale: a
+// compose app can never run more than 1 replica, so scaling one to N>1 must
+// 400 via spec.Validate rather than silently redeploying.
+func TestScaleComposeRejected(t *testing.T) {
+	ts, _, _ := newTestServerWithCompose(t)
+
+	composeDir := t.TempDir()
+	composePath := filepath.Join(composeDir, "docker-compose.yml")
+	if err := os.WriteFile(composePath, []byte("services:\n  web:\n    image: nginx\n"), 0o644); err != nil {
+		t.Fatalf("write compose file: %v", err)
+	}
+
+	app := spec.App{
+		Name:    "webapp",
+		Compose: composePath,
+		Service: "web",
+		Domain:  "webapp.example.com",
+		Port:    8080,
+		Node:    "local",
+	}
+	body, _ := json.Marshal(app)
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /apply: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("apply status = %d, body = %s", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+
+	scaleBody, _ := json.Marshal(map[string]int{"replicas": 3})
+	sresp, err := http.Post(ts.URL+"/apps/webapp/scale", "application/json", bytes.NewReader(scaleBody))
+	if err != nil {
+		t.Fatalf("POST scale: %v", err)
+	}
+	defer sresp.Body.Close()
+	if sresp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(sresp.Body)
+		t.Fatalf("status = %d, want 400, body = %s", sresp.StatusCode, b)
+	}
+}
+
+// TestScaleUnknownApp covers scaling an app with no current deployment: 404,
+// not a 500 or a silent no-op.
+func TestScaleUnknownApp(t *testing.T) {
+	ts, _ := newTestServer(t)
+	scaleBody, _ := json.Marshal(map[string]int{"replicas": 2})
+	resp, err := http.Post(ts.URL+"/apps/unknown/scale", "application/json", bytes.NewReader(scaleBody))
+	if err != nil {
+		t.Fatalf("POST scale: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestAppStatusIncludesReplicas covers AppStatus.Replicas: GET /apps must
+// report the current deployment's replica count so `lwd ls` can show it.
+func TestAppStatusIncludesReplicas(t *testing.T) {
+	ts, _ := newTestServer(t)
+	body, _ := json.Marshal(spec.App{Name: "blog", Image: "img:1", Port: 8080, Node: "local", Domain: "blog.example.com", Replicas: 3})
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /apply: %v", err)
+	}
+	resp.Body.Close()
+
+	aresp, err := http.Get(ts.URL + "/apps")
+	if err != nil {
+		t.Fatalf("GET /apps: %v", err)
+	}
+	defer aresp.Body.Close()
+	var apps []AppStatus
+	if err := json.NewDecoder(aresp.Body).Decode(&apps); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(apps) != 1 || apps[0].Replicas != 3 {
+		t.Fatalf("apps = %+v, want a single app with Replicas == 3", apps)
+	}
+}
+
 // specNodeField unmarshals a deployment's JSON Spec snapshot and returns its
 // Node field — the api package's own equivalent of the reconciler package's
 // unexported specNode test helper.
