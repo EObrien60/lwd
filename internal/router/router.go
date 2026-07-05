@@ -81,6 +81,10 @@ type Router interface {
 	// installs the full correct set instead of a route-less one that would
 	// otherwise drop every app's live route for the reload's duration.
 	SeedRoutes(routes []Route)
+	// Healthy reports whether Caddy is currently reachable/administrable via
+	// its admin API. It performs no mutation; it is a point-in-time probe for
+	// callers (e.g. a reconciler health report) to surface edge health.
+	Healthy(ctx context.Context) bool
 }
 
 // CaddyRouter is the real Router implementation: it drives a Caddy container
@@ -409,4 +413,22 @@ func (c *CaddyRouter) ProbeThroughCaddy(ctx context.Context, host, path string) 
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode, nil
+}
+
+// Healthy reports whether Caddy's admin API is reachable and returning a 2xx
+// response right now. Any transport error or non-2xx status is treated as
+// unhealthy; it performs no mutation.
+func (c *CaddyRouter) Healthy(ctx context.Context) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.adminBaseURL+"/config/", nil)
+	if err != nil {
+		return false
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }

@@ -140,6 +140,46 @@ func TestCaddyRouterSetRouteRollsBackOnReloadFailure(t *testing.T) {
 	}
 }
 
+func TestCaddyRouterHealthy(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("2xx is healthy", func(t *testing.T) {
+		admin := stubAdminStatus(http.StatusOK)
+		defer admin.Close()
+
+		c := NewCaddyRouter(node.NewFake(), t.TempDir())
+		c.adminBaseURL = admin.URL
+
+		if !c.Healthy(ctx) {
+			t.Fatal("expected Healthy to be true when admin API returns 200")
+		}
+	})
+
+	t.Run("non-2xx is unhealthy", func(t *testing.T) {
+		admin := stubAdminStatus(http.StatusInternalServerError)
+		defer admin.Close()
+
+		c := NewCaddyRouter(node.NewFake(), t.TempDir())
+		c.adminBaseURL = admin.URL
+
+		if c.Healthy(ctx) {
+			t.Fatal("expected Healthy to be false when admin API returns 500")
+		}
+	})
+
+	t.Run("unreachable is unhealthy", func(t *testing.T) {
+		admin := stubAdminStatus(http.StatusOK)
+		admin.Close() // close immediately so the server is unreachable
+
+		c := NewCaddyRouter(node.NewFake(), t.TempDir())
+		c.adminBaseURL = admin.URL
+
+		if c.Healthy(ctx) {
+			t.Fatal("expected Healthy to be false when admin API is unreachable")
+		}
+	})
+}
+
 func TestCaddyRouterSetAndRemoveRouteCommitOnSuccess(t *testing.T) {
 	ctx := context.Background()
 

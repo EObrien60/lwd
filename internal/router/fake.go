@@ -26,14 +26,20 @@ type FakeRouter struct {
 	// SetRouteErr, if set, is returned by SetRoute instead of installing the
 	// route into Routes.
 	SetRouteErr error
+
+	// HealthyResult configures Healthy's return value. It defaults to true
+	// (set by NewFakeRouter) so existing tests observe a healthy router
+	// unless they explicitly opt into simulating an unhealthy edge.
+	HealthyResult bool
 }
 
 // NewFakeRouter returns a ready-to-use FakeRouter.
 func NewFakeRouter() *FakeRouter {
 	return &FakeRouter{
-		Routes:      map[string]Route{},
-		Staging:     map[string]bool{},
-		ProbeStatus: 200,
+		Routes:        map[string]Route{},
+		Staging:       map[string]bool{},
+		ProbeStatus:   200,
+		HealthyResult: true,
 	}
 }
 
@@ -105,6 +111,14 @@ func (f *FakeRouter) Reload(ctx context.Context) error {
 	defer f.mu.Unlock()
 	f.record("Reload")
 	return nil
+}
+
+// Healthy records the call and returns HealthyResult.
+func (f *FakeRouter) Healthy(ctx context.Context) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("Healthy")
+	return f.HealthyResult
 }
 
 // SeedRoutes populates Routes with each of routes, keyed by Domain, and
