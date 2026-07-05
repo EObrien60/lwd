@@ -132,6 +132,71 @@ func TestHealSurfaceGitAppReusesTagNoBuild(t *testing.T) {
 	}
 }
 
+// TestHealPreservesScheduled covers Phase 11b Task 1: a surface that was
+// originally placed by the scheduler (unpinned deploy, Scheduled == true)
+// must still record Scheduled == true on the fresh deployment row healing
+// produces, even though the reconstructed spec.App's Node is now the
+// concrete node the scheduler chose (no longer "") — the healed surface
+// keeps its original movability/provenance rather than being reclassified
+// as pinned just because its restored snapshot carries a concrete node.
+func TestHealPreservesScheduled(t *testing.T) {
+	r, f, fr, s := newTestReconciler(t)
+	ctx := context.Background()
+	fr.ProbeStatus = 200
+
+	app := unpinnedApp("blog")
+	app.Health.Path = "/healthz"
+	app.Health.Timeout = shortTimeout
+
+	if _, err := r.Apply(ctx, app); err != nil {
+		t.Fatalf("initial Apply: %v", err)
+	}
+
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || !cur.Scheduled {
+		t.Fatalf("sanity: want initial deployment Scheduled=true, got %+v", cur)
+	}
+
+	preRunCalls := 0
+	for _, c := range f.Calls {
+		if hasPrefix(c, "RunContainer:") {
+			preRunCalls++
+		}
+	}
+
+	r.mu.Lock()
+	healed, err := r.healSurfaceLocked(ctx, cur)
+	r.mu.Unlock()
+	if err != nil {
+		t.Fatalf("healSurfaceLocked: %v", err)
+	}
+
+	postRunCalls := 0
+	for _, c := range f.Calls {
+		if hasPrefix(c, "RunContainer:") {
+			postRunCalls++
+		}
+	}
+	if postRunCalls <= preRunCalls {
+		t.Errorf("want a new RunContainer call during heal, calls: %v", f.Calls)
+	}
+
+	if !healed.Scheduled {
+		t.Errorf("healed.Scheduled = false, want true (preserved from original scheduled surface)")
+	}
+
+	newCur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment after heal: %v", err)
+	}
+	if newCur == nil || !newCur.Scheduled {
+		t.Fatalf("CurrentDeployment.Scheduled after heal = %+v, want true", newCur)
+	}
+}
+
 // TestRollbackStillWorks confirms Rollback's behavior is unchanged after
 // splitting rollbackGit into a locking wrapper plus rollbackGitLocked: a
 // public API caller (which does not hold r.mu) must still be able to roll

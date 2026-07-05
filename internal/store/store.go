@@ -33,17 +33,25 @@ type Deployment struct {
 	// Compose is the docker-compose file content used for this deployment,
 	// captured at record time. It lets rollback re-apply the exact prior stack.
 	Compose string
+	// Scheduled records placement provenance: true iff this deployment's
+	// node was chosen by the scheduler (the app's spec had Node == "" at
+	// deploy time), false if the app pinned an explicit node (or "local").
+	// Phase 11b's failover/evacuation machinery only ever moves a surface
+	// the scheduler placed — an explicit pin is honored and never touched —
+	// so this is recorded at deploy time rather than re-derived later.
+	Scheduled bool
 }
 
 // Node represents a registered cluster node (remote or local).
 // The implicit "local" node is never stored; only explicit registered nodes appear in the registry.
 type Node struct {
-	Name      string    `json:"name"`
-	SSHHost   string    `json:"ssh_host"`
-	MeshAddr  string    `json:"mesh_addr"`
-	AgentURL  string    `json:"agent_url"`
-	Pool      string    `json:"pool"`
-	CreatedAt time.Time `json:"created_at"`
+	Name        string    `json:"name"`
+	SSHHost     string    `json:"ssh_host"`
+	MeshAddr    string    `json:"mesh_addr"`
+	AgentURL    string    `json:"agent_url"`
+	Pool        string    `json:"pool"`
+	Schedulable bool      `json:"schedulable"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // DefaultPool is the pool an implicit "local" node lives in, and the pool a
@@ -64,7 +72,8 @@ CREATE TABLE IF NOT EXISTS deployments (
 	status       TEXT    NOT NULL,
 	created_at   INTEGER NOT NULL,
 	spec         TEXT    NOT NULL DEFAULT '',
-	compose      TEXT    NOT NULL DEFAULT ''
+	compose      TEXT    NOT NULL DEFAULT '',
+	scheduled    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_deployments_app ON deployments(app);
 CREATE TABLE IF NOT EXISTS secrets (
@@ -79,7 +88,8 @@ CREATE TABLE IF NOT EXISTS nodes (
 	mesh_addr TEXT    NOT NULL,
 	created_at INTEGER NOT NULL,
 	agent_url TEXT    NOT NULL DEFAULT '',
-	pool      TEXT    NOT NULL DEFAULT 'default'
+	pool      TEXT    NOT NULL DEFAULT 'default',
+	schedulable INTEGER NOT NULL DEFAULT 1
 );
 `
 
@@ -111,6 +121,14 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	if err := migrateAddPoolColumn(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	if err := migrateAddSchedulableColumn(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	if err := migrateAddScheduledColumn(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -305,14 +323,113 @@ func migrateAddPoolColumn(db *sql.DB) error {
 	return nil
 }
 
+// migrateAddSchedulableColumn adds the "schedulable" column to a pre-Phase-11b
+// nodes table that predates it. Safe to call on every Open: it first checks
+// PRAGMA table_info for the column and only issues ALTER TABLE if missing,
+// and additionally tolerates a concurrent/duplicate "add column" error
+// (e.g. "duplicate column name: schedulable") so it never fails on a DB that
+// already has the column, including one created by the base schema above.
+// Existing rows default to schedulable=1 (true): a pre-existing node must not
+// be silently cordoned by this migration.
+func migrateAddSchedulableColumn(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(nodes)`)
+	if err != nil {
+		return fmt.Errorf("table_info: %w", err)
+	}
+	hasSchedulable := false
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			ctype     string
+			notnull   int
+			dfltValue any
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan table_info: %w", err)
+		}
+		if name == "schedulable" {
+			hasSchedulable = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("table_info rows: %w", err)
+	}
+	rows.Close()
+	if hasSchedulable {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE nodes ADD COLUMN schedulable INTEGER NOT NULL DEFAULT 1`); err != nil {
+		// Tolerate a race/duplicate add: some other process (or a prior
+		// partial run) already added it between our check and this call.
+		if strings.Contains(err.Error(), "duplicate column name") {
+			return nil
+		}
+		return fmt.Errorf("add schedulable column: %w", err)
+	}
+	return nil
+}
+
+// migrateAddScheduledColumn adds the "scheduled" column to a pre-Phase-11b
+// deployments table that predates it. Safe to call on every Open: it first
+// checks PRAGMA table_info for the column and only issues ALTER TABLE if
+// missing, and additionally tolerates a concurrent/duplicate "add column"
+// error (e.g. "duplicate column name: scheduled") so it never fails on a DB
+// that already has the column, including one created by the base schema
+// above. Existing rows default to scheduled=0 (false): placement provenance
+// is unknown for deployments recorded before this column existed, and false
+// is the conservative choice (never eligible for scheduler-driven eviction).
+func migrateAddScheduledColumn(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(deployments)`)
+	if err != nil {
+		return fmt.Errorf("table_info: %w", err)
+	}
+	hasScheduled := false
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			ctype     string
+			notnull   int
+			dfltValue any
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan table_info: %w", err)
+		}
+		if name == "scheduled" {
+			hasScheduled = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("table_info rows: %w", err)
+	}
+	rows.Close()
+	if hasScheduled {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE deployments ADD COLUMN scheduled INTEGER NOT NULL DEFAULT 0`); err != nil {
+		// Tolerate a race/duplicate add: some other process (or a prior
+		// partial run) already added it between our check and this call.
+		if strings.Contains(err.Error(), "duplicate column name") {
+			return nil
+		}
+		return fmt.Errorf("add scheduled column: %w", err)
+	}
+	return nil
+}
+
 // Close closes the underlying database.
 func (s *Store) Close() error { return s.db.Close() }
 
 // RecordDeployment inserts a deployment row and returns its id.
 func (s *Store) RecordDeployment(d Deployment) (int64, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO deployments (app, image, container_id, status, created_at, spec, compose) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		d.App, d.Image, d.ContainerID, d.Status, d.CreatedAt.Unix(), d.Spec, d.Compose,
+		`INSERT INTO deployments (app, image, container_id, status, created_at, spec, compose, scheduled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.App, d.Image, d.ContainerID, d.Status, d.CreatedAt.Unix(), d.Spec, d.Compose, d.Scheduled,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("insert deployment: %w", err)
@@ -323,14 +440,14 @@ func (s *Store) RecordDeployment(d Deployment) (int64, error) {
 // CurrentDeployment returns the most recent running deployment for app, or nil.
 func (s *Store) CurrentDeployment(app string) (*Deployment, error) {
 	row := s.db.QueryRow(
-		`SELECT id, app, image, container_id, status, created_at, spec, compose
+		`SELECT id, app, image, container_id, status, created_at, spec, compose, scheduled
 		 FROM deployments WHERE app = ? AND status = ?
 		 ORDER BY id DESC LIMIT 1`,
 		app, StatusRunning,
 	)
 	var d Deployment
 	var ts int64
-	switch err := row.Scan(&d.ID, &d.App, &d.Image, &d.ContainerID, &d.Status, &ts, &d.Spec, &d.Compose); err {
+	switch err := row.Scan(&d.ID, &d.App, &d.Image, &d.ContainerID, &d.Status, &ts, &d.Spec, &d.Compose, &d.Scheduled); err {
 	case nil:
 		d.CreatedAt = time.Unix(ts, 0)
 		return &d, nil
@@ -346,14 +463,14 @@ func (s *Store) CurrentDeployment(app string) (*Deployment, error) {
 // there is none. This is what rollback targets.
 func (s *Store) PreviousDeployment(app string) (*Deployment, error) {
 	row := s.db.QueryRow(
-		`SELECT id, app, image, container_id, status, created_at, spec, compose
+		`SELECT id, app, image, container_id, status, created_at, spec, compose, scheduled
 		 FROM deployments WHERE app = ? AND status = ?
 		 ORDER BY id DESC LIMIT 1`,
 		app, StatusRetired,
 	)
 	var d Deployment
 	var ts int64
-	switch err := row.Scan(&d.ID, &d.App, &d.Image, &d.ContainerID, &d.Status, &ts, &d.Spec, &d.Compose); err {
+	switch err := row.Scan(&d.ID, &d.App, &d.Image, &d.ContainerID, &d.Status, &ts, &d.Spec, &d.Compose, &d.Scheduled); err {
 	case nil:
 		d.CreatedAt = time.Unix(ts, 0)
 		return &d, nil
@@ -367,7 +484,7 @@ func (s *Store) PreviousDeployment(app string) (*Deployment, error) {
 // DeploymentsForApp returns all deployments for app, newest first.
 func (s *Store) DeploymentsForApp(app string) ([]Deployment, error) {
 	rows, err := s.db.Query(
-		`SELECT id, app, image, container_id, status, created_at, spec, compose
+		`SELECT id, app, image, container_id, status, created_at, spec, compose, scheduled
 		 FROM deployments WHERE app = ?
 		 ORDER BY id DESC`,
 		app,
@@ -380,7 +497,7 @@ func (s *Store) DeploymentsForApp(app string) ([]Deployment, error) {
 	for rows.Next() {
 		var d Deployment
 		var ts int64
-		if err := rows.Scan(&d.ID, &d.App, &d.Image, &d.ContainerID, &d.Status, &ts, &d.Spec, &d.Compose); err != nil {
+		if err := rows.Scan(&d.ID, &d.App, &d.Image, &d.ContainerID, &d.Status, &ts, &d.Spec, &d.Compose, &d.Scheduled); err != nil {
 			return nil, fmt.Errorf("scan deployment: %w", err)
 		}
 		d.CreatedAt = time.Unix(ts, 0)
@@ -491,14 +608,17 @@ func (s *Store) DeleteSecret(app, key string) error {
 
 // AddNode upserts a node by name. An existing node with the same name will have its
 // ssh_host, mesh_addr, agent_url, and pool updated; created_at is preserved on update.
-// An empty Pool is normalized to DefaultPool before insert.
+// An empty Pool is normalized to DefaultPool before insert. A node is always
+// schedulable when (re-)added regardless of the passed-in Schedulable value —
+// cordoning is a deliberate follow-up action via SetSchedulable, not something
+// AddNode itself can leave a node in.
 func (s *Store) AddNode(n Node) error {
 	pool := n.Pool
 	if pool == "" {
 		pool = DefaultPool
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO nodes (name, ssh_host, mesh_addr, created_at, agent_url, pool) VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO nodes (name, ssh_host, mesh_addr, created_at, agent_url, pool, schedulable) VALUES (?, ?, ?, ?, ?, ?, 1)
 		 ON CONFLICT(name) DO UPDATE SET ssh_host=excluded.ssh_host, mesh_addr=excluded.mesh_addr, agent_url=excluded.agent_url, pool=excluded.pool`,
 		n.Name, n.SSHHost, n.MeshAddr, n.CreatedAt.Unix(), n.AgentURL, pool,
 	)
@@ -510,10 +630,10 @@ func (s *Store) AddNode(n Node) error {
 
 // GetNode returns a node by name, or (nil, nil) if not found.
 func (s *Store) GetNode(name string) (*Node, error) {
-	row := s.db.QueryRow(`SELECT name, ssh_host, mesh_addr, created_at, agent_url, pool FROM nodes WHERE name = ?`, name)
+	row := s.db.QueryRow(`SELECT name, ssh_host, mesh_addr, created_at, agent_url, pool, schedulable FROM nodes WHERE name = ?`, name)
 	var n Node
 	var ts int64
-	switch err := row.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts, &n.AgentURL, &n.Pool); err {
+	switch err := row.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts, &n.AgentURL, &n.Pool, &n.Schedulable); err {
 	case nil:
 		n.CreatedAt = time.Unix(ts, 0)
 		return &n, nil
@@ -526,7 +646,7 @@ func (s *Store) GetNode(name string) (*Node, error) {
 
 // ListNodes returns all nodes sorted by name ascending.
 func (s *Store) ListNodes() ([]Node, error) {
-	rows, err := s.db.Query(`SELECT name, ssh_host, mesh_addr, created_at, agent_url, pool FROM nodes ORDER BY name ASC`)
+	rows, err := s.db.Query(`SELECT name, ssh_host, mesh_addr, created_at, agent_url, pool, schedulable FROM nodes ORDER BY name ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
@@ -535,13 +655,24 @@ func (s *Store) ListNodes() ([]Node, error) {
 	for rows.Next() {
 		var n Node
 		var ts int64
-		if err := rows.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts, &n.AgentURL, &n.Pool); err != nil {
+		if err := rows.Scan(&n.Name, &n.SSHHost, &n.MeshAddr, &ts, &n.AgentURL, &n.Pool, &n.Schedulable); err != nil {
 			return nil, fmt.Errorf("scan node: %w", err)
 		}
 		n.CreatedAt = time.Unix(ts, 0)
 		out = append(out, n)
 	}
 	return out, rows.Err()
+}
+
+// SetSchedulable cordons (false) or uncordons (true) a node by name: a
+// cordoned node is excluded from scheduler placement (enforced by later
+// Phase 11b tasks) but keeps running whatever is already deployed on it.
+func (s *Store) SetSchedulable(name string, schedulable bool) error {
+	_, err := s.db.Exec(`UPDATE nodes SET schedulable = ? WHERE name = ?`, schedulable, name)
+	if err != nil {
+		return fmt.Errorf("set schedulable: %w", err)
+	}
+	return nil
 }
 
 // DeleteNode removes a node by name.

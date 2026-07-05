@@ -184,6 +184,63 @@ func TestRequirementsAppliedToRunSpec(t *testing.T) {
 	}
 }
 
+// TestUnpinnedRecordsScheduled covers Phase 11b Task 1: an unpinned app
+// (Node == "") is placed by the scheduler, and the resulting deployment must
+// record Scheduled == true — this is the placement provenance later tasks
+// use to decide which surfaces may be evacuated/failed-over.
+func TestUnpinnedRecordsScheduled(t *testing.T) {
+	r, _, fr, s := newTestReconciler(t)
+	ctx := context.Background()
+	fr.ProbeStatus = 200
+
+	app := unpinnedApp("blog")
+	app.Health.Path = "/healthz"
+	app.Health.Timeout = shortTimeout
+
+	if _, err := r.Apply(ctx, app); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || !cur.Scheduled {
+		t.Fatalf("CurrentDeployment.Scheduled = %+v, want true for unpinned deploy", cur)
+	}
+}
+
+// TestPinnedRecordsNotScheduled covers Phase 11b Task 1: an explicitly pinned
+// app (Node set to a concrete node) bypasses the scheduler, and the resulting
+// deployment must record Scheduled == false.
+func TestPinnedRecordsNotScheduled(t *testing.T) {
+	r, resolver, _, fr, s := newSchedulingReconciler(t, "web1")
+	ctx := context.Background()
+	fr.ProbeStatus = 200
+	resolver["web1"].(*node.Fake).Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 5000}
+
+	if err := s.AddNode(store.Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", Pool: "default"}); err != nil {
+		t.Fatalf("AddNode web1: %v", err)
+	}
+
+	app := unpinnedApp("blog")
+	app.Node = "web1"
+	app.Health.Path = "/healthz"
+	app.Health.Timeout = shortTimeout
+
+	if _, err := r.Apply(ctx, app); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || cur.Scheduled {
+		t.Fatalf("CurrentDeployment.Scheduled = %+v, want false for pinned deploy", cur)
+	}
+}
+
 func TestProbeNodesIncludesCapacity(t *testing.T) {
 	r, resolver, localFake, _, s := newSchedulingReconciler(t, "web1")
 	ctx := context.Background()

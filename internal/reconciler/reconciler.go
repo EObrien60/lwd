@@ -316,11 +316,28 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 // blue-green, ensuring any declared backing services first. Callers must
 // hold r.mu; Apply does so before branching here.
 func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Deployment, error) {
+	return r.applyImageProvenance(ctx, app, nil)
+}
+
+// applyImageProvenance is applyImage's body, parameterized by an optional
+// scheduledOverride: nil means "use whatever resolvePlacement determines"
+// (the normal Apply path), while a non-nil value forces the Scheduled
+// provenance recorded on the resulting deployment regardless of what
+// resolvePlacement computes for app.Node. This exists for
+// healSurfaceLocked: the spec.App it reconstructs from a prior deployment's
+// snapshot already carries a concrete Node (the scheduler's original
+// choice, or an explicit pin), so resolvePlacement's own pinned/unpinned
+// test can no longer tell the two apart — the healed surface must instead
+// keep the ORIGINAL deployment's provenance verbatim.
+func (r *Reconciler) applyImageProvenance(ctx context.Context, app *spec.App, scheduledOverride *bool) (*store.Deployment, error) {
 	// Resolve placement (scheduling an unpinned app, or passing a pinned
 	// Node through unchanged) BEFORE the spec snapshot is marshaled, so the
 	// recorded deployment's Spec captures the concrete node an unpinned app
 	// actually landed on, not the "" it declared.
-	chosen, err := r.resolvePlacement(ctx, app)
+	chosen, scheduled, err := r.resolvePlacement(ctx, app)
+	if scheduledOverride != nil {
+		scheduled = *scheduledOverride
+	}
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -401,7 +418,7 @@ func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Depl
 		return nil, fmt.Errorf("ensure backing: %w", err)
 	}
 
-	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr)
+	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr, scheduled)
 }
 
 // applyGit deploys a git-built app: clone the declared ref with the box's
@@ -413,7 +430,7 @@ func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Depl
 func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deployment, error) {
 	// Resolve placement BEFORE the spec snapshot is marshaled, same rationale
 	// as applyImage.
-	chosen, err := r.resolvePlacement(ctx, app)
+	chosen, scheduled, err := r.resolvePlacement(ctx, app)
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -547,7 +564,7 @@ func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deploy
 		}
 	}
 
-	return r.deployBlueGreenSurface(ctx, n, app, tag, env, network, composeContent, specJSON, isLocal, meshAddr)
+	return r.deployBlueGreenSurface(ctx, n, app, tag, env, network, composeContent, specJSON, isLocal, meshAddr, scheduled)
 }
 
 // rollbackGit redeploys app (a git-built app's spec snapshot, with Image
@@ -558,17 +575,29 @@ func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deploy
 // semantics). Unlike applyGit/applyImage, this takes r.mu itself: Rollback
 // (its only caller) does not hold the lock, to avoid deadlocking against
 // Apply.
-func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App) (*store.Deployment, error) {
+//
+// scheduled carries the placement provenance of the snapshot being restored
+// (see rollbackGitLocked): it is NOT recomputed here, since app.Node is
+// already the concrete node from that snapshot and resolvePlacement isn't
+// even consulted on this path.
+func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App, scheduled bool) (*store.Deployment, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.rollbackGitLocked(ctx, app)
+	return r.rollbackGitLocked(ctx, app, scheduled)
 }
 
 // rollbackGitLocked is rollbackGit's body, extracted so the Phase 10 heal
 // path (healSurfaceLocked) can redeploy a git app's recorded spec+built tag
 // while ALREADY holding r.mu — calling rollbackGit itself would deadlock.
 // Callers must hold r.mu.
-func (r *Reconciler) rollbackGitLocked(ctx context.Context, app *spec.App) (*store.Deployment, error) {
+//
+// scheduled is the Scheduled provenance of the deployment being restored —
+// Rollback passes prev.Scheduled (the previous deployment's provenance),
+// healSurfaceLocked passes cur.Scheduled (the dead deployment's provenance)
+// — so a rolled-back/healed git surface keeps its original movability
+// rather than being (re-)classified from app.Node, which is always a
+// concrete node by the time it reaches here.
+func (r *Reconciler) rollbackGitLocked(ctx context.Context, app *spec.App, scheduled bool) (*store.Deployment, error) {
 	// Validate the declared shape (git url, build, domain, port, services...)
 	// against a copy with Image cleared: spec.Validate rejects a git app that
 	// declares Image (that combination is meaningless for user-authored
@@ -650,7 +679,7 @@ func (r *Reconciler) rollbackGitLocked(ctx context.Context, app *spec.App) (*sto
 		}
 	}
 
-	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr)
+	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr, scheduled)
 }
 
 // healSurfaceLocked recreates a dead surface from cur, the app's current
@@ -672,12 +701,19 @@ func (r *Reconciler) healSurfaceLocked(ctx context.Context, cur *store.Deploymen
 	}
 	restored.Image = cur.Image
 	if restored.Git != nil {
-		return r.rollbackGitLocked(ctx, &restored) // reuses built tag, no clone/build
+		// reuses built tag, no clone/build; cur.Scheduled carries the dead
+		// deployment's placement provenance forward, since restored.Node is
+		// already the concrete node it was running on, not "".
+		return r.rollbackGitLocked(ctx, &restored, cur.Scheduled)
 	}
 	if err := restored.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid spec snapshot for %q: %w", cur.App, err)
 	}
-	return r.applyImage(ctx, &restored) // applyImage assumes r.mu held; image already present
+	// applyImageProvenance assumes r.mu held; image already present. The
+	// override forces Scheduled to cur.Scheduled: resolvePlacement would
+	// otherwise see restored.Node already concrete (the scheduler's earlier
+	// choice) and misclassify it as pinned.
+	return r.applyImageProvenance(ctx, &restored, &cur.Scheduled)
 }
 
 // surfaceIsDead classifies a node.ContainerHealth observation (state, err) as
@@ -794,7 +830,12 @@ func (r *Reconciler) ensureBacking(ctx context.Context, n node.Node, app *spec.A
 // only address Caddy, running on the controller, can reach across nodes),
 // and Caddy's upstream becomes that meshAddr:port instead of the container
 // name.
-func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, app *spec.App, image string, env map[string]string, backingNetwork, composeContent string, specJSON []byte, isLocal bool, meshAddr string) (*store.Deployment, error) {
+//
+// scheduled is placement provenance (Phase 11b): recorded verbatim as
+// Scheduled on the StatusRunning deployment this call produces. Callers pass
+// whatever resolvePlacement determined (applyImage/applyGit), or the
+// provenance carried forward from a restored snapshot (rollbackGitLocked).
+func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, app *spec.App, image string, env map[string]string, backingNetwork, composeContent string, specJSON []byte, isLocal bool, meshAddr string, scheduled bool) (*store.Deployment, error) {
 	deployID, err := r.store.NextDeployID()
 	if err != nil {
 		return nil, fmt.Errorf("next deploy id: %w", err)
@@ -892,6 +933,7 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, ap
 		CreatedAt:   time.Now(),
 		Spec:        string(specJSON),
 		Compose:     composeContent,
+		Scheduled:   scheduled,
 	}
 	id, err := r.store.RecordDeployment(dep)
 	if err != nil {
@@ -1388,8 +1430,10 @@ func (r *Reconciler) Rollback(ctx context.Context, app string) (*store.Deploymen
 		// rollbackGit bypasses Apply entirely (it redeploys the previous
 		// built tag directly), so it needs its own nudge on success; the
 		// Compose/image path below falls through to Apply, which already
-		// nudges on its own success return.
-		dep, err := r.rollbackGit(ctx, &restored)
+		// nudges on its own success return. prev.Scheduled carries the
+		// restored deployment's placement provenance forward, since
+		// restored.Node is already the concrete node it ran on, not "".
+		dep, err := r.rollbackGit(ctx, &restored, prev.Scheduled)
 		if err == nil {
 			r.signalNudge()
 		}

@@ -53,19 +53,27 @@ func capacityBounded(ctx context.Context, n node.Node) (node.Capacity, error) {
 	return n.Capacity(ctxB)
 }
 
-// resolvePlacement decides the concrete node a surface deploy should run on.
-// A pinned app (Node set to anything other than "" or "local") bypasses the
-// scheduler entirely and is returned as-is. An app with Node == "local" is
-// also left alone here (ResolveMeta already treats "local" as the local
-// node); only a fully unset Node ("") is actually scheduled: candidates are
-// gathered (the local node, always, plus every registered node in the app's
-// pool) and handed to scheduler.Place.
-func (r *Reconciler) resolvePlacement(ctx context.Context, app *spec.App) (string, error) {
+// resolvePlacement decides the concrete node a surface deploy should run on,
+// and reports whether that decision came from the scheduler. A pinned app
+// (Node set to anything other than "" or "local") bypasses the scheduler
+// entirely and is returned as-is. An app with Node == "local" is also left
+// alone here (ResolveMeta already treats "local" as the local node); only a
+// fully unset Node ("") is actually scheduled: candidates are gathered (the
+// local node, always, plus every registered node in the app's pool) and
+// handed to scheduler.Place.
+//
+// The returned scheduled bool is placement provenance (Phase 11b): true iff
+// this call actually invoked the scheduler (original app.Node == ""), false
+// for a pinned node (including "local"). Callers record it on the resulting
+// deployment so later phases can tell which surfaces the scheduler placed
+// (and may therefore move) from ones an operator explicitly pinned (which
+// must never be moved).
+func (r *Reconciler) resolvePlacement(ctx context.Context, app *spec.App) (string, bool, error) {
 	// Any explicitly set Node ("local" or a named remote node) is pinned and
 	// bypasses the scheduler entirely; only a fully unset Node ("") is
 	// actually scheduled.
 	if app.Node != "" {
-		return app.Node, nil
+		return app.Node, false, nil
 	}
 
 	pool := poolOf(app)
@@ -140,5 +148,9 @@ func (r *Reconciler) resolvePlacement(ctx context.Context, app *spec.App) (strin
 	}
 
 	req := scheduler.Requirements{CPUCores: reqCPU(app), MemBytes: reqMem(app)}
-	return scheduler.Place(candidates, pool, req)
+	chosen, err := scheduler.Place(candidates, pool, req)
+	if err != nil {
+		return "", false, err
+	}
+	return chosen, true, nil
 }
