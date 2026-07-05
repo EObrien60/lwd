@@ -33,6 +33,7 @@ type DaemonClient interface {
 	AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL, pool string) error
 	RemoveNode(ctx context.Context, name string) error
 	Health(ctx context.Context) (reconciler.Health, error)
+	Pools(ctx context.Context) ([]client.Pool, error)
 }
 
 // The real daemon client must satisfy DaemonClient. This assertion fails the
@@ -78,6 +79,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/nodes/{name}", s.handleNodeRemove)
 
 	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("GET /api/pools", s.handlePools)
 
 	// Embedded static assets (placeholder UI; Task 5 replaces the contents
 	// of internal/web/assets/ with the crafted design). "/", "/login", and

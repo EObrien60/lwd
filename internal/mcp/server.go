@@ -12,6 +12,7 @@ import (
 
 	"lwd/internal/api"
 	"lwd/internal/client"
+	"lwd/internal/reconciler"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -33,6 +34,7 @@ type ClientIface interface {
 	Nodes(ctx context.Context) ([]client.NodeStatus, error)
 	AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL, pool string) error
 	RemoveNode(ctx context.Context, name string) error
+	Health(ctx context.Context) (reconciler.Health, error)
 }
 
 // The real daemon client must satisfy ClientIface. This assertion fails the

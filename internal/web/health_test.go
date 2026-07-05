@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"lwd/internal/node"
 	"lwd/internal/reconciler"
 )
 
@@ -19,7 +20,10 @@ func TestApiHealth(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	fd.health = reconciler.Health{
 		Nodes: []reconciler.NodeHealth{
-			{Name: "local", Transport: "local", Reachable: true, UpdatedAt: now},
+			{Name: "local", Transport: "local", Reachable: true, UpdatedAt: now, Capacity: node.Capacity{
+				CPUCores: 8, CPUUsed: 1.5, MemTotal: 16 << 30, MemAvailable: 10 << 30,
+				DiskTotal: 200 << 30, DiskFree: 120 << 30, Known: true,
+			}},
 			{Name: "web1", Transport: "agent", Reachable: false, UpdatedAt: now},
 		},
 		Edge: reconciler.EdgeHealth{Reachable: true, UpdatedAt: now},
@@ -41,6 +45,16 @@ func TestApiHealth(t *testing.T) {
 	}
 	if len(got.Nodes) != 2 || got.Nodes[1].Name != "web1" || got.Nodes[1].Reachable {
 		t.Errorf("unexpected Nodes: %+v", got.Nodes)
+	}
+	// Capacity (Phase 11a Task 8: surfaced in the web Health panel) must
+	// round-trip through the /api/health proxy exactly as the daemon reported
+	// it — this is the field the frontend renders as CPU/MEM/DISK bars.
+	gotCap := got.Nodes[0].Capacity
+	if !gotCap.Known || gotCap.CPUCores != 8 || gotCap.CPUUsed != 1.5 || gotCap.MemTotal != 16<<30 || gotCap.MemAvailable != 10<<30 || gotCap.DiskTotal != 200<<30 || gotCap.DiskFree != 120<<30 {
+		t.Errorf("unexpected Capacity for local: %+v", gotCap)
+	}
+	if got.Nodes[1].Capacity.Known {
+		t.Errorf("unexpected Capacity for web1 (no probe succeeded): %+v", got.Nodes[1].Capacity)
 	}
 	if !got.Edge.Reachable {
 		t.Errorf("unexpected Edge: %+v", got.Edge)

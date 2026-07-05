@@ -413,7 +413,7 @@ func runSecretRm(args []string) int {
 
 func runNode(args []string) int {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: lwd node <add|ls|rm> ...")
+		fmt.Fprintln(os.Stderr, "usage: lwd node <add|ls|rm|capacity|inspect> ...")
 		return 2
 	}
 	switch args[0] {
@@ -423,6 +423,10 @@ func runNode(args []string) int {
 		return runNodeLs()
 	case "rm":
 		return runNodeRm(args[1:])
+	case "capacity":
+		return runNodeCapacity()
+	case "inspect":
+		return runNodeInspect(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown node command %q\n", args[0])
 		return 2
@@ -514,6 +518,163 @@ func runPoolLs() int {
 	fmt.Printf("%-20s %s\n", "POOL", "NODES")
 	for _, p := range pools {
 		fmt.Printf("%-20s %d\n", p.Name, p.Nodes)
+	}
+	return 0
+}
+
+// humanBytes formats a byte count as a short human-readable string (e.g.
+// "512M", "2.3G"), using the same binary (1024-based) units spec.ParseSize
+// accepts for `requirements.memory` — so a size printed by `lwd node
+// capacity`/`lwd node inspect` is valid input if pasted back into an
+// lwd.toml. A non-positive count (including the zero value of an
+// unmeasured Capacity) renders as "0".
+func humanBytes(n int64) string {
+	if n <= 0 {
+		return "0"
+	}
+	units := []string{"B", "K", "M", "G", "T"}
+	f := float64(n)
+	i := 0
+	for f >= 1024 && i < len(units)-1 {
+		f /= 1024
+		i++
+	}
+	if i == 0 {
+		return fmt.Sprintf("%d%s", int64(f), units[i])
+	}
+	return fmt.Sprintf("%.1f%s", f, units[i])
+}
+
+// runNodeCapacity prints every node's live capacity snapshot (as observed by
+// the continuous reconciler, via GET /health) alongside its pool (from GET
+// /nodes — capacity and pool live in different daemon responses, see
+// client.Health/client.Nodes). A node whose capacity could not be measured
+// live (e.g. a briefly-unreachable remote, or an ssh-only node that only
+// reports totals) shows "known = no" with CPU/MEM/DISK columns blank rather
+// than misleadingly zero.
+func runNodeCapacity() int {
+	c := newClient()
+	ctx := context.Background()
+
+	h, err := c.Health(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "node capacity:", err)
+		return 1
+	}
+	nodes, err := c.Nodes(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "node capacity:", err)
+		return 1
+	}
+	pools := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		pools[n.Name] = n.Pool
+	}
+
+	fmt.Printf("%-16s %-10s %-14s %-20s %-20s %s\n", "NODE", "POOL", "CPU", "MEM", "DISK", "KNOWN")
+	for _, n := range h.Nodes {
+		pool := pools[n.Name]
+		if pool == "" {
+			pool = "default"
+		}
+		cpu, mem, disk, known := "—", "—", "—", "no"
+		if n.Capacity.Known {
+			known = "yes"
+			cpu = fmt.Sprintf("%.2f/%d", n.Capacity.CPUUsed, n.Capacity.CPUCores)
+			mem = fmt.Sprintf("%s/%s", humanBytes(n.Capacity.MemAvailable), humanBytes(n.Capacity.MemTotal))
+			disk = fmt.Sprintf("%s/%s", humanBytes(n.Capacity.DiskFree), humanBytes(n.Capacity.DiskTotal))
+		}
+		fmt.Printf("%-16s %-10s %-14s %-20s %-20s %s\n", n.Name, pool, cpu, mem, disk, known)
+	}
+	return 0
+}
+
+// runNodeInspect prints one node's pool, live capacity, and the surfaces
+// currently placed on it. Placement isn't tracked as its own queryable
+// field anywhere; it's derived the same way a human would have to: for
+// every app, its most recent (current) deployment's recorded spec snapshot
+// carries the concrete `Node` it was actually scheduled/pinned to (see
+// reconciler.applyImage/applyGit, which resolve placement before recording
+// the snapshot) — so an app whose current spec's Node matches name is
+// "on" this node.
+func runNodeInspect(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: lwd node inspect <name>")
+		return 2
+	}
+	name := args[0]
+	c := newClient()
+	ctx := context.Background()
+
+	nodes, err := c.Nodes(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "node inspect:", err)
+		return 1
+	}
+	pool := "default"
+	for _, n := range nodes {
+		if n.Name == name {
+			pool = n.Pool
+			break
+		}
+	}
+
+	h, err := c.Health(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "node inspect:", err)
+		return 1
+	}
+	var nh *reconciler.NodeHealth
+	for i := range h.Nodes {
+		if h.Nodes[i].Name == name {
+			nh = &h.Nodes[i]
+			break
+		}
+	}
+
+	fmt.Printf("NODE:      %s\n", name)
+	fmt.Printf("POOL:      %s\n", pool)
+	if nh == nil {
+		fmt.Println("(no live health data for this node yet — it may not be registered, or no reconcile pass has run)")
+	} else {
+		fmt.Printf("TRANSPORT: %s\n", nh.Transport)
+		fmt.Printf("REACHABLE: %v\n", nh.Reachable)
+		if nh.Capacity.Known {
+			fmt.Printf("CPU:       %.2f/%d cores\n", nh.Capacity.CPUUsed, nh.Capacity.CPUCores)
+			fmt.Printf("MEM:       %s/%s\n", humanBytes(nh.Capacity.MemAvailable), humanBytes(nh.Capacity.MemTotal))
+			fmt.Printf("DISK:      %s/%s\n", humanBytes(nh.Capacity.DiskFree), humanBytes(nh.Capacity.DiskTotal))
+		} else {
+			fmt.Println("CAPACITY:  unknown")
+		}
+	}
+
+	apps, err := c.Apps(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "node inspect:", err)
+		return 1
+	}
+
+	fmt.Println()
+	fmt.Println("SURFACES")
+	fmt.Printf("%-20s %-10s %-30s %s\n", "APP", "STATUS", "DOMAIN", "IMAGE")
+	var any bool
+	for _, a := range apps {
+		history, err := c.History(ctx, a.Name)
+		if err != nil || len(history) == 0 {
+			continue
+		}
+		var spc spec.App
+		if err := json.Unmarshal([]byte(history[0].Spec), &spc); err != nil {
+			continue
+		}
+		if spc.Node != name {
+			continue
+		}
+		any = true
+		fmt.Printf("%-20s %-10s %-30s %s\n", a.Name, a.Status, a.Domain, a.Image)
+	}
+	if !any {
+		fmt.Println("(none)")
 	}
 	return 0
 }

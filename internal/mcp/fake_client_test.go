@@ -6,6 +6,7 @@ import (
 
 	"lwd/internal/api"
 	"lwd/internal/client"
+	"lwd/internal/reconciler"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -48,6 +49,9 @@ type fakeClient struct {
 
 	removedNodes  []string
 	removeNodeErr error
+
+	health    reconciler.Health
+	healthErr error
 }
 
 // nodeAddCall captures the arguments of one AddNode call, so tests can assert
@@ -169,4 +173,11 @@ func (f *fakeClient) RemoveNode(ctx context.Context, name string) error {
 	}
 	f.removedNodes = append(f.removedNodes, name)
 	return nil
+}
+
+func (f *fakeClient) Health(ctx context.Context) (reconciler.Health, error) {
+	if f.healthErr != nil {
+		return reconciler.Health{}, f.healthErr
+	}
+	return f.health, nil
 }

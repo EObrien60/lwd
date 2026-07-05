@@ -12,9 +12,11 @@ mirrors that code; if they ever disagree, the Go source wins.
 | `image` | string | image apps | prebuilt image ref; mutually exclusive with `[git]`/`compose` |
 | `domain` | string | image, git, compose apps | required for those three shapes; live routing + TLS via Caddy |
 | `port` | int | image, git, compose apps | required for those three shapes; the **container** port, not a host port |
-| `node` | string | all | defaults to `"local"` |
+| `node` | string | all | **unset** (omit the field, or `""`) means "let lwd schedule it" — the daemon picks the node with the most free capacity in `pool` at deploy time; `"local"` pins it to the controller; any other value pins it to that registered node name (see `lwd node ls`). Unset does **not** default to `"local"` |
+| `pool` | string | all | the node pool to schedule into when `node` is unset; defaults to `"default"` (the pool the implicit `local` node and every node registered without `--pool` live in). Ignored (but still validated) when `node` is pinned. Must match `^[A-Za-z0-9][A-Za-z0-9_-]*$` |
 | `env` | map[string]string | all | non-secret config, passed as container/compose env |
 | `secrets` | []string | app + each `[[services]]` entry | **names only, never values**; must match `^[A-Za-z_][A-Za-z0-9_]*$` |
+| `[requirements]` | table | all | resource needs the scheduler uses when `node` is unset: `cpu` (float, cores, e.g. `0.5`) and `memory` (size string, e.g. `"512M"`, `"2G"` — binary units, K/M/G/T or Ki/Mi/Gi/Ti). Either or both may be set; omit the whole table for no requirements. A node whose live capacity can't be measured is optimistically assumed to fit |
 | `[health]` | table | all | `path` (string) and `timeout` (Go duration string, e.g. `"30s"`, default `30s`) |
 | `[git]` | table | git apps | `url` (required), `ref` (default `"main"`), `path` (subdir, optional) |
 | `[build]` | table | git apps only | `context`, `dockerfile` — **required** alongside `[git]`; rejected on every other shape |
@@ -69,6 +71,12 @@ Exactly one of these three shapes per app:
 - `[[services]].image`: required, non-empty.
 - `surfaces`: any non-empty value is rejected for every shape — never emit
   this field.
+- `pool`: `^[A-Za-z0-9][A-Za-z0-9_-]*$` when set; empty (unset) is allowed
+  and means `"default"`.
+- `requirements.cpu`: must not be negative; `0` (or omitting `cpu`) means no
+  CPU requirement.
+- `requirements.memory`: must parse as a size (see the `pool`/`[requirements]`
+  row above); empty (or omitting `memory`) means no memory requirement.
 
 ## Worked examples
 
@@ -155,3 +163,31 @@ Notes: `compose` is resolved relative to the app directory if not absolute.
 fronts that one service. Any other services in the compose file (a database,
 a worker) are brought up by `docker compose` itself and are **not** declared
 as `[[services]]` (which is rejected on compose apps).
+
+### (d) Scheduled image app (no pinned node, pool + resource requirements)
+
+`references/examples/scheduled-app.toml`:
+
+```toml
+name    = "worker"
+image   = "ghcr.io/me/worker:latest"
+domain  = "worker.example.com"
+port    = 8080
+
+pool = "web"
+
+[requirements]
+cpu    = 1
+memory = "1G"
+```
+
+Notes: `node` is **not set** — this is the key difference from every example
+above (all of which either omit `node` entirely on a single-node deploy, or
+pin it explicitly). On a fleet with more than one node registered in the
+`web` pool (see `lwd node add ... --pool web`), the daemon places this app on
+whichever node in that pool currently has the most free memory (then CPU) and
+at least 1 CPU core and 1G of available memory free; on a single-node
+install, or a pool with just `local` in it, it simply lands on `local` — the
+same as every other example. Never write `node = "local"` and expect
+scheduling to still apply: an explicit `node` (including `"local"`) always
+bypasses the scheduler.

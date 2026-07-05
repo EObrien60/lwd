@@ -149,6 +149,58 @@ func TestApiApplyRejectsBadToml(t *testing.T) {
 	}
 }
 
+// TestApiApplyParsesPoolAndRequirements covers the contract the deploy
+// modal's generated lwd.toml (From Git / Builder tabs) relies on: a `pool`
+// line plus a `[requirements]` table with `cpu`/`memory` set, in the shape
+// app.js's buildGitToml/buildBuilderToml emit (root-level scalars, then
+// `[requirements]`, before any `[git]`/`[[services]]` table headers), parses
+// and validates into an App with Pool/Requirements populated and reaches
+// Apply unchanged. There is no JS test runner in this repo (see app.js's
+// header comment on the buildless design), so this is the closest thing to a
+// test of the deploy modal's pool/requirements output: it proves the exact
+// wire format the modal must produce is accepted end to end.
+func TestApiApplyParsesPoolAndRequirements(t *testing.T) {
+	fd := newFakeDaemon()
+	srv, auth := testServer(fd)
+
+	toml := `
+name = "myapp"
+image = "nginx:latest"
+domain = "myapp.example.com"
+port = 80
+pool = "web"
+
+[requirements]
+cpu = 1.5
+memory = "512M"
+`
+	req := authedRequest(t, auth, http.MethodPost, "/api/apply", strings.NewReader(toml))
+	rec := do(srv, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+	if len(fd.applied) != 1 {
+		t.Fatalf("applied count = %d, want 1", len(fd.applied))
+	}
+	got := fd.applied[0]
+	if got.Pool != "web" {
+		t.Errorf("Pool = %q, want %q", got.Pool, "web")
+	}
+	if got.Requirements == nil {
+		t.Fatalf("Requirements = nil, want non-nil")
+	}
+	if got.Requirements.CPU != 1.5 || got.Requirements.Memory != "512M" {
+		t.Errorf("Requirements = %+v, want {CPU:1.5 Memory:512M}", got.Requirements)
+	}
+	// Node was left unset in the generated toml (the "Auto" placement
+	// option): spec.Parse must preserve "" rather than defaulting it, so the
+	// scheduler (not this test) decides where it lands.
+	if got.Node != "" {
+		t.Errorf("Node = %q, want unset", got.Node)
+	}
+}
+
 func TestApiApplyRejectsBadSpec(t *testing.T) {
 	fd := newFakeDaemon()
 	srv, auth := testServer(fd)

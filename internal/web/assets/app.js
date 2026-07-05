@@ -94,6 +94,45 @@ function fullTime(iso) {
   return d.toLocaleString();
 }
 
+// formatBytes renders a byte count in the same binary (1024-based) units
+// requirements.memory accepts (see spec.ParseSize), so a size shown in the
+// Nodes/Health capacity columns is valid input if typed back into a
+// requirement field.
+function formatBytes(n) {
+  if (n === null || n === undefined || n <= 0) return '0';
+  const units = ['B', 'K', 'M', 'G', 'T'];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return (i === 0 ? Math.round(v) : v.toFixed(1)) + units[i];
+}
+
+// pct clamps used/total into a 0-100 integer, for a meter bar's width.
+function pct(used, total) {
+  if (!total) return 0;
+  return Math.max(0, Math.min(100, Math.round((used / total) * 100)));
+}
+
+// The three *UsedPct helpers each take a node.Capacity JSON value (as
+// embedded in reconciler.NodeHealth) and return a 0-100 "used" percentage for
+// a meter bar, or 0 when capacity wasn't measured live (cap.known === false)
+// — callers gate the bar itself on cap.known and show "unknown" instead.
+function cpuUsedPct(cap) {
+  if (!cap || !cap.known || !cap.cpu_cores) return 0;
+  return pct(cap.cpu_used, cap.cpu_cores);
+}
+function memUsedPct(cap) {
+  if (!cap || !cap.known || !cap.mem_total) return 0;
+  return pct(cap.mem_total - cap.mem_available, cap.mem_total);
+}
+function diskUsedPct(cap) {
+  if (!cap || !cap.known || !cap.disk_total) return 0;
+  return pct(cap.disk_total - cap.disk_free, cap.disk_total);
+}
+
 // shortImage trims a long image reference (registry/repo@sha256:digest) down
 // to something that fits a card without hiding the meaningful tail.
 function shortImage(image) {
@@ -129,11 +168,19 @@ function specToToml(json) {
   kv('domain', spec.Domain);
   if (spec.Port) lines.push(`port = ${spec.Port}`);
   if (spec.Node && spec.Node !== 'local') kv('node', spec.Node);
+  kv('pool', spec.Pool);
   if (spec.Compose) kv('compose', spec.Compose);
   if (spec.Service) kv('service', spec.Service);
 
   if (spec.Secrets && spec.Secrets.length) {
     lines.push(`secrets = [${spec.Secrets.map(tomlString).join(', ')}]`);
+  }
+
+  if (spec.Requirements && (spec.Requirements.CPU || spec.Requirements.Memory)) {
+    lines.push('');
+    lines.push('[requirements]');
+    if (spec.Requirements.CPU) lines.push(`cpu = ${spec.Requirements.CPU}`);
+    if (spec.Requirements.Memory) lines.push(`memory = ${tomlString(spec.Requirements.Memory)}`);
   }
 
   if (spec.Env && Object.keys(spec.Env).length) {
@@ -229,19 +276,42 @@ function appendServiceTables(lines, services) {
   }
 }
 
+// requirementsLines renders the optional [requirements] table for a
+// placement form (f.reqCpu / f.reqMemory), returning [] if neither is set —
+// callers push the result directly onto their lines array. Must be called
+// AFTER every root-level scalar key (name/domain/port/node/pool/env/secrets)
+// and BEFORE any table header ([git]/[[services]]): once a header is
+// written, subsequent bare `key = value` lines belong to that table, not the
+// root document.
+function requirementsLines(f) {
+  const cpu = String(f.reqCpu || '').trim();
+  const memory = (f.reqMemory || '').trim();
+  if (!cpu && !memory) return [];
+  const lines = ['', '[requirements]'];
+  if (cpu) lines.push(`cpu = ${parseFloat(cpu)}`);
+  if (memory) lines.push(`memory = ${tomlString(memory)}`);
+  return lines;
+}
+
 // buildGitToml renders the "From Git" form into an lwd.toml document:
-// top-level app fields, a [git] block, a [build] block, then any declared
-// [[services]].
+// top-level app fields, an optional [requirements] table, a [git] block, a
+// [build] block, then any declared [[services]].
 function buildGitToml(f) {
   const lines = [];
   lines.push(`name = ${tomlString((f.name || '').trim())}`);
   lines.push(`domain = ${tomlString((f.domain || '').trim())}`);
   if (String(f.port || '').trim()) lines.push(`port = ${parseInt(f.port, 10)}`);
-  if (f.node && f.node !== 'local') lines.push(`node = ${tomlString(f.node)}`);
+  // f.node === '' means "Auto (let lwd schedule)": omit the line entirely, so
+  // spec.Parse preserves Node as unset — see spec.go's Node field comment.
+  // Anything else (including the explicit "local" choice) is emitted, since
+  // an unset node is no longer equivalent to "local" (Phase 11a).
+  if (f.node) lines.push(`node = ${tomlString(f.node)}`);
+  if ((f.pool || '').trim()) lines.push(`pool = ${tomlString(f.pool.trim())}`);
   const env = envRowsToInline(f.env);
   if (env) lines.push(`env = ${env}`);
   const secrets = namesToArray(f.secrets);
   if (secrets) lines.push(`secrets = ${secrets}`);
+  lines.push(...requirementsLines(f));
 
   lines.push('');
   lines.push('[git]');
@@ -260,19 +330,23 @@ function buildGitToml(f) {
 }
 
 // buildBuilderToml renders the "Builder" form (an image app, not a git build)
-// into an lwd.toml document: top-level app fields (including `image`), then
-// any declared [[services]].
+// into an lwd.toml document: top-level app fields (including `image`), an
+// optional [requirements] table, then any declared [[services]].
 function buildBuilderToml(f) {
   const lines = [];
   lines.push(`name = ${tomlString((f.name || '').trim())}`);
   lines.push(`image = ${tomlString((f.image || '').trim())}`);
   lines.push(`domain = ${tomlString((f.domain || '').trim())}`);
   if (String(f.port || '').trim()) lines.push(`port = ${parseInt(f.port, 10)}`);
-  if (f.node && f.node !== 'local') lines.push(`node = ${tomlString(f.node)}`);
+  // See buildGitToml's comment: '' means Auto/unset (scheduler decides), so
+  // it's the only node value that omits the line.
+  if (f.node) lines.push(`node = ${tomlString(f.node)}`);
+  if ((f.pool || '').trim()) lines.push(`pool = ${tomlString(f.pool.trim())}`);
   const env = envRowsToInline(f.env);
   if (env) lines.push(`env = ${env}`);
   const secrets = namesToArray(f.secrets);
   if (secrets) lines.push(`secrets = ${secrets}`);
+  lines.push(...requirementsLines(f));
 
   appendServiceTables(lines, f.services);
 
@@ -347,9 +421,14 @@ function dashboard() {
     nodes: [],
     nodesLoading: false,
     nodesError: '',
-    newNode: { name: '', sshHost: '', meshAddr: '', agentUrl: '' },
+    newNode: { name: '', sshHost: '', meshAddr: '', agentUrl: '', pool: '' },
     nodeAddBusy: false,
     nodeRemoveBusy: '',
+
+    // ---- pools (Phase 11a Task 8) --------------------------------------
+    // Populated from /api/pools; used to fill the deploy modal's Pool
+    // <select> and the Nodes view's pool badges.
+    pools: [],
 
     // ---- health ------------------------------------------------------
     health: null,
@@ -375,6 +454,7 @@ function dashboard() {
       this.applyTheme();
       this.loadApps();
       this.loadNodes(); // populates the deploy modal's node <select> even before visiting the Nodes view
+      this.loadPools(); // populates the deploy modal's pool <select> even before visiting the Nodes view
       this._pollHandle = setInterval(() => this.loadApps({ silent: true }), 5000);
       window.addEventListener('beforeunload', () => { this.stopLogs(); this.stopHealthPoll(); });
     },
@@ -430,6 +510,10 @@ function dashboard() {
     shortImage,
     timeAgo,
     fullTime,
+    formatBytes,
+    cpuUsedPct,
+    memUsedPct,
+    diskUsedPct,
 
     // ====================================================================
     // navigation
@@ -636,7 +720,7 @@ function dashboard() {
     },
 
     newNodeForm() {
-      return { name: '', sshHost: '', meshAddr: '', agentUrl: '' };
+      return { name: '', sshHost: '', meshAddr: '', agentUrl: '', pool: '' };
     },
 
     async addNode() {
@@ -650,16 +734,49 @@ function dashboard() {
         await apiFetch('/api/nodes', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, ssh_host: sshHost, mesh_addr: meshAddr, agent_url: this.newNode.agentUrl.trim() }),
+          body: JSON.stringify({
+            name, ssh_host: sshHost, mesh_addr: meshAddr,
+            agent_url: this.newNode.agentUrl.trim(), pool: this.newNode.pool.trim(),
+          }),
         });
         this.notify('ok', `Node "${name}" added.`);
         this.newNode = this.newNodeForm();
         await this.loadNodes();
+        await this.loadPools();
       } catch (e) {
         this.nodesError = e.message || 'Failed to add node.';
       } finally {
         this.nodeAddBusy = false;
       }
+    },
+
+    // poolForNode returns the pool a node (by name) is registered in, for
+    // display alongside its reachability in the Nodes/Health views. "local"
+    // is never in the registry (it's implicit) but always lives in
+    // "default"; an unrecognized name (e.g. health data for a node whose
+    // registration lookup hasn't loaded yet) falls back to "—".
+    poolForNode(name) {
+      if (name === 'local') return 'default';
+      const n = (this.nodes || []).find((x) => x.name === name);
+      return n ? (n.pool || 'default') : '—';
+    },
+
+    // ====================================================================
+    // pools (Phase 11a Task 8)
+    // ====================================================================
+    async loadPools() {
+      try {
+        this.pools = (await apiFetch('/api/pools')) || [];
+      } catch (e) {
+        // Best-effort: the deploy modal's pool <select> just falls back to
+        // offering only "default" if this fails.
+      }
+    },
+
+    // otherPools is every pool besides "default" (which the deploy modal's
+    // Pool <select> always offers as its blank/default option).
+    get otherPools() {
+      return (this.pools || []).filter((p) => p.name !== 'default');
     },
 
     async removeNode(name) {
@@ -748,7 +865,7 @@ function dashboard() {
     newGitForm() {
       return {
         url: '', ref: 'main', subdir: '', dockerfile: 'Dockerfile',
-        name: '', domain: '', port: '', node: 'local',
+        name: '', domain: '', port: '', node: 'local', pool: '', reqCpu: '', reqMemory: '',
         env: [], secrets: [], services: [],
       };
     },
@@ -756,7 +873,7 @@ function dashboard() {
     newBuilderForm() {
       return {
         image: '',
-        name: '', domain: '', port: '', node: 'local',
+        name: '', domain: '', port: '', node: 'local', pool: '', reqCpu: '', reqMemory: '',
         env: [], secrets: [], services: [],
       };
     },
@@ -767,6 +884,7 @@ function dashboard() {
         git: this.newGitForm(), builder: this.newBuilderForm(),
       };
       this.loadNodes(); // refresh the node <select> options in case one was just registered
+      this.loadPools(); // refresh the pool <select> options in case one was just created
     },
 
     openDeployEdit() {

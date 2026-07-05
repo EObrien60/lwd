@@ -10,9 +10,9 @@ that replaces raw docker-over-ssh for a registered node).
 
 > This is the **router + blue-green + secrets + compose apps + web UI + git
 > deploy + backing services + multi-node federation + dumb node agent + node
-> UX + continuous reconciler/self-heal** milestone (Phases 1–10). A scheduler
-> with capacity-aware placement and cross-node reschedule on node loss is
-> next (see `docs/VISION.md`).
+> UX + continuous reconciler/self-heal + capacity-aware scheduler + node
+> pools** milestone (Phases 1–11a). Node drain/evacuate and automatic
+> cross-node failover on node loss are next (see `docs/VISION.md`).
 
 ## Build
 
@@ -291,14 +291,18 @@ you — see [Web UI](#web-ui-lwd-web).
 
 ## Multi-node (federation)
 
-By default every app deploys to the same machine `lwd daemon` runs on —
-`node = "local"` (or an unset `node`, which defaults to it). lwd can
-additionally deploy an app to another registered machine over
+By default every app deploys to the same machine `lwd daemon` runs on. lwd
+can additionally deploy an app to another registered machine over
 **docker-over-ssh**, moving whatever image it needs there with `docker save |
 ssh | load` — no image registry required, and lwd manages no ssh credentials
 of its own (the daemon's own `ssh` — agent, keys, `~/.ssh/config` — must
 already reach the target non-interactively, exactly like [Deploy from
 Git](#deploy-from-git)'s use of the box's own git).
+
+**`node = "local"` pins an app to the controller; leaving `node` unset lets
+lwd pick where it runs** — see [Scheduling & pools](#scheduling--pools) for
+the placement rules. On a single-node install (no other nodes registered)
+these two are equivalent in practice: there's only ever one place to run.
 
 ### Register a node
 
@@ -331,7 +335,7 @@ lwd node rm web1
 
 ### Place an app on a node
 
-Add `node = "<name>"` to `lwd.toml`:
+Add `node = "<name>"` to `lwd.toml` to pin it to a specific node:
 
 ```toml
 name   = "worker"
@@ -341,13 +345,17 @@ port   = 8080
 node   = "web1"
 ```
 
-Omitting `node` (or setting it to `"local"`) keeps the app on the
-controller — every existing single-node `lwd.toml` is unaffected by this
-feature. `lwd-web`'s Deploy modal (both **From Git** and **Builder** tabs) has
-a **Node** dropdown, populated from the registry plus `local`, that adds the
-`node = "..."` line for you; `lwd-mcp`'s `lwd_apply` and `lwd_deploy_git`
-tools take an optional `node` argument that does the same — see
-[Web UI](#web-ui-lwd-web) and [Agent access](#agent-access-lwd-mcp).
+Setting `node = "local"` pins it to the controller. **Omitting `node`
+entirely** hands placement to the scheduler instead of pinning it anywhere —
+see [Scheduling & pools](#scheduling--pools). Every existing single-node
+`lwd.toml` (no `node` line, no other nodes registered) is unaffected: with
+nothing else to choose from, the scheduler places it on `local`, same as
+before. `lwd-web`'s Deploy modal (both **From Git** and **Builder** tabs) has
+a **Node** dropdown — `Auto` (unset), `local`, or a registered node — that
+adds (or omits) the `node = "..."` line for you, plus optional **Pool**/
+**CPU**/**Memory** fields; `lwd-mcp`'s `lwd_apply` and `lwd_deploy_git` tools
+take optional `node`, `pool`, and `requirements` arguments that do the
+same — see [Web UI](#web-ui-lwd-web) and [Agent access](#agent-access-lwd-mcp).
 
 ### How a remote deploy works
 
@@ -395,10 +403,117 @@ tools take an optional `node` argument that does the same — see
   run on a remote node.
 - Node reachability is now continuously observed (see [Self-healing &
   health](#self-healing--health)), and a dead surface is healed in place on
-  its existing node — but node capacity reporting, cross-node reschedule on
-  node loss, and a scheduler generally are later milestones (see
-  `docs/VISION.md`'s roadmap) — placement is still apply-time only: declare
-  `node = "..."`, `apply` deploys there once.
+  its existing node. An unpinned app is placed once, at apply time, by the
+  capacity-aware scheduler (see [Scheduling & pools](#scheduling--pools)) —
+  but **cross-node reschedule when a node goes away entirely** (node
+  drain/evacuate, automatic failover) is a later milestone (P11b, see
+  `docs/VISION.md`'s roadmap): today, if the node an app already landed on
+  disappears, self-healing has nothing to recreate the surface onto until
+  that node comes back.
+
+## Scheduling & pools
+
+Every registered node (plus the implicit `local` node) belongs to a **pool**
+— a group the scheduler picks within. Nodes registered without an explicit
+pool, and `local`, live in `"default"`.
+
+```bash
+lwd node add web1 deploy@web1.example.com 100.64.0.2 --pool web
+lwd node add web2 deploy@web2.example.com 100.64.0.3 --pool web
+lwd pool ls
+```
+
+```
+POOL                 NODES
+default              1
+web                  2
+```
+
+### Placing an app
+
+- **`node` unset** (no `node` line in `lwd.toml`) — the daemon schedules it:
+  at apply time, it gathers every reachable node in the app's `pool`
+  (`"default"` if `pool` is also unset — always includes `local`) along with
+  each one's live [capacity](#the-lwd-agent-transport), picks the node with
+  the most free memory (ties broken by free CPU, then name), and deploys
+  there. This is a one-time placement decision made at `apply`, not a
+  continuously rebalanced one — redeploying the same app schedules it again
+  from scratch (it may land somewhere different if capacity shifted).
+- **`node = "local"`** or **`node = "<registered-name>"`** — pins the app
+  exactly as before Phase 11a; the scheduler is never consulted.
+- **`pool = "<name>"`** narrows which pool an unpinned app schedules into.
+  Ignored (but still validated) if `node` is pinned.
+- **`[requirements]`** declares what the app needs — `cpu` (cores, e.g.
+  `0.5`) and/or `memory` (a size string, e.g. `"512M"`, `"2G"`) — and the
+  scheduler excludes any candidate node that doesn't have that much free.
+  Neither field is required; omit `[requirements]` entirely for "runs
+  anywhere with room."
+
+```toml
+name    = "worker"
+image   = "ghcr.io/me/worker:latest"
+domain  = "worker.example.com"
+port    = 8080
+pool    = "web"
+
+[requirements]
+cpu    = 1
+memory = "1G"
+```
+
+A node whose live capacity couldn't be measured (e.g. a briefly-unreachable
+remote, or an ssh-only node that only ever reports totals, never live usage)
+is **optimistically assumed to fit** any requirement rather than being
+excluded outright — this keeps a flaky capacity probe from turning into a
+failed deploy. See [The lwd-agent transport](#the-lwd-agent-transport) for
+which nodes report precise, live-usage capacity (agent-connected) versus
+best-effort totals (ssh-only).
+
+**Single-node stays exactly as before:** with no other nodes registered,
+every pool but `default` is empty, `local` is the only candidate, and an
+unpinned app always lands there — scheduling changes nothing observable for
+a single-machine install.
+
+### Inspecting capacity and placement
+
+```bash
+lwd node capacity
+```
+
+```
+NODE             POOL       CPU            MEM                  DISK                 KNOWN
+local            default    1.20/8         6.1G/16.0G           140.0G/200.0G        yes
+web1             web        3.60/4         1.0G/8.0G            8.0G/100.0G          yes
+web2             web        —              —                    —                    no
+```
+
+`CPU` is *used*/*cores*, `MEM` and `DISK` are *available*/*total* — the same
+numbers the scheduler ranks candidates by. `KNOWN = no` means this node's
+capacity couldn't be measured on the last probe (see the agent-vs-ssh note
+above); it's still a placement candidate, just an optimistic one.
+
+```bash
+lwd node inspect web1
+```
+
+```
+NODE:      web1
+POOL:      web
+TRANSPORT: agent
+REACHABLE: true
+CPU:       3.60/4 cores
+MEM:       1.0G/8.0G
+DISK:      8.0G/100.0G
+
+SURFACES
+APP                  STATUS     DOMAIN                         IMAGE
+worker               running    worker.example.com             ghcr.io/me/worker:latest
+```
+
+`node inspect` derives "what's running here" from every app's most recently
+recorded deployment spec (there's no separate placement table to query) —
+the same data `lwd-web`'s Nodes/Health views and `lwd-mcp`'s `lwd_node_list`
+tool render as pool badges and CPU/memory/disk bars/fields.
 
 ## The lwd-agent transport
 
@@ -474,6 +589,32 @@ credential.
 `lwd_node_remove` tools manage the node registry (including `agent_url`) the
 same way the CLI's `lwd node` subcommands do — see
 [Web UI](#web-ui-lwd-web) and [Agent access](#agent-access-lwd-mcp).
+
+### Node capacity: agent vs ssh
+
+The transport a node is reached over also decides how precise its reported
+[capacity](#scheduling--pools) is:
+
+- **Agent-connected nodes report precise, live usage** — `lwd-agent` reads
+  `/proc/meminfo` and `/proc/loadavg` and `statfs`s the root filesystem on
+  its own host directly, the same way the controller measures its own
+  (`local`) capacity. CPU-used, memory-available, and disk-free all reflect
+  what's happening on that machine right now.
+- **ssh-only nodes report best-effort totals from `docker info`** — without
+  an agent running there to read `/proc` locally, lwd falls back to what the
+  remote Docker daemon itself reports (CPU core count, total memory), which
+  has no live *usage* figures. `CPUUsed` and `MemAvailable` are left at their
+  zero value in this case (still `Known: true` — the totals themselves are
+  real, just not usage-aware), so the scheduler's free-memory ranking treats
+  such a node as though nothing is using it yet.
+- **A probe that fails entirely** (unreachable node, agent down, ssh
+  timeout) reports `Known: false` — see [Scheduling &
+  pools](#scheduling--pools) for how that's handled (optimistic inclusion,
+  never a hard exclusion).
+
+This is the same reason `lwd-agent` is worth running on a node you plan to
+schedule onto with `[requirements]`: it's the difference between the
+scheduler seeing real headroom versus just "how big is this box."
 
 ## Self-healing & health
 
@@ -671,7 +812,11 @@ built-in TLS, so don't expose it directly to the internet. Instead:
     **Edit & apply** on an existing app's config).
   Both From Git and Builder have an "Add backing service" control that emits
   `[[services]]` entries (name, image, command, env, secrets, volume) into
-  the generated document — see [Backing services](#backing-services).
+  the generated document — see [Backing services](#backing-services). Both
+  also have a **Node** dropdown (`Auto`/`local`/a registered node), an
+  optional **Pool** dropdown, and optional **CPU**/**Memory** requirement
+  fields that emit `node`/`pool`/`[requirements]` — see
+  [Scheduling & pools](#scheduling--pools).
 - **Live logs** — a per-app log stream over SSE, with a follow toggle.
 - **History + rollback** — past deployments for an app, with a one-click
   **Roll back** to any prior deployment (for a git-built app, this redeploys
@@ -682,17 +827,21 @@ built-in TLS, so don't expose it directly to the internet. Instead:
 - **Config edit** — view and edit an app's `lwd.toml` and re-apply it.
 - **Nodes** — a dedicated view (reachable from the header, alongside the
   Fleet overview) listing every registered [node](#multi-node-federation):
-  ssh host, mesh address, agent URL, live **transport** (`agent`/`ssh`), and
-  a **reachable/unreachable** indicator, probed fresh on every load; an
-  inline form to register a new node (name, ssh host, mesh address, optional
-  agent URL) and a **Remove** action per node. The Deploy modal's **From
-  Git**/**Builder** tabs also gained a **Node** dropdown (populated from this
-  same list, plus `local`) that adds the app's `node = "..."` line to the
-  generated `lwd.toml`.
+  **pool**, ssh host, mesh address, agent URL, live **transport**
+  (`agent`/`ssh`), and a **reachable/unreachable** indicator, probed fresh on
+  every load; an inline form to register a new node (name, ssh host, mesh
+  address, optional agent URL, optional pool) and a **Remove** action per
+  node. The Deploy modal's **From Git**/**Builder** tabs also have a **Node**
+  dropdown (populated from this same list, plus `Auto` and `local`) and a
+  **Pool** dropdown (from `GET /api/pools`) — see
+  [Scheduling & pools](#scheduling--pools).
 - **Health** — a dedicated view (reachable from the header, alongside Fleet
   and Nodes) rendering the [continuous reconciler's](#self-healing--health)
-  live snapshot from `GET /api/health`: every node's transport/reachability,
-  the shared edge (Caddy) reachability, and every self-healed app's state
+  live snapshot from `GET /api/health`: every node's pool, transport/
+  reachability, and live **CPU/memory/disk** (as small meter bars, or
+  "unknown" if the last probe couldn't measure it — see [Node capacity:
+  agent vs ssh](#node-capacity-agent-vs-ssh)); the shared edge (Caddy)
+  reachability; and every self-healed app's state
   (`healthy`/`degraded`/`healing`/`failed`) with its heal-attempt count and
   last error, auto-refreshing every few seconds. Read-only, and carries no
   secret values.
@@ -756,15 +905,15 @@ ever returned by any tool):
 | `lwd_status` | Get the current status and deployment history of a single app. |
 | `lwd_logs` | Get the most recent logs (`tail`-limited, default 200 lines) for an app. |
 | `lwd_history` | List recorded deployments (image, status, time) for an app. |
-| `lwd_apply` | Deploy an app from an `lwd.toml`, given inline (`toml`) or a local directory (`dir`); an optional `node` argument places it on a registered node, overriding whatever the toml itself says. |
-| `lwd_deploy_git` | Deploy an app built from a git repo, from discrete fields (url/ref/dockerfile/name/domain/port/services), without hand-authoring an `lwd.toml`; also takes an optional `node` argument. |
+| `lwd_apply` | Deploy an app from an `lwd.toml`, given inline (`toml`) or a local directory (`dir`); optional `node`/`pool`/`requirements` (`cpu`, `memory`) arguments set the same-named `lwd.toml` fields before validating, overriding whatever the toml itself says — see [Scheduling & pools](#scheduling--pools). |
+| `lwd_deploy_git` | Deploy an app built from a git repo, from discrete fields (url/ref/dockerfile/name/domain/port/services), without hand-authoring an `lwd.toml`; also takes optional `node`/`pool`/`requirements` arguments. |
 | `lwd_rollback` | Roll back an app to its previous deployment. |
 | `lwd_remove` | Permanently stop and remove an app. |
 | `lwd_secret_set` | Set (or overwrite) a secret value for an app. The value is never echoed back. |
 | `lwd_secret_list` | List the names of secrets set for an app — names only, never values. |
 | `lwd_secret_delete` | Delete a secret from an app. |
-| `lwd_node_list` | List every registered [node](#multi-node-federation): ssh host, mesh address, agent URL, and its live transport (`agent`/`ssh`) and reachability. |
-| `lwd_node_add` | Register (or update) a node: `name`, `ssh_host`, `mesh_addr`, and an optional `agent_url`. |
+| `lwd_node_list` | List every registered [node](#multi-node-federation): ssh host, mesh address, agent URL, pool, and its live transport (`agent`/`ssh`), reachability, and [capacity](#scheduling--pools) (CPU/memory/disk). |
+| `lwd_node_add` | Register (or update) a node: `name`, `ssh_host`, `mesh_addr`, and optional `agent_url`/`pool`. |
 | `lwd_node_remove` | Deregister a node. Apps already placed on it are not moved or removed. |
 
 `lwd_list`, `lwd_status`, `lwd_logs`, `lwd_history`, `lwd_secret_list`, and
@@ -822,32 +971,42 @@ argument to pass.
   [The lwd-agent transport](#the-lwd-agent-transport)) — is live for `image`
   and `[git]`+`[build]` apps (with or without `[[services]]`). A `compose =`
   app can only be placed on `local` for now (validation rejects the
-  combination). The single-node path (`node` unset or `"local"`) is fully
-  unchanged. Node reachability is continuously observed and a dead surface is
-  healed in place (see the next bullet); node capacity reporting, cross-node
-  reschedule on node loss, and a scheduler generally are later milestones.
+  combination). The single-node path (`node` unset, no other nodes
+  registered) is fully unchanged. Node reachability is continuously observed
+  and a dead surface is healed in place (see the next bullet); cross-node
+  **reschedule when a node goes away entirely** is a later milestone (P11b).
+- **Capacity-aware scheduling and node pools** (see
+  [Scheduling & pools](#scheduling--pools)) are fully live: an app with
+  `node` unset is placed, once, at apply time, on the most-free node in its
+  `pool` (`[requirements]` optionally gates candidates by free CPU/memory);
+  `lwd node capacity`/`lwd node inspect`/`lwd pool ls`, `lwd-web`'s Nodes and
+  Health views, and `lwd-mcp`'s `lwd_node_list` all surface pool + live
+  capacity. This is one-shot placement, not continuous rebalancing or
+  failover — see the multi-node bullet above.
 - [`lwd-web`](#web-ui-lwd-web) (a separate dashboard binary) is fully live:
   overview, live logs, history/rollback, secrets, redeploy, config edit, a
-  **Nodes** view (list/add/remove, live transport + reachability), a
-  **Health** view (the continuous reconciler's live snapshot), and a
-  Deploy modal with **From Git**, **Builder**, and **Paste** tabs (From Git
-  and Builder support declaring backing services and picking a node), all as
-  a thin client of the same daemon API the CLI uses. Deploying `lwd-web`
-  itself as an lwd-managed app and multi-user auth are not built yet.
+  **Nodes** view (list/add/remove, live transport + reachability + pool), a
+  **Health** view (the continuous reconciler's live snapshot, including
+  per-node CPU/memory/disk), and a Deploy modal with **From Git**,
+  **Builder**, and **Paste** tabs (From Git and Builder support declaring
+  backing services, picking a node/pool, and setting resource requirements),
+  all as a thin client of the same daemon API the CLI uses. Deploying
+  `lwd-web` itself as an lwd-managed app and multi-user auth are not built
+  yet.
 - [`lwd-mcp`](#agent-access-lwd-mcp) (a separate stdio MCP server binary) is
   fully live: all fourteen tools (list/status/logs/history/apply/deploy_git/
-  rollback/remove/secret set-list-delete/node list-add-remove), as a thin
-  client of the same daemon API the CLI and `lwd-web` use — no daemon
-  changes, no network listener, no secret value ever returned. Networked MCP
-  transport is not built yet.
+  rollback/remove/secret set-list-delete/node list-add-remove), including
+  pool/requirements/capacity, as a thin client of the same daemon API the CLI
+  and `lwd-web` use — no daemon changes, no network listener, no secret value
+  ever returned. Networked MCP transport is not built yet.
 - [Self-healing & health](#self-healing--health) — a continuous reconciler
   loop, off the request path, self-heals dead single-service surfaces
   (`image`/`[git]` apps) and observes (without acting on) node and edge
   reachability, exposed via `lwd health`, `GET /health`, and `lwd-web`'s
   **Health** panel — is fully live. `compose=` apps are not self-healed (see
   [Known limitations](#known-limitations-this-milestone)). Cross-node
-  reschedule of a surface whose node has gone away, and node
-  capacity/scheduling generally, are later milestones (P11).
+  reschedule of a surface whose node has gone away is a later milestone
+  (P11b).
 
 ### Known limitations (this milestone)
 
@@ -896,9 +1055,10 @@ argument to pass.
   substitute for host security.
 - **A `compose =` app cannot be placed on a remote node** — see [What's
   remote-capable today](#whats-remote-capable-today). Placement is also
-  apply-time only: nothing yet detects a node going away and reschedules
-  what was running on it, or reports node capacity/health — later milestones
-  per `docs/VISION.md`.
+  still one-shot: node capacity is reported and used to schedule an unpinned
+  app at `apply` time (see [Scheduling & pools](#scheduling--pools)), but
+  nothing yet detects a node going away afterward and reschedules what was
+  already running on it — that's P11b per `docs/VISION.md`.
 - A remote surface's mesh-address traffic between the controller's Caddy and
   the node is **plain HTTP** — lwd relies on the mesh itself (e.g.
   WireGuard) for transport encryption between nodes; it adds none of its
@@ -1007,6 +1167,19 @@ the same things an operator (or the web Health panel, or `lwd health`) would
 see: a brand-new running surface, the live route re-pointed at it, a fresh
 `running` deployment row, and the health snapshot reporting the app healthy
 again.
+
+Nor does the **[scheduler](#scheduling--pools) path**: `TestEndToEndScheduling`
+also always runs as part of `go test ./...`, entirely against fakes — a real
+reconciler/store/scheduler, two registered `node.Fake`s in pool `"default"`
+with deliberately different `MemAvailable`, plus the implicit `local` node
+(left with unmeasured, `Known: false` capacity so it can never win the
+ranking). It deploys an app with `node` left **unset**, and asserts the
+surface actually ran on the higher-capacity node (checking which fake
+received the `RunContainer` call, not just the recorded spec) and that the
+deployment row's spec snapshot records that concrete node — proving
+`resolvePlacement`'s full candidate-gathering (local + every registered node
+in the app's pool) and `scheduler.Place`'s most-free ranking end to end, with
+no Docker involved.
 
 All six Docker-gated tests clean up every container, network, node
 registration, and (for the git test) built image they create, and will

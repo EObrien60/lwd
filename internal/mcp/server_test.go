@@ -14,6 +14,8 @@ import (
 
 	"lwd/internal/api"
 	"lwd/internal/client"
+	"lwd/internal/node"
+	"lwd/internal/reconciler"
 	"lwd/internal/store"
 )
 
@@ -780,5 +782,153 @@ func TestToolDeployGitWithNode(t *testing.T) {
 	}
 	if fc.applied[0].Node != "web1" {
 		t.Errorf("expected applied App.Node = %q, got %q", "web1", fc.applied[0].Node)
+	}
+}
+
+// TestToolNodeAddWithPool covers Phase 11a Task 8: lwd_node_add's pool
+// argument reaches client.AddNode (Task 4 left it always passing "").
+func TestToolNodeAddWithPool(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	res := callTool(t, cs, "lwd_node_add", map[string]any{
+		"name": "web1", "ssh_host": "deploy@web1.example.com", "mesh_addr": "100.64.0.2", "pool": "web",
+	})
+	if res.IsError {
+		t.Fatalf("lwd_node_add(pool) returned tool error: %+v", res.Content)
+	}
+	if len(fc.addedNodes) != 1 || fc.addedNodes[0].Pool != "web" {
+		t.Fatalf("expected AddNode called once with pool %q, got %+v", "web", fc.addedNodes)
+	}
+
+	// pool is optional, same as agent_url.
+	res = callTool(t, cs, "lwd_node_add", map[string]any{"name": "web2", "ssh_host": "h", "mesh_addr": "m"})
+	if res.IsError {
+		t.Fatalf("lwd_node_add(no pool) returned tool error: %+v", res.Content)
+	}
+	if len(fc.addedNodes) != 2 || fc.addedNodes[1].Pool != "" {
+		t.Fatalf("expected second AddNode with empty pool, got %+v", fc.addedNodes)
+	}
+}
+
+// TestToolApplyWithPoolAndRequirements covers Phase 11a Task 8: lwd_apply's
+// optional pool and requirements arguments set app.Pool/app.Requirements
+// before Validate/Apply.
+func TestToolApplyWithPoolAndRequirements(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	res := callTool(t, cs, "lwd_apply", map[string]any{
+		"toml":         validSingleServiceToml,
+		"pool":         "web",
+		"requirements": map[string]any{"cpu": 1.5, "memory": "512M"},
+	})
+	if res.IsError {
+		t.Fatalf("lwd_apply(pool, requirements) returned tool error: %+v", res.Content)
+	}
+	if len(fc.applied) != 1 {
+		t.Fatalf("expected Apply called once, got %d", len(fc.applied))
+	}
+	got := fc.applied[0]
+	if got.Pool != "web" {
+		t.Errorf("expected applied App.Pool = %q, got %q", "web", got.Pool)
+	}
+	if got.Requirements == nil || got.Requirements.CPU != 1.5 || got.Requirements.Memory != "512M" {
+		t.Errorf("unexpected applied App.Requirements: %+v", got.Requirements)
+	}
+
+	// Omitting requirements entirely leaves app.Requirements nil (not a
+	// zero-valued &spec.Requirements{}) — Validate treats nil as "no
+	// requirements declared" (see spec.go), distinct from an explicit {}.
+	res = callTool(t, cs, "lwd_apply", map[string]any{"toml": validSingleServiceToml})
+	if res.IsError {
+		t.Fatalf("lwd_apply(no pool/requirements) returned tool error: %+v", res.Content)
+	}
+	if fc.applied[1].Requirements != nil {
+		t.Errorf("expected nil Requirements when omitted, got %+v", fc.applied[1].Requirements)
+	}
+}
+
+// TestToolDeployGitWithPoolAndRequirements covers Phase 11a Task 8:
+// lwd_deploy_git's optional pool and requirements arguments set
+// app.Pool/app.Requirements before Validate/Apply.
+func TestToolDeployGitWithPoolAndRequirements(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	res := callTool(t, cs, "lwd_deploy_git", map[string]any{
+		"url": "https://github.com/example/app.git", "name": "app", "domain": "app.example.com", "port": 3000,
+		"pool":         "web",
+		"requirements": map[string]any{"cpu": 0.5, "memory": "1G"},
+	})
+	if res.IsError {
+		t.Fatalf("lwd_deploy_git(pool, requirements) returned tool error: %+v", res.Content)
+	}
+	if len(fc.applied) != 1 {
+		t.Fatalf("expected Apply called once, got %d", len(fc.applied))
+	}
+	got := fc.applied[0]
+	if got.Pool != "web" {
+		t.Errorf("expected applied App.Pool = %q, got %q", "web", got.Pool)
+	}
+	if got.Requirements == nil || got.Requirements.CPU != 0.5 || got.Requirements.Memory != "1G" {
+		t.Errorf("unexpected applied App.Requirements: %+v", got.Requirements)
+	}
+}
+
+// TestToolNodeListIncludesPoolAndCapacity covers Phase 11a Task 8:
+// lwd_node_list's output carries each node's pool (from client.Nodes,
+// unchanged) and its live capacity, merged in from client.Health by node
+// name.
+func TestToolNodeListIncludesPoolAndCapacity(t *testing.T) {
+	fc := newFakeClient()
+	fc.nodes = []client.NodeStatus{
+		{Node: store.Node{Name: "web1", Pool: "web"}, Transport: "agent", Reachable: true},
+	}
+	fc.health = reconciler.Health{
+		Nodes: []reconciler.NodeHealth{
+			{Name: "web1", Transport: "agent", Reachable: true, Capacity: node.Capacity{
+				CPUCores: 4, CPUUsed: 0.5, MemTotal: 8 << 30, MemAvailable: 6 << 30, Known: true,
+			}},
+		},
+	}
+	cs := connectTestServer(t, fc)
+
+	res := callTool(t, cs, "lwd_node_list", map[string]any{})
+	if res.IsError {
+		t.Fatalf("lwd_node_list returned tool error: %+v", res.Content)
+	}
+	var out lwdNodeListOutput
+	decodeStructured(t, res, &out)
+	if len(out.Nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d: %+v", len(out.Nodes), out.Nodes)
+	}
+	got := out.Nodes[0]
+	if got.Pool != "web" {
+		t.Errorf("Pool = %q, want %q", got.Pool, "web")
+	}
+	if !got.Capacity.Known || got.Capacity.CPUCores != 4 || got.Capacity.MemAvailable != 6<<30 {
+		t.Errorf("unexpected Capacity: %+v", got.Capacity)
+	}
+}
+
+// TestToolNodeListCapacityUnknownOnHealthError covers that a failed
+// client.Health call (e.g. a daemon that hasn't run a reconcile pass, or a
+// transient error) doesn't fail lwd_node_list — every node is still
+// returned, just with Capacity.Known == false.
+func TestToolNodeListCapacityUnknownOnHealthError(t *testing.T) {
+	fc := newFakeClient()
+	fc.nodes = []client.NodeStatus{{Node: store.Node{Name: "web1", Pool: "default"}}}
+	fc.healthErr = fmt.Errorf("health unavailable")
+	cs := connectTestServer(t, fc)
+
+	res := callTool(t, cs, "lwd_node_list", map[string]any{})
+	if res.IsError {
+		t.Fatalf("lwd_node_list should tolerate a health fetch error, got tool error: %+v", res.Content)
+	}
+	var out lwdNodeListOutput
+	decodeStructured(t, res, &out)
+	if len(out.Nodes) != 1 || out.Nodes[0].Capacity.Known {
+		t.Errorf("unexpected Nodes: %+v", out.Nodes)
 	}
 }

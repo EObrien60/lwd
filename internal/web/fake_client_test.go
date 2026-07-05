@@ -51,6 +51,9 @@ type fakeDaemon struct {
 
 	health    reconciler.Health
 	healthErr error
+
+	pools    []client.Pool
+	poolsErr error
 }
 
 // nodeAddCall captures the arguments of one AddNode call, so tests can assert
@@ -179,4 +182,11 @@ func (f *fakeDaemon) Health(ctx context.Context) (reconciler.Health, error) {
 		return reconciler.Health{}, f.healthErr
 	}
 	return f.health, nil
+}
+
+func (f *fakeDaemon) Pools(ctx context.Context) ([]client.Pool, error) {
+	if f.poolsErr != nil {
+		return nil, f.poolsErr
+	}
+	return f.pools, nil
 }
