@@ -26,6 +26,19 @@ type UpSpec struct {
 	Env map[string]string
 }
 
+// DownSpec describes a compose project to tear down. It exists mainly so
+// Fake can record what a Down call was passed (mirroring UpSpec/LastUp) for
+// tests to assert on.
+type DownSpec struct {
+	// Project is the compose project name (`-p`).
+	Project string
+	// File is the path to the compose file (`-f`).
+	File string
+	// Env is set on the `docker compose` process environment, same as
+	// UpSpec.Env.
+	Env map[string]string
+}
+
 // Composer brings up, tears down, and inspects docker-compose-managed
 // stacks. The real implementation (CLI) shells out to the `docker compose`
 // CLI plugin; Fake is an in-memory stand-in for tests.
@@ -34,8 +47,13 @@ type Composer interface {
 	// recreating any services whose config or image changed. Unchanged
 	// services are left running.
 	Up(ctx context.Context, spec UpSpec) error
-	// Down tears down project's containers and its default network.
-	Down(ctx context.Context, project, file string) error
+	// Down tears down project's containers and its default network. env is
+	// set on the `docker compose` process environment (in addition to the
+	// current process environment), same as UpSpec.Env — used to pass
+	// DOCKER_HOST when project's containers live on a remote node's Docker
+	// daemon rather than the local one. nil/empty means no extra env (the
+	// local-node case).
+	Down(ctx context.Context, project, file string, env map[string]string) error
 	// ServiceContainer resolves the running container for service within
 	// project, returning its ID and name. It errors if the service has no
 	// running container.
@@ -69,10 +87,17 @@ func (c *CLI) Up(ctx context.Context, spec UpSpec) error {
 }
 
 // Down runs `docker compose -p <project> -f <file> down`, removing the
-// project's containers and its default network.
-func (c *CLI) Down(ctx context.Context, project, file string) error {
+// project's containers and its default network, with env added to the
+// process environment (same merge behavior as Up) so a remote node's
+// backing project is torn down against its own Docker daemon rather than
+// the controller's.
+func (c *CLI) Down(ctx context.Context, project, file string, env map[string]string) error {
 	args := []string{"compose", "-p", project, "-f", file, "down"}
-	if _, err := run(ctx, nil, "docker", args...); err != nil {
+	procEnv := os.Environ()
+	for k, v := range env {
+		procEnv = append(procEnv, k+"="+v)
+	}
+	if _, err := run(ctx, procEnv, "docker", args...); err != nil {
 		return fmt.Errorf("compose down %s: %w", project, err)
 	}
 	return nil

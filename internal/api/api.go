@@ -5,8 +5,11 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"regexp"
 	"strings"
+	"time"
 
 	"lwd/internal/node"
 	"lwd/internal/reconciler"
@@ -16,14 +19,31 @@ import (
 	"lwd/internal/store"
 )
 
+// hostnamePattern matches a plausible bare hostname (a single DNS label or
+// dotted sequence of them — e.g. "web1", "web1.internal", "10.0.0.1" also
+// happens to match but that's fine, IPs are valid mesh addresses too). It
+// deliberately rejects whitespace, a URL scheme, or other garbage that could
+// never be dialed as a docker-over-ssh host.
+var hostnamePattern = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$`)
+
+// NodeCacheInvalidator lets the API evict a resolver's cached remote node
+// entry when a node's registry row changes — added, updated, or removed via
+// POST/DELETE /nodes — so a stale docker-over-ssh client never lingers past
+// the change. *node.RegistryResolver satisfies this in production; tests may
+// pass nil (checked before use) or a fake that records calls.
+type NodeCacheInvalidator interface {
+	Invalidate(name string)
+}
+
 // Server wires HTTP routes to the reconciler, store, node, router, and
 // secrets store.
 type Server struct {
-	rec     *reconciler.Reconciler
-	store   *store.Store
-	node    node.Node
-	router  router.Router
-	secrets *secrets.Store
+	rec         *reconciler.Reconciler
+	store       *store.Store
+	node        node.Node
+	router      router.Router
+	secrets     *secrets.Store
+	invalidator NodeCacheInvalidator
 }
 
 // AppStatus is the wire representation of an app's current state.
@@ -35,9 +55,11 @@ type AppStatus struct {
 	Domain      string `json:"domain"`
 }
 
-// New returns a Server.
-func New(r *reconciler.Reconciler, s *store.Store, n node.Node, rt router.Router, sec *secrets.Store) *Server {
-	return &Server{rec: r, store: s, node: n, router: rt, secrets: sec}
+// New returns a Server. inv may be nil, in which case node registry changes
+// (POST/DELETE /nodes) skip cache invalidation — fine for tests that don't
+// exercise a resolver, but the daemon must pass its real RegistryResolver.
+func New(r *reconciler.Reconciler, s *store.Store, n node.Node, rt router.Router, sec *secrets.Store, inv NodeCacheInvalidator) *Server {
+	return &Server{rec: r, store: s, node: n, router: rt, secrets: sec, invalidator: inv}
 }
 
 // Handler returns the HTTP handler for all routes.
@@ -52,6 +74,9 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /apps/{name}/secrets", srv.handleSecretSet)
 	mux.HandleFunc("GET /apps/{name}/secrets", srv.handleSecretList)
 	mux.HandleFunc("DELETE /apps/{name}/secrets/{key}", srv.handleSecretDelete)
+	mux.HandleFunc("POST /nodes", srv.handleNodeAdd)
+	mux.HandleFunc("GET /nodes", srv.handleNodeList)
+	mux.HandleFunc("DELETE /nodes/{name}", srv.handleNodeDelete)
 	return mux
 }
 
@@ -224,5 +249,91 @@ func (srv *Server) handleSecretDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// nodeRequest is the wire body for POST /nodes.
+type nodeRequest struct {
+	Name     string `json:"name"`
+	SSHHost  string `json:"ssh_host"`
+	MeshAddr string `json:"mesh_addr"`
+}
+
+// invalidateNode evicts the resolver's cached remote node for name, if the
+// Server was given an invalidator. Called after every registry mutation
+// (add/update via POST, remove via DELETE) so a stale docker-over-ssh client
+// from before the change never lingers.
+func (srv *Server) invalidateNode(name string) {
+	if srv.invalidator != nil {
+		srv.invalidator.Invalidate(name)
+	}
+}
+
+// handleNodeAdd registers (or updates, upsert-by-name) a node in the store's
+// registry. All three fields are required — an empty name, ssh_host, or
+// mesh_addr each produce a 400 with a clear error, since a partially
+// specified node can't be resolved into a working docker-over-ssh Node
+// later. "local" is rejected too: it is the implicit, always-present local
+// node (node.Resolver treats "" and "local" as the local Docker daemon), so
+// registering a remote node under that name would either be silently inert
+// or shadow the real local node in confusing ways. mesh_addr is checked
+// against a plausible IP-or-hostname shape (net.ParseIP or hostnamePattern)
+// to catch whitespace, a URL scheme, or other garbage early, before it ever
+// reaches a docker-over-ssh dial or a Caddy upstream.
+func (srv *Server) handleNodeAdd(w http.ResponseWriter, r *http.Request) {
+	var req nodeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Name == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("name is required"))
+		return
+	}
+	if req.Name == "local" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("node name %q is reserved for the implicit local node", req.Name))
+		return
+	}
+	if req.SSHHost == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("ssh_host is required"))
+		return
+	}
+	if req.MeshAddr == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("mesh_addr is required"))
+		return
+	}
+	if net.ParseIP(req.MeshAddr) == nil && !hostnamePattern.MatchString(req.MeshAddr) {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("mesh_addr %q is not a valid IP address or hostname", req.MeshAddr))
+		return
+	}
+	n := store.Node{Name: req.Name, SSHHost: req.SSHHost, MeshAddr: req.MeshAddr, CreatedAt: time.Now()}
+	if err := srv.store.AddNode(n); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	// The add may be an update to an existing node's ssh_host/mesh_addr —
+	// invalidate any cached remote Node for this name so the next deploy to
+	// it re-resolves against the new values instead of reusing a stale ssh
+	// client built from the old ones.
+	srv.invalidateNode(req.Name)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (srv *Server) handleNodeList(w http.ResponseWriter, r *http.Request) {
+	nodes, err := srv.store.ListNodes()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, nodes)
+}
+
+func (srv *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := srv.store.DeleteNode(name); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	srv.invalidateNode(name)
 	w.WriteHeader(http.StatusNoContent)
 }

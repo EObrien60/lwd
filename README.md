@@ -7,8 +7,10 @@ optional client binaries: [`lwd-web`](#web-ui-lwd-web) (a browser dashboard)
 and [`lwd-mcp`](#agent-access-lwd-mcp) (an MCP server for coding agents).
 
 > This is the **router + blue-green + secrets + compose apps + web UI + git
-> deploy + backing services + agent access** milestone (Phases 1–8). Pinned
-> surfaces (outside compose) arrive in a later milestone.
+> deploy + backing services + agent access + multi-node federation**
+> milestone (Phases 1–9a). Continuous reconciliation, a scheduler, surface
+> replicas, and multi-edge routing arrive in later milestones (see
+> `docs/VISION.md`).
 
 ## Build
 
@@ -285,6 +287,98 @@ persistent volume, or a bind-mount path).
 section that builds `[[services]]` entries into the generated `lwd.toml` for
 you — see [Web UI](#web-ui-lwd-web).
 
+## Multi-node (federation)
+
+By default every app deploys to the same machine `lwd daemon` runs on —
+`node = "local"` (or an unset `node`, which defaults to it). lwd can
+additionally deploy an app to another registered machine over
+**docker-over-ssh**, moving whatever image it needs there with `docker save |
+ssh | load` — no image registry required, and lwd manages no ssh credentials
+of its own (the daemon's own `ssh` — agent, keys, `~/.ssh/config` — must
+already reach the target non-interactively, exactly like [Deploy from
+Git](#deploy-from-git)'s use of the box's own git).
+
+### Register a node
+
+```bash
+lwd node add web1 deploy@web1.example.com 100.64.0.2
+lwd node ls
+lwd node rm web1
+```
+
+- `<ssh-host>` is anything `ssh` itself accepts (`user@host`, or a `Host`
+  alias from `~/.ssh/config`).
+- `<mesh-addr>` is the address the controller reaches that node at for app
+  traffic. This is meant to be a **WireGuard mesh** address: the central
+  Caddy talks plain HTTP to a remote surface across it, so it should be a
+  private, trusted network, not a public IP. Standing up the mesh itself
+  (WireGuard keys/peers) is outside lwd's scope, same as ssh — bring your
+  own.
+- `local` is implicit and never appears in `lwd node ls`; registering a node
+  named `local` is not meaningful and not supported.
+
+### Place an app on a node
+
+Add `node = "<name>"` to `lwd.toml`:
+
+```toml
+name   = "worker"
+image  = "ghcr.io/me/worker:latest"
+domain = "worker.example.com"
+port   = 8080
+node   = "web1"
+```
+
+Omitting `node` (or setting it to `"local"`) keeps the app on the
+controller — every existing single-node `lwd.toml` is unaffected by this
+feature.
+
+### How a remote deploy works
+
+1. **The build always stays on the controller.** A git-built app's `docker
+   build` (see [Deploy from Git](#deploy-from-git)) never runs on the target
+   node; only the resulting image is shipped there.
+2. Before starting the container, lwd makes the image available on the
+   target: it first tries an ordinary registry pull **on the target
+   itself** (covers any image the target can fetch on its own, with no data
+   flowing through the controller); if that doesn't produce the image (e.g.
+   a locally-built `lwd-build/<app>:<sha>` tag that was never pushed
+   anywhere), lwd transfers it directly — `docker save` on the controller,
+   piped over the ssh connection into `docker load` on the target.
+3. The surface container runs on the target node's own Docker daemon,
+   reached via the Docker SDK's ssh connection helper (the same mechanism
+   `docker -H ssh://<ssh-host>` uses). A **local** surface publishes no host
+   port at all — Caddy reaches it by container name on the shared `lwd`
+   network, unchanged from single-node. A **remote** surface instead
+   publishes an ephemeral host port bound to the node's mesh address, and
+   the central Caddy's upstream for that route becomes
+   `<mesh-addr>:<published-port>`. Blue-green staging, health-checking
+   (through Caddy), and cutover all work exactly as described in [How
+   deploys work](#how-deploys-work) — only the upstream address differs.
+4. A remote app's declared [`[[services]]`](#backing-services) are brought
+   up with `docker compose` **targeting the node's own daemon**
+   (`DOCKER_HOST=ssh://<ssh-host>` in the process env passed to the compose
+   CLI) — pinned alongside the surface on that node, not the controller.
+
+### What's remote-capable today
+
+- `image` apps and `[git]`+`[build]` apps — with or without
+  `[[services]]` — can be placed on a registered node.
+- **A `compose =` app cannot be placed on a remote node yet.**
+  `lwd.toml` validation rejects `compose` combined with a non-local `node`
+  outright (`compose apps on remote nodes are not supported yet`): unlike
+  the image/git backing-services path above, `applyCompose`'s `docker
+  compose up` and routing don't yet thread a resolved node's `DOCKER_HOST`
+  through, so silently allowing it would run the stack on the controller
+  instead of the node the user asked for. Run a compose app on `local`, or
+  reshape it as an `image`/`[git]` app with `[[services]]` if it needs to
+  run on a remote node.
+- A dumb `lwd-agent` transport (replacing raw docker-over-ssh), node
+  capacity/health reporting, continuous reconciliation (self-healing a
+  crashed remote surface), a scheduler, and web/MCP node UX are later
+  milestones (see `docs/VISION.md`'s roadmap) — this milestone is
+  placement-only: declare `node = "..."`, `apply` deploys there once.
+
 ## Secrets
 
 Apps can declare secret names in `lwd.toml`:
@@ -493,14 +587,23 @@ argument to pass.
 
 ## Networking model
 
-- lwd creates and manages one private Docker network, `lwd`. Every app
-  container and the `lwd-caddy` container join it.
-- App containers publish **no host ports** — Caddy reaches them by container
-  name and port on the `lwd` network. This is why `lwd.toml`'s `port` is just
-  the app's container port (e.g. `80` for `traefik/whoami`), not a host port
-  to reserve.
-- Only `lwd-caddy` binds host ports: 80 and 443 for traffic, and 2019
-  (loopback-only) for its admin API, which lwd uses to push routing config.
+- lwd creates and manages one private Docker network, `lwd`, **on every node
+  it deploys to**. Every local app container, every remote app container (on
+  its own node), and the `lwd-caddy` container (on the controller) join the
+  `lwd` network on their respective host.
+- A **local** app container publishes **no host ports** — Caddy reaches it by
+  container name and port on the `lwd` network. This is why `lwd.toml`'s
+  `port` is just the app's container port (e.g. `80` for `traefik/whoami`),
+  not a host port to reserve.
+- A **remote** app container (placed via [`node =
+  "..."`](#multi-node-federation)) publishes an ephemeral host port bound to
+  its node's mesh address, since the controller's Caddy has no other way to
+  reach across nodes; `lwd.toml`'s `port` is still just the container port —
+  the host port is chosen automatically.
+- Only `lwd-caddy`, on the controller, binds host ports 80 and 443 for
+  traffic, and 2019 (loopback-only) for its admin API, which lwd uses to push
+  routing config. A registered node runs no lwd-managed container of its
+  own besides the app surfaces (and their backing services) placed on it.
 
 ## Scope of this milestone
 
@@ -521,6 +624,15 @@ argument to pass.
 - `surfaces` in `lwd.toml` is parsed but rejected with a clear error for all
   shapes; the surfaces-outside-compose blue-green model discussed for the web
   tier of a compose app is deliberately not built (YAGNI for now).
+- **Multi-node (federation)** — `lwd node add/ls/rm`, `node = "..."`
+  placement, docker-over-ssh transport, and `docker save|load` image
+  movement (see [Multi-node](#multi-node-federation)) — is live for `image`
+  and `[git]`+`[build]` apps (with or without `[[services]]`). A `compose =`
+  app can only be placed on `local` for now (validation rejects the
+  combination). The single-node path (`node` unset or `"local"`) is fully
+  unchanged. A dumb `lwd-agent` transport, node capacity/health reporting,
+  continuous reconciliation, a scheduler, and web/MCP node UX are later
+  milestones.
 - [`lwd-web`](#web-ui-lwd-web) (a separate dashboard binary) is fully live:
   overview, live logs, history/rollback, secrets, redeploy, config edit, and
   a Deploy modal with **From Git**, **Builder**, and **Paste** tabs (both
@@ -579,6 +691,16 @@ argument to pass.
   the database in `<data_dir>/secret.key`, so anyone who can read the data
   directory can decrypt every secret. This is a data-at-rest control, not a
   substitute for host security.
+- **A `compose =` app cannot be placed on a remote node** — see [What's
+  remote-capable today](#whats-remote-capable-today). Placement is also
+  apply-time only: nothing yet detects a node going away and reschedules
+  what was running on it, reports node capacity/health, or exposes node
+  choice from `lwd-web`/`lwd-mcp` (CLI/API only for now) — all later
+  milestones per `docs/VISION.md`.
+- A remote surface's mesh-address traffic between the controller's Caddy and
+  the node is **plain HTTP** — lwd relies on the mesh itself (e.g.
+  WireGuard) for transport encryption between nodes; it adds none of its
+  own on top.
 
 ## Testing
 
@@ -633,7 +755,19 @@ compose test also `redis`) — against real Docker:
   across both the redeploy and a `lwd rollback`. It `t.Skip`s if `git` or the
   `docker compose` CLI plugin (needed for the backing service) is not
   available.
+- `TestEndToEndRemoteNode` exercises [multi-node
+  federation](#multi-node-federation) end to end: it registers `ssh://localhost`
+  as a stand-in "remote" node against a real `node.RegistryResolver`, deploys
+  an app pinned to it, and asserts (via `docker -H ssh://localhost ...`, not
+  just the local daemon view) that the image is present and the surface
+  container is running on that node, reachable through Caddy at the node's
+  mesh address — then deploys a second, `node = "local"` app in the same run
+  and asserts it still works unchanged. It requires key-based ssh to
+  `localhost` with a reachable Docker daemon there (`docker -H
+  ssh://localhost version` must succeed); it probes for that first and
+  `t.Skip`s with a clear message — it never fakes a pass — if unusable, which
+  is the common case in a sandboxed/CI environment with no sshd running.
 
-All four tests clean up every container, network, and (for the git test)
-built image they create, and will `t.Skip` (rather than fail) if ports 80/443
-are already in use on the host.
+All five tests clean up every container, network, node registration, and (for
+the git test) built image they create, and will `t.Skip` (rather than fail)
+if ports 80/443 are already in use on the host.

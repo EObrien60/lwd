@@ -94,7 +94,8 @@ func newTestReconcilerFull(t *testing.T, sec SecretResolver) (*Reconciler, *node
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	return New(f, fr, s, sec, cf, sf, bf), f, fr, s, cf, sf, bf
+	resolver := node.FakeResolver{"local": f}
+	return New(resolver, fr, s, sec, cf, sf, bf), f, fr, s, cf, sf, bf
 }
 
 func testApp() *spec.App {
@@ -275,7 +276,7 @@ func TestApplyDockerHealthcheck(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+	r := New(node.FakeResolver{"local": f}, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -301,7 +302,7 @@ func TestApplyDockerHealthcheckUnhealthyFails(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+	r := New(node.FakeResolver{"local": f}, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -463,7 +464,7 @@ func TestApplyDockerHealthStartingThenHealthy(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+	r := New(node.FakeResolver{"local": f}, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -477,6 +478,86 @@ func TestApplyDockerHealthStartingThenHealthy(t *testing.T) {
 	}
 	if _, ok := fr.Routes["blog.example.com"]; !ok {
 		t.Errorf("want route set once docker health flips to healthy")
+	}
+}
+
+// TestApplyPlacesOnNode is the pivotal federation-placement test: an app
+// declaring node = "web1" must have its container run on the node resolved
+// for "web1", not on the local node, even though both are wired into the
+// same Reconciler via a single FakeResolver.
+func TestApplyPlacesOnNode(t *testing.T) {
+	n0 := node.NewFake()
+	n1 := node.NewFake()
+	fr := router.NewFakeRouter()
+	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	resolver := node.FakeResolver{"local": n0, "web1": n1}
+	r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+	app := testApp()
+	app.Node = "web1"
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	dep, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if dep.Status != store.StatusRunning {
+		t.Errorf("status = %q, want running", dep.Status)
+	}
+
+	if !contains(n1.Calls, "RunContainer:lwd-blog-1") {
+		t.Errorf("want the container run on the resolved node (web1), calls: %v", n1.Calls)
+	}
+	for _, c := range n0.Calls {
+		if strings.HasPrefix(c, "RunContainer:") {
+			t.Errorf("want no RunContainer call on the local node when app.Node=web1, calls: %v", n0.Calls)
+		}
+	}
+
+	// Remove must also resolve back to web1 (from the stored spec snapshot's
+	// Node field), not the local node.
+	if err := r.Remove(context.Background(), "blog"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if !contains(n1.Calls, "RemoveContainer:"+dep.ContainerID) {
+		t.Errorf("want Remove to remove the container on web1, calls: %v", n1.Calls)
+	}
+}
+
+// TestApplyUnknownNodeRecordsFailed ensures a bad `node = "..."` fails the
+// deploy closed (no container ever started) and is recorded in history,
+// rather than silently falling back to the local node.
+func TestApplyUnknownNodeRecordsFailed(t *testing.T) {
+	r, f, _, s := newTestReconciler(t)
+	app := testApp()
+	app.Node = "ghost"
+
+	_, err := r.Apply(context.Background(), app)
+	if err == nil {
+		t.Fatal("want error for an unregistered node")
+	}
+	for _, c := range f.Calls {
+		if strings.HasPrefix(c, "RunContainer:") {
+			t.Errorf("want no RunContainer call when the node can't be resolved, calls: %v", f.Calls)
+		}
+	}
+	history, err := s.DeploymentsForApp(app.Name)
+	if err != nil {
+		t.Fatalf("DeploymentsForApp: %v", err)
+	}
+	var sawFailed bool
+	for _, d := range history {
+		if d.Status == store.StatusFailed {
+			sawFailed = true
+		}
+	}
+	if !sawFailed {
+		t.Errorf("want a StatusFailed deployment recorded, history: %+v", history)
 	}
 }
 
@@ -855,6 +936,57 @@ func TestRemoveSingleServiceRemovesContainersAndRoute(t *testing.T) {
 	}
 }
 
+// TestRemoveSingleServiceDegradesWhenNodeGone covers the Phase 9a
+// final-review fix: an app whose stored node no longer resolves (e.g. it was
+// deregistered via `lwd node rm` after the app was deployed to it) must
+// still be removable. Before this fix, ResolveMeta's error hard-failed the
+// whole Remove, leaving the app's Caddy route and deployment row stuck
+// forever pointing at a node that no longer exists. Now: remote container
+// and backing teardown are skipped (nothing left to talk to, and nothing to
+// clean up there anyway since the node is gone), but the controller-side
+// Caddy route is still removed and the deployment row is still retired.
+func TestRemoveSingleServiceDegradesWhenNodeGone(t *testing.T) {
+	local := node.NewFake()
+	remote := node.NewFake()
+	fr := router.NewFakeRouter()
+	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	resolver := node.FakeResolver{"local": local, "web1": remote}
+	r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+	app := testApp()
+	app.Node = "web1"
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	if _, err := r.Apply(context.Background(), app); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// Simulate `lwd node rm web1`: it's gone from the registry, so a later
+	// ResolveMeta("web1") fails exactly like it would against the real
+	// RegistryResolver.
+	delete(resolver, "web1")
+
+	if err := r.Remove(context.Background(), "blog"); err != nil {
+		t.Fatalf("Remove: %v, want it to succeed (degraded) even though the node is gone", err)
+	}
+
+	if _, ok := fr.Routes["blog.example.com"]; ok {
+		t.Errorf("want route removed after Remove even with the node gone")
+	}
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur != nil {
+		t.Errorf("want no current deployment (retired) after Remove, got %+v", cur)
+	}
+}
+
 func TestApplyGitClonesBuildsDeploys(t *testing.T) {
 	r, f, fr, _, sf, bf := newTestReconcilerWithGit(t)
 	app := testGitApp()
@@ -1212,6 +1344,412 @@ func TestRemoveGitDownsBacking(t *testing.T) {
 	}
 	if cur != nil {
 		t.Errorf("want no current deployment after Remove, got %+v", cur)
+	}
+}
+
+// TestEnsureImageTransfersWhenAbsent covers the Phase 9a-Task 4 image
+// transfer path used before running a surface on a non-local node:
+// ensureImageOnNode should transfer (save on the local node, load on the
+// target) only when the image is absent AND a registry pull on the target
+// doesn't produce it; it must not transfer when the target already has it,
+// and it must hard-fail (no transfer, no run) when ImagePresent itself
+// errors on the target.
+func TestEnsureImageTransfersWhenAbsent(t *testing.T) {
+	t.Run("absent after pull triggers save|load transfer", func(t *testing.T) {
+		local := node.NewFake()
+		remote := node.NewFake()
+		fr := router.NewFakeRouter()
+		s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		resolver := node.FakeResolver{"local": local, "web1": remote}
+		r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+		app := testApp() // Image: "img:1"
+		app.Node = "web1"
+		app.Health.Timeout = shortTimeout
+		fr.ProbeStatus = 200
+
+		// remote.Images has no entry for "img:1", and Fake.EnsureImage never
+		// marks an image present (it only records the call), so the
+		// "registry pull on the target" step leaves it absent and the
+		// transfer path must run.
+		dep, err := r.Apply(context.Background(), app)
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if dep.Status != store.StatusRunning {
+			t.Errorf("status = %q, want running", dep.Status)
+		}
+		if !contains(local.Calls, "SaveImage:img:1") {
+			t.Errorf("want SaveImage on the local node, calls: %v", local.Calls)
+		}
+		if !contains(remote.Calls, "LoadImage") {
+			t.Errorf("want LoadImage on the target node, calls: %v", remote.Calls)
+		}
+		if !remote.Images["img:1"] {
+			t.Errorf("want img:1 present on the target node after transfer")
+		}
+	})
+
+	t.Run("already present on target skips transfer", func(t *testing.T) {
+		local := node.NewFake()
+		remote := node.NewFake()
+		remote.Images = map[string]bool{"img:1": true}
+		fr := router.NewFakeRouter()
+		s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		resolver := node.FakeResolver{"local": local, "web1": remote}
+		r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+		app := testApp()
+		app.Node = "web1"
+		app.Health.Timeout = shortTimeout
+		fr.ProbeStatus = 200
+
+		dep, err := r.Apply(context.Background(), app)
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if dep.Status != store.StatusRunning {
+			t.Errorf("status = %q, want running", dep.Status)
+		}
+		for _, c := range local.Calls {
+			if strings.HasPrefix(c, "SaveImage:") {
+				t.Errorf("want no SaveImage call when already present on target, calls: %v", local.Calls)
+			}
+		}
+		if contains(remote.Calls, "LoadImage") {
+			t.Errorf("want no LoadImage call when already present on target, calls: %v", remote.Calls)
+		}
+	})
+
+	t.Run("ImagePresent error fails deploy closed, no transfer, no run", func(t *testing.T) {
+		local := node.NewFake()
+		remote := node.NewFake()
+		remote.ImagePresentErr = fmt.Errorf("docker unreachable")
+		fr := router.NewFakeRouter()
+		s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		resolver := node.FakeResolver{"local": local, "web1": remote}
+		r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+		app := testApp()
+		app.Node = "web1"
+		app.Health.Timeout = shortTimeout
+		fr.ProbeStatus = 200
+
+		if _, err := r.Apply(context.Background(), app); err == nil {
+			t.Fatal("want Apply to fail when ImagePresent errors on the target")
+		}
+		for _, c := range remote.Calls {
+			if strings.HasPrefix(c, "RunContainer:") {
+				t.Errorf("want no RunContainer call when image presence can't be determined, calls: %v", remote.Calls)
+			}
+		}
+		if contains(remote.Calls, "LoadImage") {
+			t.Errorf("want no LoadImage call, calls: %v", remote.Calls)
+		}
+		for _, c := range local.Calls {
+			if strings.HasPrefix(c, "SaveImage:") {
+				t.Errorf("want no SaveImage call, calls: %v", local.Calls)
+			}
+		}
+	})
+}
+
+// TestEnsureImageOnNodeMutableTagRefresh covers the Phase 9a final-review
+// fix: ensureImageOnNode must mirror Local.EnsureImage's pinned-vs-mutable
+// semantics on a remote node too. Before this fix it early-returned as soon
+// as target.ImagePresent was true, so a remote app declaring a mutable tag
+// (e.g. "img:latest") never re-pulled a moved tag — only a LOCAL app did,
+// via Local.EnsureImage's own always-pull-when-mutable behavior.
+func TestEnsureImageOnNodeMutableTagRefresh(t *testing.T) {
+	t.Run("mutable tag already present on target still triggers a pull", func(t *testing.T) {
+		local := node.NewFake()
+		remote := node.NewFake()
+		remote.Images = map[string]bool{"img:latest": true}
+		fr := router.NewFakeRouter()
+		s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		resolver := node.FakeResolver{"local": local, "web1": remote}
+		r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+		app := testApp()
+		app.Image = "img:latest"
+		app.Node = "web1"
+		app.Health.Timeout = shortTimeout
+		fr.ProbeStatus = 200
+
+		dep, err := r.Apply(context.Background(), app)
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if dep.Status != store.StatusRunning {
+			t.Errorf("status = %q, want running", dep.Status)
+		}
+		if !contains(remote.Calls, "EnsureImage:img:latest") {
+			t.Errorf("want target.EnsureImage called for a mutable tag even though already present, calls: %v", remote.Calls)
+		}
+	})
+
+	t.Run("pinned digest already present skips pull and transfer", func(t *testing.T) {
+		local := node.NewFake()
+		remote := node.NewFake()
+		const ref = "img@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+		remote.Images = map[string]bool{ref: true}
+		fr := router.NewFakeRouter()
+		s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		resolver := node.FakeResolver{"local": local, "web1": remote}
+		r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+		app := testApp()
+		app.Image = ref
+		app.Node = "web1"
+		app.Health.Timeout = shortTimeout
+		fr.ProbeStatus = 200
+
+		dep, err := r.Apply(context.Background(), app)
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if dep.Status != store.StatusRunning {
+			t.Errorf("status = %q, want running", dep.Status)
+		}
+		if contains(remote.Calls, "EnsureImage:"+ref) {
+			t.Errorf("want no pull for a pinned digest already present, calls: %v", remote.Calls)
+		}
+		for _, c := range local.Calls {
+			if strings.HasPrefix(c, "SaveImage:") {
+				t.Errorf("want no SaveImage call for a pinned digest already present, calls: %v", local.Calls)
+			}
+		}
+	})
+
+	t.Run("absent lwd-build tag transfers via save|load", func(t *testing.T) {
+		local := node.NewFake()
+		remote := node.NewFake()
+		const ref = "lwd-build/gitapp:deadbeefcafe"
+		fr := router.NewFakeRouter()
+		s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		resolver := node.FakeResolver{"local": local, "web1": remote}
+		r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+		app := testApp()
+		app.Image = ref
+		app.Node = "web1"
+		app.Health.Timeout = shortTimeout
+		fr.ProbeStatus = 200
+
+		dep, err := r.Apply(context.Background(), app)
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if dep.Status != store.StatusRunning {
+			t.Errorf("status = %q, want running", dep.Status)
+		}
+		if !contains(local.Calls, "SaveImage:"+ref) {
+			t.Errorf("want SaveImage on the local node for an absent lwd-build tag, calls: %v", local.Calls)
+		}
+		if !contains(remote.Calls, "LoadImage") {
+			t.Errorf("want LoadImage on the target node, calls: %v", remote.Calls)
+		}
+		if !remote.Images[ref] {
+			t.Errorf("want %s present on the target node after transfer", ref)
+		}
+	})
+}
+
+// TestRemoteSurfaceRoutesToMeshAddr covers the Phase 9a-Task 4 mesh-address
+// routing: a surface placed on a registered remote node must publish an
+// ephemeral host port bound to that node's mesh address, and the live Caddy
+// route must point at meshAddr:<published port> — never at the container
+// name, which Caddy (running on the controller) cannot resolve on another
+// node's Docker network. A local surface must be completely unaffected: no
+// published port, and the route still targets the container name.
+func TestRemoteSurfaceRoutesToMeshAddr(t *testing.T) {
+	n0 := node.NewFake() // local
+	n1 := node.NewFake() // web1
+	n1.MeshAddr = "100.64.0.2"
+	n1.Images = map[string]bool{"img:1": true} // skip the transfer path; routing is what's under test
+	fr := router.NewFakeRouter()
+	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	resolver := node.FakeResolver{"local": n0, "web1": n1}
+	r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+	app := testApp()
+	app.Node = "web1"
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	dep, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if dep.Status != store.StatusRunning {
+		t.Errorf("status = %q, want running", dep.Status)
+	}
+
+	if len(n1.LastRunSpec.Publish) != 1 {
+		t.Fatalf("want exactly one published port for a remote surface, got %+v", n1.LastRunSpec.Publish)
+	}
+	pub := n1.LastRunSpec.Publish[0]
+	if pub.HostIP != "100.64.0.2" {
+		t.Errorf("published HostIP = %q, want the node's mesh address", pub.HostIP)
+	}
+	if pub.ContainerPort != app.Port {
+		t.Errorf("published ContainerPort = %d, want %d", pub.ContainerPort, app.Port)
+	}
+
+	containers, err := n1.ListContainers(context.Background(), map[string]string{"lwd.app": app.Name})
+	if err != nil || len(containers) != 1 {
+		t.Fatalf("ListContainers on web1: %v, %+v", err, containers)
+	}
+	wantPort := containers[0].HostPort
+	if wantPort == 0 {
+		t.Fatal("want a non-zero published host port assigned")
+	}
+
+	route, ok := fr.Routes[app.Domain]
+	if !ok {
+		t.Fatalf("want a live route for %s", app.Domain)
+	}
+	if route.Upstream != "100.64.0.2" {
+		t.Errorf("route.Upstream = %q, want the node's mesh address", route.Upstream)
+	}
+	if route.Port != wantPort {
+		t.Errorf("route.Port = %d, want the published host port %d", route.Port, wantPort)
+	}
+
+	// A local app is completely unaffected: no publish, and the route still
+	// targets the container name.
+	localApp := testApp()
+	localApp.Name = "localblog"
+	localApp.Domain = "localblog.example.com"
+	localApp.Health.Timeout = shortTimeout
+
+	localDep, err := r.Apply(context.Background(), localApp)
+	if err != nil {
+		t.Fatalf("Apply (local): %v", err)
+	}
+	if len(n0.LastRunSpec.Publish) != 0 {
+		t.Errorf("want no published ports for a local surface, got %+v", n0.LastRunSpec.Publish)
+	}
+	localRoute, ok := fr.Routes[localApp.Domain]
+	if !ok {
+		t.Fatalf("want a live route for %s", localApp.Domain)
+	}
+	if localRoute.Upstream != containerName(localApp, localDep.ID) {
+		t.Errorf("route.Upstream = %q, want the surface container name", localRoute.Upstream)
+	}
+	if localRoute.Port != localApp.Port {
+		t.Errorf("route.Port = %d, want the app's declared port %d", localRoute.Port, localApp.Port)
+	}
+}
+
+// TestBackingRunsOnRemoteNode covers the Phase 9a-Task 6 fix: an app placed
+// on a remote node (app.Node = "web1") that declares [[services]] must have
+// its backing compose project brought up (and, on Remove, torn down) against
+// that node's own Docker daemon — via DOCKER_HOST=ssh://<sshHost> in the
+// process env `docker compose` runs with — never the controller's local
+// Docker. Before this fix, ensureBacking/downBacking passed only the app's
+// resolved env/secrets, so DOCKER_HOST was never set and the backing project
+// (and a stray lwd-<app> network) landed on the controller instead of the
+// remote node. A local app's backing must see no DOCKER_HOST at all.
+func TestBackingRunsOnRemoteNode(t *testing.T) {
+	local := node.NewFake()
+	remote := node.NewFake() // web1
+	remote.MeshAddr = "100.64.0.2"
+	remote.DockerHost = "ssh://deploy@web1"
+	remote.Images = map[string]bool{"img:1": true} // skip the image-transfer path; backing routing is what's under test
+	fr := router.NewFakeRouter()
+	cf := compose.NewFake()
+	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	resolver := node.FakeResolver{"local": local, "web1": remote}
+	r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, cf, source.NewFake(), build.NewFake())
+
+	app := testApp()
+	app.Node = "web1"
+	app.Services = []spec.Service{{Name: "db", Image: "postgres:16"}}
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	if _, err := r.Apply(context.Background(), app); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if !contains(cf.Calls, "Up:lwd-blog") {
+		t.Fatalf("want backing compose Up for project lwd-blog, calls: %v", cf.Calls)
+	}
+	if cf.LastUp.Env["DOCKER_HOST"] != "ssh://deploy@web1" {
+		t.Errorf("LastUp.Env[DOCKER_HOST] = %q, want ssh://deploy@web1", cf.LastUp.Env["DOCKER_HOST"])
+	}
+	// The backing network is ensured on the remote node itself, not local.
+	if !contains(remote.Calls, "EnsureNetwork:lwd-blog") {
+		t.Errorf("want the backing network ensured on the remote node, calls: %v", remote.Calls)
+	}
+	for _, c := range local.Calls {
+		if c == "EnsureNetwork:lwd-blog" {
+			t.Errorf("want no stray backing network ensured on the local/controller node, calls: %v", local.Calls)
+		}
+	}
+
+	if err := r.Remove(context.Background(), app.Name); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if !contains(cf.Calls, "Down:lwd-blog") {
+		t.Fatalf("want backing compose Down for project lwd-blog, calls: %v", cf.Calls)
+	}
+	if cf.LastDown.Env["DOCKER_HOST"] != "ssh://deploy@web1" {
+		t.Errorf("LastDown.Env[DOCKER_HOST] = %q, want ssh://deploy@web1", cf.LastDown.Env["DOCKER_HOST"])
+	}
+
+	// A local app's backing must see no DOCKER_HOST at all.
+	localApp := testApp()
+	localApp.Name = "locblog"
+	localApp.Domain = "locblog.example.com"
+	localApp.Services = []spec.Service{{Name: "db", Image: "postgres:16"}}
+	localApp.Health.Timeout = shortTimeout
+
+	if _, err := r.Apply(context.Background(), localApp); err != nil {
+		t.Fatalf("Apply (local): %v", err)
+	}
+	if _, ok := cf.LastUp.Env["DOCKER_HOST"]; ok {
+		t.Errorf("want no DOCKER_HOST for a local app's backing Up, Env: %v", cf.LastUp.Env)
+	}
+
+	if err := r.Remove(context.Background(), localApp.Name); err != nil {
+		t.Fatalf("Remove (local): %v", err)
+	}
+	if cf.LastDown.Env != nil {
+		t.Errorf("want no env (no DOCKER_HOST) for a local app's backing Down, Env: %v", cf.LastDown.Env)
 	}
 }
 

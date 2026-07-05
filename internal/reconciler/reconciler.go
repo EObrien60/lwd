@@ -15,9 +15,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,28 +63,114 @@ type SecretResolver interface {
 	Resolve(app string, names []string) (map[string]string, error)
 }
 
-// Reconciler applies desired app specs against a node and a router, recording
-// history in the store. A single mutex serializes all Apply calls: blue-green
-// swaps involve multiple external side effects (container, staging route,
-// live route) that must not interleave across concurrent deploys.
+// Reconciler applies desired app specs against a node — resolved per-deploy
+// from each app's declared `node = "..."` (spec.App.Node) via a
+// node.Resolver — and a router, recording history in the store. A single
+// mutex serializes all Apply calls: blue-green swaps involve multiple
+// external side effects (container, staging route, live route) that must not
+// interleave across concurrent deploys.
 type Reconciler struct {
-	node    node.Node
-	router  router.Router
-	store   *store.Store
-	secrets SecretResolver
-	compose compose.Composer
-	src     source.Git
-	bld     build.Builder
-	mu      sync.Mutex
+	resolver node.Resolver
+	router   router.Router
+	store    *store.Store
+	secrets  SecretResolver
+	compose  compose.Composer
+	src      source.Git
+	bld      build.Builder
+	mu       sync.Mutex
 }
 
-// New returns a Reconciler bound to a node, a router, a store, a secret
-// resolver used to inject an app's declared secrets into its container env, a
-// Composer used to delegate compose-app deploys (and rendered backing-service
-// stacks) to `docker compose`, a Git source used to clone git-built apps, and
-// a Builder used to `docker build` them.
-func New(n node.Node, r router.Router, s *store.Store, sec SecretResolver, comp compose.Composer, src source.Git, bld build.Builder) *Reconciler {
-	return &Reconciler{node: n, router: r, store: s, secrets: sec, compose: comp, src: src, bld: bld}
+// New returns a Reconciler bound to a node.Resolver (used to place each
+// app's containers on the node its spec declares — "" or "local" is always
+// the local Docker daemon), a router, a store, a secret resolver used to
+// inject an app's declared secrets into its container env, a Composer used
+// to delegate compose-app deploys (and rendered backing-service stacks) to
+// `docker compose`, a Git source used to clone git-built apps, and a Builder
+// used to `docker build` them.
+func New(resolver node.Resolver, r router.Router, s *store.Store, sec SecretResolver, comp compose.Composer, src source.Git, bld build.Builder) *Reconciler {
+	return &Reconciler{resolver: resolver, router: r, store: s, secrets: sec, compose: comp, src: src, bld: bld}
+}
+
+// localNode resolves the local node through the same resolver used for
+// per-app placement. Used by callers (e.g. the Phase 9a-Task 4 image
+// transfer path) that need the controller's own Docker regardless of which
+// node an app is placed on.
+func (r *Reconciler) localNode() (node.Node, error) {
+	return r.resolver.Resolve("local")
+}
+
+// ensureImageOnNode makes ref available on target, which may be a remote
+// (docker-over-ssh) node that does not share the controller's local image
+// store. It is used in place of a plain target.EnsureImage for any node that
+// ResolveMeta reports as non-local, and mirrors Local.EnsureImage's
+// pinned-vs-mutable distinction so a remote app re-pulls a moved tag the
+// same way a local one does:
+//
+//  1. If ref is a pinned digest (contains "@sha256:") and target already
+//     reports it present, nothing to do — pinned digests are immutable, so a
+//     present copy is used as-is with no pull attempted.
+//  2. Otherwise (a mutable tag, or a pinned digest not yet present), try
+//     target.EnsureImage (a registry pull run ON the target node itself) —
+//     this covers the common case of a public/private image ref the target
+//     can fetch on its own, with no data ever flowing through the
+//     controller, AND picks up a tag that has moved since it was last
+//     pulled. Its error, if any, is deliberately ignored here: a
+//     locally-built or otherwise unregistered ref is expected to fail this
+//     step, and the only thing that matters is whether the image ended up
+//     present.
+//  3. If ref is still absent, it isn't pullable by the target directly (e.g.
+//     a controller-local `lwd-build/...` tag): move it via `docker save` on
+//     the controller's own local node piped into `docker load` on target.
+//
+// An ImagePresent failure (as opposed to a clean "not present" answer) is a
+// hard failure at any step — it means the target's Docker is unreachable or
+// misbehaving, not that the image needs fetching, so no pull or transfer is
+// attempted.
+func (r *Reconciler) ensureImageOnNode(ctx context.Context, target node.Node, ref string) error {
+	if strings.Contains(ref, "@sha256:") {
+		present, err := target.ImagePresent(ctx, ref)
+		if err != nil {
+			return fmt.Errorf("check image present: %w", err)
+		}
+		if present {
+			return nil
+		}
+	}
+
+	// Mutable tag (always re-pulled regardless of presence, so a moved tag
+	// is picked up), or a pinned digest confirmed absent above: attempt a
+	// pull on the target itself before falling back to a save|load transfer.
+	_ = target.EnsureImage(ctx, ref)
+
+	present, err := target.ImagePresent(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("check image present after pull: %w", err)
+	}
+	if present {
+		return nil
+	}
+
+	local, err := r.localNode()
+	if err != nil {
+		return fmt.Errorf("resolve local node for image transfer: %w", err)
+	}
+	rc, err := local.SaveImage(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("save image %s: %w", ref, err)
+	}
+	defer rc.Close()
+	if err := target.LoadImage(ctx, rc); err != nil {
+		return fmt.Errorf("load image %s on target node: %w", ref, err)
+	}
+
+	present, err = target.ImagePresent(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("check image present after transfer: %w", err)
+	}
+	if !present {
+		return fmt.Errorf("image %s still absent on target node after save/load transfer", ref)
+	}
+	return nil
 }
 
 // containerName returns the name of the surface container for one blue-green
@@ -137,19 +225,40 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 // blue-green, ensuring any declared backing services first. Callers must
 // hold r.mu; Apply does so before branching here.
 func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Deployment, error) {
-	if err := r.router.EnsureUp(ctx); err != nil {
-		return nil, fmt.Errorf("ensure router: %w", err)
-	}
-	if err := r.node.EnsureNetwork(ctx, lwdNetwork); err != nil {
-		return nil, fmt.Errorf("ensure network: %w", err)
-	}
-	if err := r.node.EnsureImage(ctx, app.Image); err != nil {
-		return nil, fmt.Errorf("ensure image: %w", err)
-	}
-
 	specJSON, err := json.Marshal(app)
 	if err != nil {
 		return nil, fmt.Errorf("marshal spec snapshot: %w", err)
+	}
+
+	// Resolve the target node BEFORE touching anything (router, network,
+	// image, the currently-running deployment): an unknown/unreachable node
+	// fails the deploy closed, same as a secret resolve failure below.
+	n, meshAddr, dockerHost, isLocal, err := r.resolver.ResolveMeta(app.Node)
+	if err != nil {
+		_, _ = r.store.RecordDeployment(store.Deployment{
+			App:       app.Name,
+			Image:     app.Image,
+			Status:    store.StatusFailed,
+			CreatedAt: time.Now(),
+			Spec:      string(specJSON),
+		})
+		return nil, fmt.Errorf("resolve node %q: %w", app.Node, err)
+	}
+
+	if err := r.router.EnsureUp(ctx); err != nil {
+		return nil, fmt.Errorf("ensure router: %w", err)
+	}
+	if err := n.EnsureNetwork(ctx, lwdNetwork); err != nil {
+		return nil, fmt.Errorf("ensure network: %w", err)
+	}
+	if isLocal {
+		if err := n.EnsureImage(ctx, app.Image); err != nil {
+			return nil, fmt.Errorf("ensure image: %w", err)
+		}
+	} else {
+		if err := r.ensureImageOnNode(ctx, n, app.Image); err != nil {
+			return nil, fmt.Errorf("ensure image: %w", err)
+		}
 	}
 
 	// Resolve declared secrets BEFORE starting anything. This must fail
@@ -173,7 +282,7 @@ func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Depl
 	// Backing services (if declared) are ensured before the surface starts,
 	// same as the git path: they're pinned infrastructure the surface may
 	// depend on at startup (e.g. a database URL pointing at it by name).
-	network, composeContent, err := r.ensureBacking(ctx, app, env)
+	network, composeContent, err := r.ensureBacking(ctx, n, app, env, dockerHost)
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -185,7 +294,7 @@ func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Depl
 		return nil, fmt.Errorf("ensure backing: %w", err)
 	}
 
-	return r.deployBlueGreenSurface(ctx, app, app.Image, env, network, composeContent, specJSON)
+	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr)
 }
 
 // applyGit deploys a git-built app: clone the declared ref with the box's
@@ -195,16 +304,29 @@ func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Depl
 // services, if declared, are ensured first (same as applyImage). Callers must
 // hold r.mu; Apply does so before branching here.
 func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deployment, error) {
-	if err := r.router.EnsureUp(ctx); err != nil {
-		return nil, fmt.Errorf("ensure router: %w", err)
-	}
-	if err := r.node.EnsureNetwork(ctx, lwdNetwork); err != nil {
-		return nil, fmt.Errorf("ensure network: %w", err)
-	}
-
 	specJSON, err := json.Marshal(app)
 	if err != nil {
 		return nil, fmt.Errorf("marshal spec snapshot: %w", err)
+	}
+
+	// Resolve the target node BEFORE touching anything, same rationale as
+	// applyImage.
+	n, meshAddr, dockerHost, isLocal, err := r.resolver.ResolveMeta(app.Node)
+	if err != nil {
+		_, _ = r.store.RecordDeployment(store.Deployment{
+			App:       app.Name,
+			Status:    store.StatusFailed,
+			CreatedAt: time.Now(),
+			Spec:      string(specJSON),
+		})
+		return nil, fmt.Errorf("resolve node %q: %w", app.Node, err)
+	}
+
+	if err := r.router.EnsureUp(ctx); err != nil {
+		return nil, fmt.Errorf("ensure router: %w", err)
+	}
+	if err := n.EnsureNetwork(ctx, lwdNetwork); err != nil {
+		return nil, fmt.Errorf("ensure network: %w", err)
 	}
 
 	// Resolve declared secrets BEFORE cloning/building/ensuring backing.
@@ -225,7 +347,7 @@ func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deploy
 	// Backing first: the source clone and build are the slowest and most
 	// failure-prone steps, so bring up any declared pinned services (and fail
 	// fast if that doesn't work) before spending time on them.
-	network, composeContent, err := r.ensureBacking(ctx, app, env)
+	network, composeContent, err := r.ensureBacking(ctx, n, app, env, dockerHost)
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -287,7 +409,25 @@ func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deploy
 		}
 	}
 
-	return r.deployBlueGreenSurface(ctx, app, tag, env, network, composeContent, specJSON)
+	// The build above always runs on the controller (this method's node.Node,
+	// bld, is always local); a build stays local even when the app is placed
+	// on a remote node. Move the freshly built tag to the target node before
+	// running it there.
+	if !isLocal {
+		if err := r.ensureImageOnNode(ctx, n, tag); err != nil {
+			_, _ = r.store.RecordDeployment(store.Deployment{
+				App:       app.Name,
+				Image:     tag,
+				Status:    store.StatusFailed,
+				CreatedAt: time.Now(),
+				Spec:      string(specJSON),
+				Compose:   composeContent,
+			})
+			return nil, fmt.Errorf("ensure image on node %q: %w", app.Node, err)
+		}
+	}
+
+	return r.deployBlueGreenSurface(ctx, n, app, tag, env, network, composeContent, specJSON, isLocal, meshAddr)
 }
 
 // rollbackGit redeploys app (a git-built app's spec snapshot, with Image
@@ -317,16 +457,28 @@ func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App) (*store.Dep
 		return nil, fmt.Errorf("no built image tag recorded to roll back to for %q", app.Name)
 	}
 
-	if err := r.router.EnsureUp(ctx); err != nil {
-		return nil, fmt.Errorf("ensure router: %w", err)
-	}
-	if err := r.node.EnsureNetwork(ctx, lwdNetwork); err != nil {
-		return nil, fmt.Errorf("ensure network: %w", err)
-	}
-
 	specJSON, err := json.Marshal(app)
 	if err != nil {
 		return nil, fmt.Errorf("marshal spec snapshot: %w", err)
+	}
+
+	n, meshAddr, dockerHost, isLocal, err := r.resolver.ResolveMeta(app.Node)
+	if err != nil {
+		_, _ = r.store.RecordDeployment(store.Deployment{
+			App:       app.Name,
+			Image:     app.Image,
+			Status:    store.StatusFailed,
+			CreatedAt: time.Now(),
+			Spec:      string(specJSON),
+		})
+		return nil, fmt.Errorf("resolve node %q: %w", app.Node, err)
+	}
+
+	if err := r.router.EnsureUp(ctx); err != nil {
+		return nil, fmt.Errorf("ensure router: %w", err)
+	}
+	if err := n.EnsureNetwork(ctx, lwdNetwork); err != nil {
+		return nil, fmt.Errorf("ensure network: %w", err)
 	}
 
 	secretVals, err := r.secrets.Resolve(app.Name, app.Secrets)
@@ -342,7 +494,7 @@ func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App) (*store.Dep
 	}
 	env := mergeEnv(app.Env, secretVals)
 
-	network, composeContent, err := r.ensureBacking(ctx, app, env)
+	network, composeContent, err := r.ensureBacking(ctx, n, app, env, dockerHost)
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -354,7 +506,24 @@ func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App) (*store.Dep
 		return nil, fmt.Errorf("ensure backing: %w", err)
 	}
 
-	return r.deployBlueGreenSurface(ctx, app, app.Image, env, network, composeContent, specJSON)
+	// The restored image tag was built (or transferred) on the controller by
+	// the original deploy; if this rollback targets a non-local node, make
+	// sure that tag is present there too before running it.
+	if !isLocal {
+		if err := r.ensureImageOnNode(ctx, n, app.Image); err != nil {
+			_, _ = r.store.RecordDeployment(store.Deployment{
+				App:       app.Name,
+				Image:     app.Image,
+				Status:    store.StatusFailed,
+				CreatedAt: time.Now(),
+				Spec:      string(specJSON),
+				Compose:   composeContent,
+			})
+			return nil, fmt.Errorf("ensure image on node %q: %w", app.Node, err)
+		}
+	}
+
+	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr)
 }
 
 // mergeEnv merges an app's plain declared env with its resolved secret
@@ -395,14 +564,22 @@ func shortSHA(sha string) string {
 // ONLY as the transient process env passed to `docker compose up` (UpSpec.Env
 // below), which is how compose actually resolves each ${NAME} reference at
 // up-time. env is never written to disk or to the store.
-func (r *Reconciler) ensureBacking(ctx context.Context, app *spec.App, env map[string]string) (network string, composeContent string, err error) {
+// dockerHost is the target node's DOCKER_HOST value from the same
+// ResolveMeta call that produced n ("" for the local node). When non-empty,
+// it is added to the process env `docker compose up` runs with, so a backing
+// project for an app placed on a remote node is created on that node's own
+// Docker daemon instead of the controller's local one — n's EnsureNetwork
+// call above already targets the remote node directly, but the Composer
+// shells out to the `docker compose` CLI plugin, which only respects
+// DOCKER_HOST from its own process environment, not from n.
+func (r *Reconciler) ensureBacking(ctx context.Context, n node.Node, app *spec.App, env map[string]string, dockerHost string) (network string, composeContent string, err error) {
 	if len(app.Services) == 0 {
 		return "", "", nil
 	}
 
 	yamlContent, net := RenderBackingCompose(app.Name, app.Services)
 
-	if err := r.node.EnsureNetwork(ctx, net); err != nil {
+	if err := n.EnsureNetwork(ctx, net); err != nil {
 		return "", "", fmt.Errorf("ensure backing network: %w", err)
 	}
 
@@ -419,7 +596,16 @@ func (r *Reconciler) ensureBacking(ctx context.Context, app *spec.App, env map[s
 		return "", "", fmt.Errorf("close temp backing compose file: %w", err)
 	}
 
-	if err := r.compose.Up(ctx, compose.UpSpec{Project: "lwd-" + app.Name, File: tmp.Name(), Env: env}); err != nil {
+	composeEnv := env
+	if dockerHost != "" {
+		composeEnv = make(map[string]string, len(env)+1)
+		for k, v := range env {
+			composeEnv[k] = v
+		}
+		composeEnv["DOCKER_HOST"] = dockerHost
+	}
+
+	if err := r.compose.Up(ctx, compose.UpSpec{Project: "lwd-" + app.Name, File: tmp.Name(), Env: composeEnv}); err != nil {
 		return "", "", fmt.Errorf("backing compose up: %w", err)
 	}
 
@@ -436,7 +622,16 @@ func (r *Reconciler) ensureBacking(ctx context.Context, app *spec.App, env map[s
 // left completely untouched (blue-green's isolation guarantee). Callers must
 // hold r.mu, have already validated the spec, ensured the router/lwd network,
 // resolved secrets into env, and ensured backing services.
-func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, app *spec.App, image string, env map[string]string, backingNetwork, composeContent string, specJSON []byte) (*store.Deployment, error) {
+//
+// isLocal and meshAddr (from the same ResolveMeta call that produced n)
+// decide how the surface is exposed to the central Caddy: a local surface
+// publishes no host port at all — Caddy reaches it by container name on the
+// shared lwd network, exactly as before Phase 9a. A remote surface instead
+// publishes an ephemeral host port bound to the node's mesh address (the
+// only address Caddy, running on the controller, can reach across nodes),
+// and Caddy's upstream becomes that meshAddr:port instead of the container
+// name.
+func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, app *spec.App, image string, env map[string]string, backingNetwork, composeContent string, specJSON []byte, isLocal bool, meshAddr string) (*store.Deployment, error) {
 	deployID, err := r.store.NextDeployID()
 	if err != nil {
 		return nil, fmt.Errorf("next deploy id: %w", err)
@@ -444,7 +639,7 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, app *spec.App, 
 	name := containerName(app, deployID)
 	stageHost := stagingHost(deployID)
 
-	c, err := r.node.RunContainer(ctx, node.RunSpec{
+	runSpec := node.RunSpec{
 		Name:  name,
 		Image: image,
 		Env:   env,
@@ -455,37 +650,56 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, app *spec.App, 
 		},
 		Port:    app.Port,
 		Network: lwdNetwork,
-	})
+	}
+	if !isLocal {
+		// HostPort 0 asks the node to assign an ephemeral port; the actual
+		// bound port comes back on Container.HostPort below.
+		runSpec.Publish = []node.PortMapping{{HostIP: meshAddr, HostPort: 0, ContainerPort: app.Port}}
+	}
+
+	c, err := n.RunContainer(ctx, runSpec)
 	if err != nil {
 		return nil, fmt.Errorf("run container: %w", err)
 	}
 
+	// upstream/upstreamPort are what Caddy is told to reverse_proxy to, for
+	// both the staging probe below and the live route on success: the
+	// container's name+declared port for a local surface (Caddy resolves the
+	// name on the shared network), or the node's mesh address + the
+	// container's freshly published host port for a remote one.
+	upstream := name
+	upstreamPort := app.Port
+	if !isLocal {
+		upstream = meshAddr
+		upstreamPort = c.HostPort
+	}
+
 	if backingNetwork != "" {
-		if err := r.node.ConnectContainerToNetwork(ctx, c.ID, backingNetwork); err != nil {
-			_ = r.node.RemoveContainer(ctx, c.ID)
+		if err := n.ConnectContainerToNetwork(ctx, c.ID, backingNetwork); err != nil {
+			_ = n.RemoveContainer(ctx, c.ID)
 			return nil, fmt.Errorf("connect container to backing network: %w", err)
 		}
 	}
 
-	if err := r.router.SetStaging(ctx, stageHost, name, app.Port); err != nil {
-		_ = r.node.RemoveContainer(ctx, c.ID)
+	if err := r.router.SetStaging(ctx, stageHost, upstream, upstreamPort); err != nil {
+		_ = n.RemoveContainer(ctx, c.ID)
 		return nil, fmt.Errorf("set staging route: %w", err)
 	}
 
-	if healthErr := r.checkHealth(ctx, app, stageHost, c.ID); healthErr != nil {
+	if healthErr := r.checkHealth(ctx, n, app, stageHost, c.ID); healthErr != nil {
 		// The prior running deployment (if any) is left completely untouched:
 		// its container keeps running and the live domain/route still points
 		// at it. Blue-green means a failed candidate never affects what's
 		// currently serving traffic, so we must not retire or otherwise mutate
 		// that row here.
-		r.recordFailedSurface(ctx, app, stageHost, c.ID, image, specJSON, composeContent)
+		r.recordFailedSurface(ctx, n, app, stageHost, c.ID, image, specJSON, composeContent)
 		return nil, fmt.Errorf("health check failed: %w", healthErr)
 	}
 
 	if err := r.router.SetRoute(ctx, router.Route{
 		Domain:      app.Domain,
-		Upstream:    name,
-		Port:        app.Port,
+		Upstream:    upstream,
+		Port:        upstreamPort,
 		TLSInternal: router.UseInternalTLS(app.Domain),
 	}); err != nil {
 		// The flip itself failed: undo the staging state and the new
@@ -494,14 +708,14 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, app *spec.App, 
 		// still pointing at the old container or unset if this is the first
 		// deploy, is unaffected, and the prior running deployment row is left
 		// untouched).
-		r.recordFailedSurface(ctx, app, stageHost, c.ID, image, specJSON, composeContent)
+		r.recordFailedSurface(ctx, n, app, stageHost, c.ID, image, specJSON, composeContent)
 		return nil, fmt.Errorf("set route: %w", err)
 	}
 	_ = r.router.RemoveStaging(ctx, stageHost)
 
 	// Retire and remove the old surface, if any, now that the new one is live.
 	if prev, perr := r.store.CurrentDeployment(app.Name); perr == nil && prev != nil {
-		_ = r.node.RemoveContainer(ctx, prev.ContainerID)
+		_ = n.RemoveContainer(ctx, prev.ContainerID)
 		_ = r.store.SetStatus(prev.ID, store.StatusRetired)
 	}
 
@@ -531,9 +745,9 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, app *spec.App, 
 // prior running deployment/route is never touched by this helper, preserving
 // blue-green's isolation guarantee: a failed candidate, however it failed,
 // never affects what's currently serving traffic.
-func (r *Reconciler) recordFailedSurface(ctx context.Context, app *spec.App, stageHost, containerID, image string, specJSON []byte, composeContent string) {
+func (r *Reconciler) recordFailedSurface(ctx context.Context, n node.Node, app *spec.App, stageHost, containerID, image string, specJSON []byte, composeContent string) {
 	_ = r.router.RemoveStaging(ctx, stageHost)
-	_ = r.node.RemoveContainer(ctx, containerID)
+	_ = n.RemoveContainer(ctx, containerID)
 
 	_, _ = r.store.RecordDeployment(store.Deployment{
 		App:         app.Name,
@@ -556,16 +770,22 @@ func (r *Reconciler) recordFailedSurface(ctx context.Context, app *spec.App, sta
 // documented tradeoff. Callers must hold r.mu; Apply does so before branching
 // here.
 func (r *Reconciler) applyCompose(ctx context.Context, app *spec.App) (*store.Deployment, error) {
-	if err := r.router.EnsureUp(ctx); err != nil {
-		return nil, fmt.Errorf("ensure router: %w", err)
-	}
-	if err := r.node.EnsureNetwork(ctx, lwdNetwork); err != nil {
-		return nil, fmt.Errorf("ensure network: %w", err)
-	}
-
 	specJSON, err := json.Marshal(app)
 	if err != nil {
 		return nil, fmt.Errorf("marshal spec snapshot: %w", err)
+	}
+
+	n, err := r.resolver.Resolve(app.Node)
+	if err != nil {
+		r.recordComposeFailed(app, "", specJSON, "")
+		return nil, fmt.Errorf("resolve node %q: %w", app.Node, err)
+	}
+
+	if err := r.router.EnsureUp(ctx); err != nil {
+		return nil, fmt.Errorf("ensure router: %w", err)
+	}
+	if err := n.EnsureNetwork(ctx, lwdNetwork); err != nil {
+		return nil, fmt.Errorf("ensure network: %w", err)
 	}
 
 	// Read the compose file content up front so failure snapshots (including
@@ -607,7 +827,7 @@ func (r *Reconciler) applyCompose(ctx context.Context, app *spec.App) (*store.De
 		return nil, fmt.Errorf("resolve service container: %w", err)
 	}
 
-	if err := r.node.ConnectContainerToNetwork(ctx, id, lwdNetwork); err != nil {
+	if err := n.ConnectContainerToNetwork(ctx, id, lwdNetwork); err != nil {
 		r.recordComposeFailed(app, id, specJSON, string(content))
 		return nil, fmt.Errorf("connect container to network: %w", err)
 	}
@@ -788,8 +1008,11 @@ func (r *Reconciler) removeCompose(ctx context.Context, appName string, cur *sto
 		return fmt.Errorf("close temp compose file: %w", err)
 	}
 
+	// A Phase-4 compose app's own remote-node DOCKER_HOST targeting is a
+	// separate, pre-existing gap (its Up call in applyCompose has the same
+	// limitation) — out of scope for this fix, so no env is passed here.
 	project := "lwd-" + appName
-	if err := r.compose.Down(ctx, project, tmp.Name()); err != nil {
+	if err := r.compose.Down(ctx, project, tmp.Name(), nil); err != nil {
 		return fmt.Errorf("compose down: %w", err)
 	}
 
@@ -809,25 +1032,49 @@ func (r *Reconciler) removeCompose(ctx context.Context, appName string, cur *sto
 // removes the app's Caddy route (resolved from cur's Spec snapshot, if any),
 // and retires cur, if present. cur may be nil (nothing recorded for appName
 // yet) — removal still runs as a defensive cleanup of any stray containers.
+// The node it operates against is resolved from cur's Spec snapshot's Node
+// field (the node the app was actually placed on), defaulting to "local"
+// when cur is nil or carries no snapshot.
+//
+// If that node no longer resolves (e.g. it was deregistered via `lwd node
+// rm` after the app was deployed to it), remote container/backing teardown
+// is impossible — there is nothing left to talk to — but the app must still
+// be removable: the controller-side Caddy route is removed and the
+// deployment row is retired regardless, with only the node-side cleanup
+// skipped (logged, not failed). This mirrors removeCompose's and
+// RemoveRoute's own best-effort rationale below: an app should never be
+// stuck un-removable because of state that outlived its backing node.
 func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cur *store.Deployment) error {
 	var domain string
+	nodeName := "local"
 	if cur != nil {
 		domain = domainFromSpec(cur.Spec)
-	}
-
-	containers, err := r.node.ListContainers(ctx, map[string]string{"lwd.app": appName})
-	if err != nil {
-		return fmt.Errorf("list containers: %w", err)
-	}
-	for _, c := range containers {
-		if err := r.node.RemoveContainer(ctx, c.ID); err != nil {
-			return fmt.Errorf("remove container %s: %w", c.ID, err)
+		if nn := nodeFromSpec(cur.Spec); nn != "" {
+			nodeName = nn
 		}
 	}
 
-	if cur != nil && cur.Compose != "" {
-		if err := r.downBacking(ctx, appName, cur.Compose); err != nil {
-			return err
+	// ResolveMeta (not plain Resolve): a PINNED backing project's teardown
+	// below needs the node's DOCKER_HOST too, to target the same remote
+	// daemon its Up originally ran against.
+	n, _, dockerHost, _, err := r.resolver.ResolveMeta(nodeName)
+	if err != nil {
+		log.Printf("remove %s: node %q no longer resolves (%v); skipping remote container/backing teardown, still removing route and retiring", appName, nodeName, err)
+	} else {
+		containers, err := n.ListContainers(ctx, map[string]string{"lwd.app": appName})
+		if err != nil {
+			return fmt.Errorf("list containers: %w", err)
+		}
+		for _, c := range containers {
+			if err := n.RemoveContainer(ctx, c.ID); err != nil {
+				return fmt.Errorf("remove container %s: %w", c.ID, err)
+			}
+		}
+
+		if cur != nil && cur.Compose != "" {
+			if err := r.downBacking(ctx, appName, cur.Compose, dockerHost); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -846,7 +1093,12 @@ func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cu
 // `docker compose down`, writing its stored rendered compose content
 // (composeContent) to a temp file since Down takes a file path. Named
 // volumes are not pruned by `down` without `-v`, so data persists.
-func (r *Reconciler) downBacking(ctx context.Context, appName, composeContent string) error {
+//
+// dockerHost is the app's node's DOCKER_HOST value ("" for the local node),
+// passed through so a remote node's backing project is torn down against its
+// own Docker daemon — the same one ensureBacking originally brought it up
+// on — rather than the controller's.
+func (r *Reconciler) downBacking(ctx context.Context, appName, composeContent, dockerHost string) error {
 	tmp, err := os.CreateTemp("", "lwd-backing-rm-*.yml")
 	if err != nil {
 		return fmt.Errorf("create temp backing compose file: %w", err)
@@ -860,8 +1112,13 @@ func (r *Reconciler) downBacking(ctx context.Context, appName, composeContent st
 		return fmt.Errorf("close temp backing compose file: %w", err)
 	}
 
+	var env map[string]string
+	if dockerHost != "" {
+		env = map[string]string{"DOCKER_HOST": dockerHost}
+	}
+
 	project := "lwd-" + appName
-	if err := r.compose.Down(ctx, project, tmp.Name()); err != nil {
+	if err := r.compose.Down(ctx, project, tmp.Name(), env); err != nil {
 		return fmt.Errorf("backing compose down: %w", err)
 	}
 	return nil
@@ -878,6 +1135,21 @@ func domainFromSpec(specJSON string) string {
 		return ""
 	}
 	return a.Domain
+}
+
+// nodeFromSpec extracts the Node field from a deployment's JSON Spec
+// snapshot, returning "" if specJSON is empty, fails to unmarshal, or the
+// snapshot predates the Node field (all of which the caller treats as "use
+// the local node").
+func nodeFromSpec(specJSON string) string {
+	if specJSON == "" {
+		return ""
+	}
+	var a spec.App
+	if err := json.Unmarshal([]byte(specJSON), &a); err != nil {
+		return ""
+	}
+	return a.Node
 }
 
 // Rollback redeploys the most recent retired ("previous") deployment for app,
@@ -968,7 +1240,7 @@ func (r *Reconciler) Rollback(ctx context.Context, app string) (*store.Deploymen
 //     anything other than Caddy's own 502/503 (which mean it couldn't reach
 //     the upstream at all) — any other status, including 404, proves the app
 //     is listening and accepting connections.
-func (r *Reconciler) checkHealth(ctx context.Context, app *spec.App, stagingHost, containerID string) error {
+func (r *Reconciler) checkHealth(ctx context.Context, n node.Node, app *spec.App, stagingHost, containerID string) error {
 	timeout := app.Health.Timeout
 	if timeout <= 0 {
 		timeout = defaultHealthTimeout
@@ -979,15 +1251,15 @@ func (r *Reconciler) checkHealth(ctx context.Context, app *spec.App, stagingHost
 		return r.checkHealthPath(ctx, deadline, stagingHost, app.Health.Path)
 	}
 
-	_, dockerHealth, err := r.node.ContainerHealth(ctx, containerID)
+	_, dockerHealth, err := n.ContainerHealth(ctx, containerID)
 	if err != nil {
 		return fmt.Errorf("container health: %w", err)
 	}
 	if dockerHealth != "" {
-		return r.checkDockerHealth(ctx, deadline, containerID)
+		return r.checkDockerHealth(ctx, n, deadline, containerID)
 	}
 
-	return r.checkLiveness(ctx, deadline, stagingHost, containerID)
+	return r.checkLiveness(ctx, n, deadline, stagingHost, containerID)
 }
 
 // checkHealthPath polls stagingHost+path through Caddy until it returns a 2xx
@@ -1019,10 +1291,10 @@ func (r *Reconciler) checkHealthPath(ctx context.Context, deadline time.Time, st
 // reports "healthy" (success), "unhealthy" (immediate failure — no point
 // waiting out the clock once the image itself says it's broken), or the
 // deadline passes.
-func (r *Reconciler) checkDockerHealth(ctx context.Context, deadline time.Time, containerID string) error {
+func (r *Reconciler) checkDockerHealth(ctx context.Context, n node.Node, deadline time.Time, containerID string) error {
 	var lastHealth string
 	for {
-		_, h, err := r.node.ContainerHealth(ctx, containerID)
+		_, h, err := n.ContainerHealth(ctx, containerID)
 		if err != nil {
 			return fmt.Errorf("container health: %w", err)
 		}
@@ -1047,7 +1319,7 @@ func (r *Reconciler) checkDockerHealth(ctx context.Context, deadline time.Time, 
 // container to stay "running" (i.e. not crash-loop) and a request through
 // Caddy to reach it (any status other than Caddy's own 502/503 proves the
 // app, not just the container, is up).
-func (r *Reconciler) checkLiveness(ctx context.Context, deadline time.Time, stagingHost, containerID string) error {
+func (r *Reconciler) checkLiveness(ctx context.Context, n node.Node, deadline time.Time, stagingHost, containerID string) error {
 	select {
 	case <-time.After(livenessSettle):
 	case <-ctx.Done():
@@ -1057,7 +1329,7 @@ func (r *Reconciler) checkLiveness(ctx context.Context, deadline time.Time, stag
 	var lastState string
 	var lastStatus int
 	for {
-		state, _, err := r.node.ContainerHealth(ctx, containerID)
+		state, _, err := n.ContainerHealth(ctx, containerID)
 		if err != nil {
 			return fmt.Errorf("container health: %w", err)
 		}

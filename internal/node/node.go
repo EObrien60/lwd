@@ -12,7 +12,12 @@ import (
 
 // PortMapping is one host<->container TCP port publication.
 type PortMapping struct {
-	HostPort      int
+	// HostIP is the address the host port binds to. Empty means the
+	// implementation's default (Local: 0.0.0.0 for 80/443, 127.0.0.1
+	// otherwise). A remote surface publish sets this to the node's
+	// WireGuard mesh address so the central Caddy can reach it.
+	HostIP        string
+	HostPort      int // 0 lets the platform assign an ephemeral port
 	ContainerPort int
 }
 
@@ -72,4 +77,13 @@ type Node interface {
 	// ConnectContainerToNetwork attaches a container to a network. Idempotent:
 	// if the container is already on the network, returns nil.
 	ConnectContainerToNetwork(ctx context.Context, containerID, network string) error
+
+	// ImagePresent reports whether ref is already present on this node's
+	// Docker, without attempting to pull or otherwise fetch it.
+	ImagePresent(ctx context.Context, ref string) (bool, error)
+	// SaveImage returns a tar stream of the image (docker save). The caller
+	// must Close it.
+	SaveImage(ctx context.Context, ref string) (io.ReadCloser, error)
+	// LoadImage loads a tar stream produced by SaveImage (docker load).
+	LoadImage(ctx context.Context, r io.Reader) error
 }

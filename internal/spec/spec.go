@@ -221,6 +221,17 @@ func (a *App) Validate() error {
 		if a.Build != nil {
 			return fmt.Errorf("cannot mix compose and build")
 		}
+		// A compose app's Up/routing (applyCompose) always runs against the
+		// controller's own `docker compose` process and never threads a
+		// resolved node's DOCKER_HOST through — placing one on a registered
+		// remote node would silently deploy it on the controller instead of
+		// the node the user asked for. image/git apps ARE supported on remote
+		// nodes (via node.Resolver + docker-over-ssh); only the compose-file
+		// shape is guarded here. "" and "local" (spec.Parse's default) are the
+		// only node values Validate treats as local — anything else is remote.
+		if a.Node != "" && a.Node != "local" {
+			return fmt.Errorf("compose apps on remote nodes are not supported yet (place on local, or use image/git apps with [[services]])")
+		}
 	} else {
 		// Single-service app validation
 		if a.Build != nil {

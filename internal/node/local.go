@@ -29,7 +29,27 @@ func NewLocal() (*Local, error) {
 	if err != nil {
 		return nil, fmt.Errorf("docker client: %w", err)
 	}
-	return &Local{cli: cli}, nil
+	return newLocalWithClient(cli), nil
+}
+
+// NewRemoteSSH connects to a Docker daemon on a remote host over SSH (the
+// Docker SDK's ssh connection helper; lwd manages no ssh credentials of its
+// own, relying on the host's ssh config/agent). The returned *Local behaves
+// identically to a locally-connected one — every method just talks to
+// whichever daemon its client is pointed at.
+func NewRemoteSSH(sshHost string) (*Local, error) {
+	cli, err := client.NewClientWithOpts(
+		client.WithHost("ssh://"+sshHost),
+		client.WithAPIVersionNegotiation(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("docker client (ssh://%s): %w", sshHost, err)
+	}
+	return newLocalWithClient(cli), nil
+}
+
+func newLocalWithClient(cli *client.Client) *Local {
+	return &Local{cli: cli}
 }
 
 // EnsureImage makes the image available for RunContainer. Pinned digests
@@ -102,21 +122,28 @@ func (l *Local) RunContainer(ctx context.Context, spec RunSpec) (Container, erro
 	if len(spec.Publish) > 0 {
 		portBindings := nat.PortMap{}
 		for _, pm := range spec.Publish {
-			hostIP := "127.0.0.1"
-			if pm.HostPort == 80 || pm.HostPort == 443 {
-				hostIP = "0.0.0.0"
+			hostIP := pm.HostIP
+			if hostIP == "" {
+				hostIP = "127.0.0.1"
+				if pm.HostPort == 80 || pm.HostPort == 443 {
+					hostIP = "0.0.0.0"
+				}
 			}
 			cp := nat.Port(strconv.Itoa(pm.ContainerPort) + "/tcp")
 			cfg.ExposedPorts[cp] = struct{}{}
+			hostPortStr := ""
+			if pm.HostPort != 0 {
+				hostPortStr = strconv.Itoa(pm.HostPort)
+			}
 			portBindings[cp] = append(portBindings[cp], nat.PortBinding{
 				HostIP:   hostIP,
-				HostPort: strconv.Itoa(pm.HostPort),
+				HostPort: hostPortStr,
 			})
 			if pm.ContainerPort == spec.Port {
 				primaryHostPort = pm.HostPort
 			}
 		}
-		if primaryHostPort == 0 {
+		if primaryHostPort == 0 && spec.Publish[0].ContainerPort != spec.Port {
 			primaryHostPort = spec.Publish[0].HostPort
 		}
 		hostCfg.PortBindings = portBindings
@@ -152,6 +179,19 @@ func (l *Local) RunContainer(ctx context.Context, spec RunSpec) (Container, erro
 				if ep.IPAddress != "" {
 					ip = ep.IPAddress
 					break
+				}
+			}
+		}
+
+		// Read back the actual published host port for the primary port,
+		// rather than trusting the requested value: a HostPort of 0 asks
+		// Docker to assign an ephemeral port, and the daemon is always the
+		// authority on what actually got bound.
+		if spec.Port != 0 {
+			cp := nat.Port(strconv.Itoa(spec.Port) + "/tcp")
+			if bindings, ok := inspect.NetworkSettings.Ports[cp]; ok && len(bindings) > 0 {
+				if hp, perr := strconv.Atoi(bindings[0].HostPort); perr == nil {
+					primaryHostPort = hp
 				}
 			}
 		}
@@ -314,6 +354,44 @@ func (l *Local) ConnectContainerToNetwork(ctx context.Context, containerID, netw
 		return nil
 	}
 	return fmt.Errorf("connect container %s to network %s: %w", containerID, network, err)
+}
+
+// ImagePresent reports whether ref is present in this node's local Docker
+// image store, without pulling or otherwise fetching it. Mirrors the
+// present/absent/error distinction used by EnsureImage and the build
+// package's ImageExists: (true, nil) present, (false, nil) not found,
+// (false, err) unexpected failure.
+func (l *Local) ImagePresent(ctx context.Context, ref string) (bool, error) {
+	_, _, err := l.cli.ImageInspectWithRaw(ctx, ref)
+	if err == nil {
+		return true, nil
+	}
+	if client.IsErrNotFound(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("inspect image %s: %w", ref, err)
+}
+
+// SaveImage returns a tar stream of the image (docker save). The caller must
+// Close the returned reader.
+func (l *Local) SaveImage(ctx context.Context, ref string) (io.ReadCloser, error) {
+	rc, err := l.cli.ImageSave(ctx, []string{ref})
+	if err != nil {
+		return nil, fmt.Errorf("save image %s: %w", ref, err)
+	}
+	return rc, nil
+}
+
+// LoadImage loads a tar stream produced by SaveImage (docker load), draining
+// and closing the daemon's response body.
+func (l *Local) LoadImage(ctx context.Context, r io.Reader) error {
+	resp, err := l.cli.ImageLoad(ctx, r, true)
+	if err != nil {
+		return fmt.Errorf("load image: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
 }
 
 // Compile-time assertion that Local implements Node.

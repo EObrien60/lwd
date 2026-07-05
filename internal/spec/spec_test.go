@@ -3,6 +3,7 @@ package spec
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -157,6 +158,40 @@ func TestComposeRejectsImageMix(t *testing.T) {
 	}
 	if err := a.Validate(); err == nil {
 		t.Fatal("want error when compose and image both set")
+	}
+}
+
+func TestComposeRejectsRemoteNode(t *testing.T) {
+	a := &App{
+		Name:    "webapp",
+		Compose: "docker-compose.yml",
+		Service: "web",
+		Domain:  "x.example.com",
+		Port:    8080,
+		Node:    "web1",
+	}
+	err := a.Validate()
+	if err == nil {
+		t.Fatal("want error for compose app placed on a remote node")
+	}
+	if !strings.Contains(err.Error(), "compose apps on remote nodes are not supported") {
+		t.Fatalf("Validate error = %q, want mention of unsupported remote compose", err.Error())
+	}
+}
+
+func TestComposeAcceptsLocalNode(t *testing.T) {
+	for _, node := range []string{"", "local"} {
+		a := &App{
+			Name:    "webapp",
+			Compose: "docker-compose.yml",
+			Service: "web",
+			Domain:  "x.example.com",
+			Port:    8080,
+			Node:    node,
+		}
+		if err := a.Validate(); err != nil {
+			t.Fatalf("Validate (node=%q): %v", node, err)
+		}
 	}
 }
 

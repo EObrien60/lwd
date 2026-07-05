@@ -210,3 +210,54 @@ func (c *Client) DeleteSecret(ctx context.Context, app, key string) error {
 	}
 	return nil
 }
+
+// AddNode registers (or updates) a node in the daemon's registry.
+func (c *Client) AddNode(ctx context.Context, name, sshHost, meshAddr string) error {
+	body, err := json.Marshal(map[string]string{"name": name, "ssh_host": sshHost, "mesh_addr": meshAddr})
+	if err != nil {
+		return err
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.url("/nodes"), bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return decodeErr(resp)
+	}
+	return nil
+}
+
+// Nodes lists all registered nodes.
+func (c *Client) Nodes(ctx context.Context) ([]store.Node, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/nodes"), nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, decodeErr(resp)
+	}
+	var nodes []store.Node
+	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
+		return nil, err
+	}
+	return nodes, nil
+}
+
+// RemoveNode deregisters a node from the daemon's registry.
+func (c *Client) RemoveNode(ctx context.Context, name string) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, c.url("/nodes/"+name), nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return decodeErr(resp)
+	}
+	return nil
+}

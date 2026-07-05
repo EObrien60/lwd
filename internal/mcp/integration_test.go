@@ -43,7 +43,7 @@ func startFakeDaemon(t *testing.T) string {
 		t.Fatalf("secrets.NewCipher: %v", err)
 	}
 	secStore := secrets.NewStore(cipher, s)
-	daemon := api.New(reconciler.New(f, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore)
+	daemon := api.New(reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore, nil)
 
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
