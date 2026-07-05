@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 
 	"lwd/internal/spec"
 	"lwd/internal/store"
@@ -27,21 +26,21 @@ import (
 // unchanged and cur is left completely untouched — no capacity elsewhere
 // means nothing to do.
 //
-// Once the new surface is live, deployReplicaSet's OWN "retire the
-// prior CurrentDeployment" logic has already run — but against the NEW
-// node's client n, since deployReplicaSet always operates against
-// whichever node the deploy targets. At the point that logic runs,
-// store.CurrentDeployment(app.Name) still resolves to cur (the new row
-// hasn't been recorded yet), so it calls n.RemoveContainer(cur.ContainerID)
-// against the NEW node — which never had that container — a harmless no-op —
-// and marks cur.ID StatusRetired. The OLD container, still actually running
-// on excludeNode, is therefore never removed by that path. This function
-// closes that gap explicitly: it removes cur's container from excludeNode
-// itself (best-effort — skipped, with a log line, if excludeNode is
-// unreachable, e.g. a node-loss eviction, in which case the container dies
-// along with its node) and retires cur (idempotent: a no-op if
-// deployReplicaSet's own logic already did it, which it will have in
-// the common case).
+// Old-set retirement is NOT done here: since Phase 12 Task 4,
+// deployReplicaSet is the single owner of retiring the prior current
+// deployment, and it does so correctly per-replica. When the new surface
+// goes live inside deployReplicaSet (reached here via applyImageProvenance
+// / rollbackGitLocked), store.CurrentDeployment(app.Name) still resolves to
+// cur (the new row isn't recorded yet), so deployReplicaSet's retire loop
+// removes each of cur's replica containers on ITS OWN node — which is
+// excludeNode for this reschedule — and marks cur.ID StatusRetired. It also
+// honors the same reachability guard this function used to: a
+// known-unreachable excludeNode (a node-loss eviction) has its container
+// removal skipped (the container dies with the node) while the row is still
+// retired. So rescheduleSurfaceLocked must NOT also remove/retire cur — that
+// would RemoveContainer + SetStatus the same container/row twice (masked by
+// node.Fake's tolerant map delete, but a wasteful already-removed error on a
+// real Local/AgentNode backend).
 //
 // Callers MUST hold r.mu. cur must be the app's current, Scheduled surface
 // deployment, currently running on excludeNode.
@@ -86,44 +85,11 @@ func (r *Reconciler) rescheduleSurfaceLocked(ctx context.Context, cur *store.Dep
 		return nil, fmt.Errorf("redeploy %q on %q: %w", cur.App, newNode, err)
 	}
 
-	r.retireOldSurfaceLocked(ctx, cur, excludeNode)
-
+	// Old-set retirement was already handled by deployReplicaSet (see this
+	// function's doc comment) — removing cur's container on excludeNode and
+	// marking cur.ID retired. Doing it again here would double-remove/
+	// double-retire, so we return the new deployment directly.
 	return moved, nil
-}
-
-// retireOldSurfaceLocked removes cur's container from excludeNode
-// (best-effort) and marks cur retired. Removal is skipped — with a log line,
-// not an error — if excludeNode is known-unreachable via r.reach (r.reach may
-// be nil, e.g. in tests that don't wire one up, in which case removal is
-// always attempted) or if excludeNode fails to resolve at all: in the
-// node-loss case the surface being moved off it is exactly BECAUSE the node
-// is gone, so its container dies along with it rather than lingering
-// unremoved. cur is always marked retired regardless — the new surface
-// (already live by the time this is called) is what serves traffic now.
-//
-// Callers must hold r.mu.
-func (r *Reconciler) retireOldSurfaceLocked(ctx context.Context, cur *store.Deployment, excludeNode string) {
-	reachable := true
-	if r.reach != nil {
-		if _, ok := r.reach.Reachable(ctx, excludeNode); !ok {
-			reachable = false
-		}
-	}
-
-	if reachable {
-		oldNode, rerr := r.resolver.Resolve(excludeNode)
-		if rerr != nil {
-			log.Printf("reschedule %s: resolve old node %q for cleanup: %v", cur.App, excludeNode, rerr)
-		} else if rmErr := oldNode.RemoveContainer(ctx, cur.ContainerID); rmErr != nil {
-			log.Printf("reschedule %s: remove old container %s on %q: %v", cur.App, cur.ContainerID, excludeNode, rmErr)
-		}
-	} else {
-		log.Printf("reschedule %s: node %q unreachable, skipping old container removal (dies with node)", cur.App, excludeNode)
-	}
-
-	if err := r.store.SetStatus(cur.ID, store.StatusRetired); err != nil {
-		log.Printf("reschedule %s: mark deployment %d retired: %v", cur.App, cur.ID, err)
-	}
 }
 
 // EvacuateResult reports the outcome of an EvacuateNode call: which apps'

@@ -51,6 +51,17 @@ func runContainerCalls(f *node.Fake) int {
 	return n
 }
 
+// countCall counts how many entries in f.Calls exactly equal want.
+func countCall(f *node.Fake, want string) int {
+	n := 0
+	for _, c := range f.Calls {
+		if c == want {
+			n++
+		}
+	}
+	return n
+}
+
 // TestRescheduleMovesToAnotherNode covers Phase 11b Task 3's core reschedule
 // path: a scheduler-placed surface currently on web1 is moved to web2 (the
 // only other node with enough capacity — local is deliberately starved so it
@@ -130,9 +141,20 @@ func TestRescheduleMovesToAnotherNode(t *testing.T) {
 	}
 
 	// The old container must be removed from web1 (the excluded node) — NOT
-	// web2 (the new node deployReplicaSet actually ran against).
-	if !contains(web1.Calls, "RemoveContainer:"+cur.ContainerID) {
-		t.Errorf("want old container %q removed from web1, calls: %v", cur.ContainerID, web1.Calls)
+	// web2 (the new node deployReplicaSet actually ran against) — and EXACTLY
+	// ONCE. Phase 12 Task 4 made deployReplicaSet the single owner of old-set
+	// retirement (per-replica, on each replica's own node), so
+	// rescheduleSurfaceLocked must no longer do its own removal on top of it:
+	// a second RemoveContainer here would be a wasteful already-removed error
+	// on a real Local/AgentNode backend (masked only by node.Fake's tolerant
+	// map delete). This count assertion is the regression guard the old
+	// contains()-only checks lacked.
+	if got := countCall(web1, "RemoveContainer:"+cur.ContainerID); got != 1 {
+		t.Errorf("RemoveContainer for old container %q on web1 called %d times, want exactly 1 (no double-remove), calls: %v", cur.ContainerID, got, web1.Calls)
+	}
+	// And nothing removed that container on web2 (the new node).
+	if got := countCall(web2, "RemoveContainer:"+cur.ContainerID); got != 0 {
+		t.Errorf("old container %q must never be removed on web2 (the new node), got %d such calls: %v", cur.ContainerID, got, web2.Calls)
 	}
 
 	oldRow := depByID(t, s, "blog", cur.ID)
