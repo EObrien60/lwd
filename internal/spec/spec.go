@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 var serviceNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 var secretNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var poolNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 // gitRefRe matches a safe git ref charset: no leading '-' (which git or a
 // shell could interpret as an option) or '.' (rejects e.g. "..", and refs
@@ -62,14 +64,24 @@ type Service struct {
 
 // App is a single deployable application as declared in lwd.toml.
 type App struct {
-	Name    string            `toml:"name"`
-	Image   string            `toml:"image"`
-	Domain  string            `toml:"domain"`
-	Port    int               `toml:"port"`
+	Name   string `toml:"name"`
+	Image  string `toml:"image"`
+	Domain string `toml:"domain"`
+	Port   int    `toml:"port"`
+	// Node selects where this app runs: "" means unset — let the scheduler
+	// place it; "local" pins it to the local node; any other value pins it
+	// to that registered node name. Parse does NOT default "" to "local"
+	// (Phase 11a) — resolvers (node.RegistryResolver/FakeResolver) and the
+	// compose guard below still treat "" and "local" as equivalent to local.
 	Node    string            `toml:"node"`
+	Pool    string            `toml:"pool"`
 	Env     map[string]string `toml:"env"`
 	Secrets []string          `toml:"secrets"`
 	Health  Health            `toml:"health"`
+
+	// Requirements declares resource needs used by the scheduler to pick a
+	// node/pool when Node is unset. Nil means no requirements declared.
+	Requirements *Requirements `toml:"requirements"`
 
 	// Compose apps
 	Compose string `toml:"compose"`
@@ -99,14 +111,66 @@ type Build struct {
 	Dockerfile string `toml:"dockerfile"`
 }
 
+// Requirements declares an app's resource needs, used by the scheduler
+// (Phase 11a) to pick a node/pool when App.Node is unset ("").
+type Requirements struct {
+	CPU    float64 `toml:"cpu"`
+	Memory string  `toml:"memory"`
+}
+
+// sizeRe matches an optional integer/decimal magnitude followed by an
+// optional binary-unit suffix (K/M/G/T, optionally with a trailing "i", e.g.
+// "512M" or "512Mi"), case-insensitive, with optional surrounding
+// whitespace.
+var sizeRe = regexp.MustCompile(`(?i)^\s*([0-9]+(?:\.[0-9]+)?)\s*(ki|mi|gi|ti|k|m|g|t)?\s*$`)
+
+// sizeUnitFactor maps a (lowercased) size suffix to its multiplier. lwd uses
+// binary units throughout: "K"/"Ki" both mean 1024, "M"/"Mi" both mean
+// 1024^2, and so on — there is no decimal (1000-based) interpretation of
+// these suffixes.
+var sizeUnitFactor = map[string]int64{
+	"":   1,
+	"k":  1024,
+	"ki": 1024,
+	"m":  1024 * 1024,
+	"mi": 1024 * 1024,
+	"g":  1024 * 1024 * 1024,
+	"gi": 1024 * 1024 * 1024,
+	"t":  1024 * 1024 * 1024 * 1024,
+	"ti": 1024 * 1024 * 1024 * 1024,
+}
+
+// ParseSize parses a memory-size string like "512M", "2G", "1Ki", or a plain
+// byte count like "1024", into a byte count. An empty string means "unset"
+// and returns (0, nil). Units are binary (K/Ki/M/Mi/G/Gi/T/Ti all use a 1024
+// base, e.g. "1M" == 1048576 bytes) — lwd does not support decimal
+// (1000-based) size suffixes. Negative values and unrecognized formats
+// return an error.
+func ParseSize(s string) (int64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	m := sizeRe.FindStringSubmatch(s)
+	if m == nil {
+		return 0, fmt.Errorf("size %q is invalid: want a number optionally followed by K/M/G/T (or Ki/Mi/Gi/Ti)", s)
+	}
+	n, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, fmt.Errorf("size %q is invalid: %w", s, err)
+	}
+	factor := sizeUnitFactor[strings.ToLower(m[2])]
+	bytes := n * float64(factor)
+	if bytes < 0 {
+		return 0, fmt.Errorf("size %q is invalid: must not be negative", s)
+	}
+	return int64(bytes), nil
+}
+
 // Parse decodes an lwd.toml document, applies defaults, and returns the App.
 func Parse(data []byte) (*App, error) {
 	var a App
 	if err := toml.Unmarshal(data, &a); err != nil {
 		return nil, fmt.Errorf("parse lwd.toml: %w", err)
-	}
-	if a.Node == "" {
-		a.Node = "local"
 	}
 	if a.Git != nil && a.Git.Ref == "" {
 		a.Git.Ref = "main"
@@ -169,6 +233,21 @@ func (a *App) Validate() error {
 		return fmt.Errorf("surfaces are not supported yet")
 	}
 
+	// Pool validation applies to all app types
+	if a.Pool != "" && !poolNameRe.MatchString(a.Pool) {
+		return fmt.Errorf("pool %q is invalid: must match [A-Za-z0-9][A-Za-z0-9_-]*", a.Pool)
+	}
+
+	// Requirements validation applies to all app types
+	if a.Requirements != nil {
+		if a.Requirements.CPU < 0 {
+			return fmt.Errorf("requirements.cpu %v is invalid: must not be negative", a.Requirements.CPU)
+		}
+		if _, err := ParseSize(a.Requirements.Memory); err != nil {
+			return fmt.Errorf("requirements.memory: %w", err)
+		}
+	}
+
 	// Git app validation
 	if a.Git != nil {
 		if a.Git.URL == "" {
@@ -227,8 +306,8 @@ func (a *App) Validate() error {
 		// remote node would silently deploy it on the controller instead of
 		// the node the user asked for. image/git apps ARE supported on remote
 		// nodes (via node.Resolver + docker-over-ssh); only the compose-file
-		// shape is guarded here. "" and "local" (spec.Parse's default) are the
-		// only node values Validate treats as local — anything else is remote.
+		// shape is guarded here. "" (unset/schedule) and "local" are the only
+		// node values Validate treats as local — anything else is remote.
 		if a.Node != "" && a.Node != "local" {
 			return fmt.Errorf("compose apps on remote nodes are not supported yet (place on local, or use image/git apps with [[services]])")
 		}

@@ -34,8 +34,8 @@ func TestParseSingleService(t *testing.T) {
 	if a.Port != 8080 {
 		t.Errorf("Port = %d, want 8080", a.Port)
 	}
-	if a.Node != "local" {
-		t.Errorf("Node = %q, want local (default)", a.Node)
+	if a.Node != "" {
+		t.Errorf("Node = %q, want empty (unset means schedule)", a.Node)
 	}
 	if a.Env["LOG_LEVEL"] != "info" {
 		t.Errorf("Env[LOG_LEVEL] = %q", a.Env["LOG_LEVEL"])
@@ -687,5 +687,133 @@ func TestGitPathAndBuildDockerfileAcceptNormalValues(t *testing.T) {
 	})
 	if err := a.Validate(); err != nil {
 		t.Fatalf("Validate: unexpected error: %v", err)
+	}
+}
+
+// --- Phase 11a Task 5: pool + requirements + ParseSize + schedule-preserving Node ---
+
+func TestParseSize(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int64
+		wantErr bool
+	}{
+		{"", 0, false},
+		{"1024", 1024, false},
+		{"512M", 512 * 1024 * 1024, false},
+		{"2G", 2 * 1024 * 1024 * 1024, false},
+		{"1Ki", 1024, false},
+		{"1ki", 1024, false},
+		{"1k", 1024, false},
+		{"1T", 1024 * 1024 * 1024 * 1024, false},
+		{" 512M ", 512 * 1024 * 1024, false},
+		{"bad", 0, true},
+		{"-5", 0, true},
+		{"-5M", 0, true},
+	}
+	for _, c := range cases {
+		got, err := ParseSize(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("ParseSize(%q) = %d, nil; want error", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("ParseSize(%q): unexpected error: %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("ParseSize(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestParsePreservesEmptyNode(t *testing.T) {
+	a, err := Parse([]byte(singleService))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.Node != "" {
+		t.Errorf("Node = %q, want empty (unset node means schedule, not local)", a.Node)
+	}
+}
+
+func TestParseExplicitLocalNode(t *testing.T) {
+	toml := `
+name = "blog"
+image = "ghcr.io/me/blog:latest"
+domain = "blog.example.com"
+port = 8080
+node = "local"
+`
+	a, err := Parse([]byte(toml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.Node != "local" {
+		t.Errorf("Node = %q, want local", a.Node)
+	}
+}
+
+func TestParsePoolAndRequirements(t *testing.T) {
+	toml := `
+name = "blog"
+image = "ghcr.io/me/blog:latest"
+domain = "blog.example.com"
+port = 8080
+pool = "web"
+
+[requirements]
+cpu = 0.5
+memory = "512M"
+`
+	a, err := Parse([]byte(toml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.Pool != "web" {
+		t.Errorf("Pool = %q, want web", a.Pool)
+	}
+	if a.Requirements == nil {
+		t.Fatal("Requirements is nil")
+	}
+	if a.Requirements.CPU != 0.5 {
+		t.Errorf("Requirements.CPU = %v, want 0.5", a.Requirements.CPU)
+	}
+	if a.Requirements.Memory != "512M" {
+		t.Errorf("Requirements.Memory = %q, want 512M", a.Requirements.Memory)
+	}
+}
+
+func TestValidateBadRequirements(t *testing.T) {
+	t.Run("bad memory", func(t *testing.T) {
+		a := &App{Name: "x", Image: "y", Port: 80, Requirements: &Requirements{Memory: "bad"}}
+		if err := a.Validate(); err == nil {
+			t.Fatal("want error for bad requirements.memory")
+		}
+	})
+	t.Run("negative cpu", func(t *testing.T) {
+		a := &App{Name: "x", Image: "y", Port: 80, Requirements: &Requirements{CPU: -1}}
+		if err := a.Validate(); err == nil {
+			t.Fatal("want error for negative requirements.cpu")
+		}
+	})
+	t.Run("valid requirements accepted", func(t *testing.T) {
+		a := &App{Name: "x", Image: "y", Port: 80, Requirements: &Requirements{CPU: 1.5, Memory: "1G"}}
+		if err := a.Validate(); err != nil {
+			t.Fatalf("Validate: unexpected error: %v", err)
+		}
+	})
+}
+
+func TestValidateBadPool(t *testing.T) {
+	a := &App{Name: "x", Image: "y", Port: 80, Pool: "bad pool!"}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for invalid pool name")
+	}
+	a2 := &App{Name: "x", Image: "y", Port: 80, Pool: "web-1"}
+	if err := a2.Validate(); err != nil {
+		t.Fatalf("Validate: unexpected error for valid pool: %v", err)
 	}
 }
