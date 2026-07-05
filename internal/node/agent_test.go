@@ -28,18 +28,26 @@ func newTestServer(t *testing.T, fake *node.Fake) (*node.AgentNode, *node.Fake) 
 	return node.NewAgentNode(srv.URL, testToken), fake
 }
 
-// TestAgentNode_Ping proves the happy path: Ping hits the authenticated
-// /ready endpoint with the correct token and succeeds. Ping no longer
-// consults the underlying node.Node at all (see handleReady), so unlike
-// pre-Finding-2 behavior, an underlying fake.PingErr has no bearing on
-// AgentNode.Ping — that's covered by TestHealthz_* in internal/agent, which
-// still exercises the node-backed /healthz liveness path.
+// TestAgentNode_Ping proves the happy path AND the docker-health contract:
+// Ping hits the authenticated /ready endpoint with the correct token; a
+// healthy agent (healthy fake docker) returns 200 → nil, but an agent whose
+// underlying docker probe fails (fake.PingErr set) returns 503 → error, even
+// though the token is valid. That second case is what keeps transport
+// selection docker-health-aware: RegistryResolver.buildTransport treats this
+// Ping error as "agent unusable" and falls back to docker-over-ssh rather
+// than selecting an agent that would then fail every EnsureImage/RunContainer
+// call against a dead Docker daemon.
 func TestAgentNode_Ping(t *testing.T) {
 	fake := node.NewFake()
 	an, _ := newTestServer(t, fake)
 
 	if err := an.Ping(context.Background()); err != nil {
 		t.Fatalf("Ping: %v", err)
+	}
+
+	fake.PingErr = context.DeadlineExceeded
+	if err := an.Ping(context.Background()); err == nil {
+		t.Fatal("expected Ping error when the agent's docker probe fails (fake.PingErr set), got nil")
 	}
 }
 

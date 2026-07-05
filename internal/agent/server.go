@@ -79,15 +79,22 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleReady is a trivial authenticated liveness/readiness check: reaching
-// this handler at all means authMiddleware already accepted the caller's
-// bearer token (PathReady is the one path NOT exempted from auth), so a bare
-// 200 is sufficient — unlike handleHealthz, it does not consult s.node.
-// AgentNode.Ping uses this endpoint (with its token) rather than /healthz so
-// that transport selection (internal/node.RegistryResolver.buildTransport)
-// can distinguish "agent reachable with a working token" from "agent
-// reachable" and fall back to ssh on a bad token.
+// handleReady is the AUTHENTICATED readiness probe AgentNode.Ping uses for
+// transport selection. Reaching this handler at all means authMiddleware
+// already accepted the caller's bearer token (PathReady is the one path NOT
+// exempted from auth), so a 200 here means the agent is up AND the caller's
+// token is valid. It ALSO probes s.node (exactly as handleHealthz does) so a
+// 200 additionally means docker is reachable — i.e. the node is actually
+// usable, not merely running an authorized agent over a dead Docker daemon.
+// This makes internal/node.RegistryResolver.buildTransport fall back to
+// docker-over-ssh if ANY of {agent down, wrong token, docker down} holds,
+// rather than committing to an agent transport that would then fail every
+// EnsureImage/RunContainer call. /healthz stays unauthenticated liveness.
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if err := s.node.Ping(r.Context()); err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 

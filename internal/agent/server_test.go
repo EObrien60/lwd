@@ -146,6 +146,24 @@ func TestReady_RequiresAuth(t *testing.T) {
 	}
 }
 
+// TestReady_DockerDown_Returns503 proves the readiness contract is complete:
+// even WITH a valid token, /ready returns 503 when the underlying node's
+// docker probe fails (fake.PingErr set) — mirroring handleHealthz. This is
+// what keeps transport selection docker-health-aware: an agent that is up and
+// authorized but sitting on a dead Docker daemon must NOT be selected (else
+// EnsureImage/RunContainer would fail with no ssh fallback); AgentNode.Ping
+// sees the 503 and RegistryResolver.buildTransport falls back to ssh.
+func TestReady_DockerDown_Returns503(t *testing.T) {
+	fake := node.NewFake()
+	fake.PingErr = errors.New("docker unreachable")
+	h := newTestServer(fake)
+
+	rec := doReq(t, h, http.MethodGet, node.PathReady, testToken, nil)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("valid token + docker down: status = %d, want 503; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestEnsureNetwork_Delegates(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)
