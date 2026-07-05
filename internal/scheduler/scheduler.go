@@ -91,6 +91,14 @@ func fits(c NodeInfo, req Requirements) bool {
 
 // freeMem returns the ranking value for available memory: the live
 // MemAvailable when known, else the total memory (0 if that too is unset).
+//
+// Best-effort tradeoff, documented rather than fixed: for Known:false nodes
+// (ssh probes that couldn't produce live usage) this falls back to raw
+// MemTotal, which is optimistic and has no relationship to actual free
+// memory. A busy ssh-only node can therefore outrank an agent-managed
+// (Known:true) node that reports real, smaller availability — agent
+// candidates are ranked precisely, ssh candidates are ranked optimistically.
+// The same asymmetry applies to freeCPU below.
 func freeMem(c NodeInfo) int64 {
 	if c.Cap.Known {
 		return c.Cap.MemAvailable

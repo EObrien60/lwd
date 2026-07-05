@@ -873,8 +873,8 @@ func TestNodeAddInvalidPool(t *testing.T) {
 }
 
 // TestPoolsEndpoint covers Phase 11a Task 4: GET /pools aggregates registered
-// nodes by pool, and always includes "default" (even with zero registered
-// nodes in it) since the implicit local node lives there.
+// nodes by pool, and always counts the implicit local node (never stored in
+// the registry) as a member of "default".
 func TestPoolsEndpoint(t *testing.T) {
 	ts, _ := newTestServerWithInvalidator(t)
 
@@ -913,14 +913,16 @@ func TestPoolsEndpoint(t *testing.T) {
 	if byName["web"] != 2 {
 		t.Fatalf("pool web = %d, want 2", byName["web"])
 	}
-	if byName["default"] != 1 {
-		t.Fatalf("pool default = %d, want 1", byName["default"])
+	// default = local (always present, count 1) + db1 (registered, no pool
+	// set, defaults to "default").
+	if byName["default"] != 2 {
+		t.Fatalf("pool default = %d, want 2", byName["default"])
 	}
 }
 
 // TestPoolsEndpointDefaultAlwaysPresent covers the zero-registered-nodes case
-// of GET /pools: "default" must appear with count 0, since the implicit local
-// node is always in pool "default" even though it's never stored.
+// of GET /pools: "default" must appear with count 1, since the implicit local
+// node is always a member of pool "default" even though it's never stored.
 func TestPoolsEndpointDefaultAlwaysPresent(t *testing.T) {
 	ts, _ := newTestServerWithInvalidator(t)
 
@@ -943,8 +945,8 @@ func TestPoolsEndpointDefaultAlwaysPresent(t *testing.T) {
 	for _, p := range pools {
 		if p.Name == "default" {
 			found = true
-			if p.Nodes != 0 {
-				t.Fatalf("pool default = %d, want 0", p.Nodes)
+			if p.Nodes != 1 {
+				t.Fatalf("pool default = %d, want 1", p.Nodes)
 			}
 		}
 	}

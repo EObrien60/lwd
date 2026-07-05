@@ -103,7 +103,19 @@ func (r *Reconciler) resolvePlacement(ctx context.Context, app *spec.App) (strin
 		reachable := true
 		if r.reach != nil {
 			_, ok := r.reach.Reachable(ctx, n.Name)
-			reachable = ok
+			if !ok {
+				// Already known unreachable — skip the Resolve+capacity
+				// fetch entirely (a 3s ping + a 5s capacity timeout for a
+				// node that scheduler.Place will exclude anyway via its
+				// Reachable filter). Placement outcome is unchanged; this
+				// only saves latency.
+				candidates = append(candidates, scheduler.NodeInfo{
+					Name:      n.Name,
+					Pool:      n.Pool,
+					Reachable: false,
+				})
+				continue
+			}
 		}
 
 		var nodeCap node.Capacity

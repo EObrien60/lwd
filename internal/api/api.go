@@ -412,16 +412,17 @@ type poolInfo struct {
 }
 
 // handlePools lists every pool with a registered node in it, plus the count
-// of nodes in each. "default" is always included — even with a zero
-// count — since the implicit "local" node (never stored in the registry)
-// lives there.
+// of nodes in each. "default" is always included, seeded at 1 — the
+// implicit "local" node (the controller's own Docker, never stored in the
+// registry) is always a member of "default" — before adding registered
+// store nodes on top.
 func (srv *Server) handlePools(w http.ResponseWriter, r *http.Request) {
 	nodes, err := srv.store.ListNodes()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	counts := map[string]int{store.DefaultPool: 0}
+	counts := map[string]int{store.DefaultPool: 1}
 	for _, n := range nodes {
 		counts[n.Pool]++
 	}
