@@ -264,6 +264,27 @@ func TestAgentNode_ContainerLogs(t *testing.T) {
 	}
 }
 
+func TestAgentNodeCapacity(t *testing.T) {
+	fake := node.NewFake()
+	fake.Cap = node.Capacity{CPUCores: 8, MemTotal: 4 << 30, MemAvailable: 2 << 30, Known: true}
+	an, _ := newTestServer(t, fake)
+
+	cap, err := an.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("Capacity: %v", err)
+	}
+	if cap != fake.Cap {
+		t.Fatalf("unexpected capacity: %+v, want %+v", cap, fake.Cap)
+	}
+
+	srv := httptest.NewServer(agent.NewServer(fake, testToken).Handler())
+	t.Cleanup(srv.Close)
+	wrong := node.NewAgentNode(srv.URL, "wrong-token")
+	if _, err := wrong.Capacity(context.Background()); err == nil {
+		t.Fatal("expected error with wrong token, got nil")
+	}
+}
+
 func TestAgentNode_WrongToken(t *testing.T) {
 	fake := node.NewFake()
 	srv := httptest.NewServer(agent.NewServer(fake, testToken).Handler())

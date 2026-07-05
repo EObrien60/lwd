@@ -246,11 +246,28 @@ func (a *AgentNode) SaveImage(ctx context.Context, ref string) (io.ReadCloser, e
 	return resp.Body, nil
 }
 
-// Capacity is not yet implemented for AgentNode: Phase 11a Task 3 wires this
-// up to a real agent-side endpoint. This stub exists only so AgentNode keeps
-// satisfying the Node interface in the interim.
+// Capacity GETs PathCapacity, which reports the agent's own node's resources
+// (the agent always runs a node.NewLocal(), so this reflects the machine the
+// agent is running on, read live from /proc).
 func (a *AgentNode) Capacity(ctx context.Context) (Capacity, error) {
-	return Capacity{}, fmt.Errorf("AgentNode.Capacity not implemented (Task 3)")
+	req, err := a.newRequest(ctx, http.MethodGet, PathCapacity, nil)
+	if err != nil {
+		return Capacity{}, err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return Capacity{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return Capacity{}, decodeAgentError(resp)
+	}
+	var cap Capacity
+	if err := json.NewDecoder(resp.Body).Decode(&cap); err != nil {
+		return Capacity{}, err
+	}
+	return cap, nil
 }
 
 // LoadImage POSTs the raw tar stream r to /load.

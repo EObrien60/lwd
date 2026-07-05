@@ -28,6 +28,7 @@ const (
 	PathConnectNetwork  = "/connect-network"
 	PathContainerHealth = "/container-health"
 	PathHealth          = "/health"
+	PathCapacity        = "/capacity"
 )
 
 // RunRequest is the body of a POST PathRun request.

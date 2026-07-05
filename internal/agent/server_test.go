@@ -398,6 +398,37 @@ func TestEnsureImage_Delegates(t *testing.T) {
 	}
 }
 
+func TestCapacity_RequiresAuth(t *testing.T) {
+	fake := node.NewFake()
+	h := newTestServer(fake)
+
+	if rec := doReq(t, h, http.MethodGet, node.PathCapacity, "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := doReq(t, h, http.MethodGet, node.PathCapacity, "wrong-token", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token: status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCapacity_ReturnsNodeCapacity(t *testing.T) {
+	fake := node.NewFake()
+	fake.Cap = node.Capacity{CPUCores: 8, MemTotal: 4 << 30, MemAvailable: 2 << 30, Known: true}
+	h := newTestServer(fake)
+
+	rec := doReq(t, h, http.MethodGet, node.PathCapacity, testToken, nil)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp node.Capacity
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp != fake.Cap {
+		t.Fatalf("unexpected capacity: %+v, want %+v", resp, fake.Cap)
+	}
+}
+
 func TestHealth_Delegates(t *testing.T) {
 	fake := node.NewFake()
 	h := newTestServer(fake)

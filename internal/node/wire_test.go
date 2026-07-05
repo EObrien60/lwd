@@ -150,6 +150,7 @@ func TestPathConstants(t *testing.T) {
 		PathConnectNetwork:  "/connect-network",
 		PathContainerHealth: "/container-health",
 		PathHealth:          "/health",
+		PathCapacity:        "/capacity",
 	}
 	for got, want := range paths {
 		if got != want {
