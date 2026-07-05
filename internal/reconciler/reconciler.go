@@ -79,10 +79,10 @@ type Reconciler struct {
 	bld      build.Builder
 	mu       sync.Mutex
 
-	// healthMu guards health and heal, which are populated by the Phase 10
-	// continuous reconciler loop (not yet added by this task) and read via
-	// HealthSnapshot. reach and nudge are set once at startup via their
-	// setters below.
+	// healthMu guards only health, populated by the Phase 10 continuous
+	// reconciler loop and read via HealthSnapshot. heal is guarded by r.mu
+	// instead (it's only ever touched by code paths that already hold it).
+	// reach and nudge are set once at startup via their setters below.
 	healthMu sync.RWMutex
 	health   Health
 	reach    Reachability
@@ -292,13 +292,24 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 		return nil, fmt.Errorf("invalid spec: %w", err)
 	}
 
-	if app.Git != nil {
-		return r.applyGit(ctx, app)
+	var dep *store.Deployment
+	var err error
+	switch {
+	case app.Git != nil:
+		dep, err = r.applyGit(ctx, app)
+	case app.Compose != "":
+		dep, err = r.applyCompose(ctx, app)
+	default:
+		dep, err = r.applyImage(ctx, app)
 	}
-	if app.Compose != "" {
-		return r.applyCompose(ctx, app)
+	// Wake a waiting continuous-reconciler loop (Phase 10) right after a
+	// successful manual deploy, rather than leaving it idle until the next
+	// ticker tick. Non-blocking: signalNudge is a no-op if no loop has been
+	// wired up via SetNudge (e.g. in tests) or a wake-up is already pending.
+	if err == nil {
+		r.signalNudge()
 	}
-	return r.applyImage(ctx, app)
+	return dep, err
 }
 
 // applyImage deploys a plain single-service image app via zero-downtime
@@ -1343,7 +1354,15 @@ func (r *Reconciler) Rollback(ctx context.Context, app string) (*store.Deploymen
 	restored.Image = prev.Image
 
 	if restored.Git != nil {
-		return r.rollbackGit(ctx, &restored)
+		// rollbackGit bypasses Apply entirely (it redeploys the previous
+		// built tag directly), so it needs its own nudge on success; the
+		// Compose/image path below falls through to Apply, which already
+		// nudges on its own success return.
+		dep, err := r.rollbackGit(ctx, &restored)
+		if err == nil {
+			r.signalNudge()
+		}
+		return dep, err
 	}
 
 	if restored.Compose != "" {

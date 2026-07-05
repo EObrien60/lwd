@@ -10,7 +10,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"lwd/internal/api"
 	"lwd/internal/build"
@@ -122,7 +124,23 @@ func runDaemon() int {
 	// resolver is passed as the api.NodeCacheInvalidator too: POST/DELETE
 	// /nodes call resolver.Invalidate so a node add/update/remove never
 	// leaves a stale cached docker-over-ssh client behind.
-	srv := api.New(reconciler.New(resolver, r, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI()), s, n, r, secStore, resolver)
+	rec := reconciler.New(resolver, r, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI())
+	srv := api.New(rec, s, n, r, secStore, resolver)
+
+	// Phase 10 continuous reconciler loop: rec.reach lets it observe node
+	// reachability (*node.RegistryResolver satisfies reconciler.Reachability
+	// directly), and nudge lets a successful manual Apply/Rollback wake it
+	// early instead of waiting out the ticker.
+	rec.SetReachability(resolver)
+	nudge := make(chan struct{}, 1)
+	rec.SetNudge(nudge)
+
+	// ctx is canceled on SIGINT/SIGTERM: it both stops the reconcile loop
+	// below and signals the graceful HTTP shutdown further down.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go reconciler.RunLoop(ctx, rec, config.ReconcileInterval(), nudge)
 
 	sock := config.SocketPath()
 	_ = os.Remove(sock) // clean stale socket
@@ -137,9 +155,22 @@ func runDaemon() int {
 	}
 	fmt.Println("lwd daemon listening on", sock)
 	httpSrv := &http.Server{Handler: srv.Handler()}
-	if err := httpSrv.Serve(ln); err != nil {
-		fmt.Fprintln(os.Stderr, "serve:", err)
-		return 1
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- httpSrv.Serve(ln) }()
+
+	select {
+	case err := <-serveErr:
+		if err != nil && err != http.ErrServerClosed {
+			fmt.Fprintln(os.Stderr, "serve:", err)
+			return 1
+		}
+	case <-ctx.Done():
+		fmt.Println("lwd daemon shutting down")
+		if err := httpSrv.Shutdown(context.Background()); err != nil {
+			fmt.Fprintln(os.Stderr, "shutdown:", err)
+			return 1
+		}
 	}
 	return 0
 }
