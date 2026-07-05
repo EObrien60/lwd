@@ -155,22 +155,35 @@ func (rr *RegistryResolver) ResolveMeta(nodeName string) (Node, string, string, 
 	return n, meshAddr, dockerHost, false, nil
 }
 
-// buildTransport selects and builds the Node for a registered remote node:
-// the agent transport if agentURL is set and its /healthz ping succeeds,
-// otherwise docker-over-ssh via newSSH.
+// pingOK reports whether n answers a Ping within agentPingTimeout, bounding
+// ctx so no caller (not even one passing context.Background()) can hang on an
+// unresponsive node. It is the single place any resolver path bounds a ping.
+func pingOK(ctx context.Context, n Node) bool {
+	ctx, cancel := context.WithTimeout(ctx, agentPingTimeout)
+	defer cancel()
+	return n.Ping(ctx) == nil
+}
+
+// buildTransport is the SOLE decision point for agent-vs-ssh: it selects and
+// builds the Node for a registered remote node — the agent transport if
+// agentURL is set and its /healthz ping succeeds (ping bounded by
+// agentPingTimeout via pingOK), otherwise docker-over-ssh via newSSH. There
+// is no ssh re-ping: a successful ssh build is usable (P9a semantics). Both
+// ResolveMeta and Reachable route through this function so the selection
+// logic can never drift between the two.
 func (rr *RegistryResolver) buildTransport(sshHost, agentURL string) (Node, string, error) {
 	if agentURL != "" {
 		an := rr.newAgent(agentURL, rr.token)
-		ctx, cancel := context.WithTimeout(context.Background(), agentPingTimeout)
-		pingErr := an.Ping(ctx)
-		cancel()
-		if pingErr == nil {
+		if pingOK(context.Background(), an) {
 			return an, "agent", nil
 		}
 	}
 	n, err := rr.newSSH(sshHost)
 	if err != nil {
-		return nil, "", err
+		// transport is still "ssh" (what we attempted) so callers that only
+		// want to report the attempted transport, like Reachable, can — while
+		// ResolveMeta wraps and propagates err and ignores the transport.
+		return nil, "ssh", err
 	}
 	return n, "ssh", nil
 }
@@ -195,13 +208,14 @@ func (rr *RegistryResolver) Invalidate(nodeName string) {
 //
 // "" and "local" always report ("local", true). For any other name: if a
 // remote Node is already cached for it, that cached node's transport is
-// pinged directly. Otherwise lookup is run fresh (without caching the
-// result) — a lookup error or unregistered name reports ("", false); an
-// agent_url is pinged first (reporting "agent" on success), else (or on a
-// failed agent ping) docker-over-ssh is built and pinged (reporting "ssh"
-// with the ping outcome). A transport that fails to even build (e.g. ssh
-// key setup) is reported as not reachable with the transport it attempted,
-// rather than panicking.
+// pinged directly (bounded via pingOK). Otherwise lookup is run fresh
+// (without caching the result) — a lookup error or unregistered name reports
+// ("", false); the agent-vs-ssh decision is delegated to buildTransport (the
+// single source of that logic), and the chosen node is then pinged once via
+// pingOK to report reachability. A transport that fails to even build (e.g.
+// ssh key setup) is reported as not reachable with the transport it
+// attempted, rather than panicking. Every ping here is bounded by
+// agentPingTimeout, so Reachable never hangs even when ctx has no deadline.
 func (rr *RegistryResolver) Reachable(ctx context.Context, name string) (string, bool) {
 	if name == "" || name == "local" {
 		return "local", true
@@ -212,7 +226,7 @@ func (rr *RegistryResolver) Reachable(ctx context.Context, name string) (string,
 	rr.mu.Unlock()
 
 	if cached {
-		return e.transport, e.node.Ping(ctx) == nil
+		return e.transport, pingOK(ctx, e.node)
 	}
 
 	sshHost, _, agentURL, ok, err := rr.lookup(name)
@@ -220,18 +234,13 @@ func (rr *RegistryResolver) Reachable(ctx context.Context, name string) (string,
 		return "", false
 	}
 
-	if agentURL != "" {
-		an := rr.newAgent(agentURL, rr.token)
-		if an.Ping(ctx) == nil {
-			return "agent", true
-		}
+	n, transport, berr := rr.buildTransport(sshHost, agentURL)
+	if berr != nil {
+		// transport reflects what we attempted (buildTransport only errors
+		// on the ssh-build path, so this is "ssh"); report not-reachable.
+		return transport, false
 	}
-
-	n, err := rr.newSSH(sshHost)
-	if err != nil {
-		return "ssh", false
-	}
-	return "ssh", n.Ping(ctx) == nil
+	return transport, pingOK(ctx, n)
 }
 
 // FakeResolver is a Resolver backed by a plain map, for tests: it returns

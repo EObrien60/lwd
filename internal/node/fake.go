@@ -32,6 +32,12 @@ type Fake struct {
 	// /healthz probe).
 	PingErr error
 
+	// PingFunc, if set, is invoked by Ping (with the call's context) and its
+	// result returned, taking precedence over PingErr — used to observe the
+	// context a caller passes (e.g. to assert a Ping is bounded by a
+	// deadline) or to simulate a ping that respects cancellation.
+	PingFunc func(ctx context.Context) error
+
 	// ImagePresentErr, if set, is returned by ImagePresent instead of
 	// consulting Images — used to test the hard-fail path of
 	// reconciler.ensureImageOnNode (an inspect failure, as opposed to a
@@ -79,11 +85,16 @@ func (f *Fake) record(name string) {
 	f.Calls = append(f.Calls, name)
 }
 
-// Ping records the call and returns PingErr (nil by default).
+// Ping records the call and returns PingErr (nil by default), or delegates to
+// PingFunc (with ctx) if one is set.
 func (f *Fake) Ping(ctx context.Context) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	fn := f.PingFunc
 	f.record("Ping")
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx)
+	}
 	return f.PingErr
 }
 

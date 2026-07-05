@@ -297,6 +297,62 @@ func TestRegistryResolverReachableUnknownNode(t *testing.T) {
 	}
 }
 
+// TestRegistryResolverAgentPingIsBounded locks in that the agent /healthz
+// ping is always invoked with a context carrying a deadline — through both
+// ResolveMeta (via buildTransport) and Reachable (cold path and cached
+// path) — so no resolver path can ever hang on an unresponsive agent, even
+// when the caller passes context.Background().
+func TestRegistryResolverAgentPingIsBounded(t *testing.T) {
+	local := NewFake()
+	agentFake := NewFake()
+	var sawDeadline []bool
+	agentFake.PingFunc = func(ctx context.Context) error {
+		_, has := ctx.Deadline()
+		sawDeadline = append(sawDeadline, has)
+		return nil
+	}
+
+	rr := NewRegistryResolver(local, "tok", func(name string) (string, string, string, bool, error) {
+		return "deploy@web1", "100.64.0.2", "http://100.64.0.2:8078", true, nil
+	})
+	rr.newAgent = func(baseURL, token string) Node { return agentFake }
+	rr.newSSH = func(sshHost string) (Node, error) {
+		t.Fatalf("newSSH should not be called when the agent pings OK")
+		return nil, nil
+	}
+
+	// ResolveMeta selects the agent transport, pinging it once (bounded).
+	if _, _, _, _, err := rr.ResolveMeta("web1"); err != nil {
+		t.Fatalf("ResolveMeta: %v", err)
+	}
+	// Reachable on the now-cached entry pings again — with the raw
+	// context.Background() (no deadline of its own), which pingOK must still
+	// bound.
+	if transport, ok := rr.Reachable(context.Background(), "web1"); transport != "agent" || !ok {
+		t.Fatalf("Reachable (cached) = (%q, %v), want (agent, true)", transport, ok)
+	}
+
+	// Fresh resolver to exercise Reachable's COLD path (no cache) with a
+	// bare Background context.
+	rr2 := NewRegistryResolver(local, "tok", func(name string) (string, string, string, bool, error) {
+		return "deploy@web1", "100.64.0.2", "http://100.64.0.2:8078", true, nil
+	})
+	rr2.newAgent = func(baseURL, token string) Node { return agentFake }
+	rr2.newSSH = func(sshHost string) (Node, error) { return NewFake(), nil }
+	if transport, ok := rr2.Reachable(context.Background(), "web1"); transport != "agent" || !ok {
+		t.Fatalf("Reachable (cold) = (%q, %v), want (agent, true)", transport, ok)
+	}
+
+	if len(sawDeadline) == 0 {
+		t.Fatal("agent Ping was never invoked")
+	}
+	for i, has := range sawDeadline {
+		if !has {
+			t.Errorf("agent Ping call #%d had no context deadline; every resolver ping must be bounded", i)
+		}
+	}
+}
+
 func TestFakeResolver(t *testing.T) {
 	local := NewFake()
 	web1 := NewFake()
