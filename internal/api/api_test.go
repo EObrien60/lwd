@@ -47,7 +47,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *node.Fake) {
 	t.Cleanup(func() { s.Close() })
 	rt := router.NewFakeRouter()
 	secStore := testSecretResolver(t, s, dir)
-	srv := New(reconciler.New(f, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore)
+	srv := New(reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f
@@ -67,7 +67,7 @@ func newTestServerWithRouter(t *testing.T) (*httptest.Server, *node.Fake, *route
 	t.Cleanup(func() { s.Close() })
 	rt := router.NewFakeRouter()
 	secStore := testSecretResolver(t, s, dir)
-	srv := New(reconciler.New(f, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore)
+	srv := New(reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake()), s, f, rt, secStore)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, f, rt
@@ -89,7 +89,7 @@ func newTestServerWithCompose(t *testing.T) (*httptest.Server, *router.FakeRoute
 	rt := router.NewFakeRouter()
 	cf := compose.NewFake()
 	secStore := testSecretResolver(t, s, dir)
-	srv := New(reconciler.New(f, rt, s, secStore, cf, source.NewFake(), build.NewFake()), s, f, rt, secStore)
+	srv := New(reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, cf, source.NewFake(), build.NewFake()), s, f, rt, secStore)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, rt, cf

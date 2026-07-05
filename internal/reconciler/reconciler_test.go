@@ -94,7 +94,8 @@ func newTestReconcilerFull(t *testing.T, sec SecretResolver) (*Reconciler, *node
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	return New(f, fr, s, sec, cf, sf, bf), f, fr, s, cf, sf, bf
+	resolver := node.FakeResolver{"local": f}
+	return New(resolver, fr, s, sec, cf, sf, bf), f, fr, s, cf, sf, bf
 }
 
 func testApp() *spec.App {
@@ -275,7 +276,7 @@ func TestApplyDockerHealthcheck(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+	r := New(node.FakeResolver{"local": f}, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -301,7 +302,7 @@ func TestApplyDockerHealthcheckUnhealthyFails(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+	r := New(node.FakeResolver{"local": f}, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -463,7 +464,7 @@ func TestApplyDockerHealthStartingThenHealthy(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	r := New(f, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+	r := New(node.FakeResolver{"local": f}, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
 
 	app := testApp()
 	app.Health.Timeout = shortTimeout
@@ -477,6 +478,86 @@ func TestApplyDockerHealthStartingThenHealthy(t *testing.T) {
 	}
 	if _, ok := fr.Routes["blog.example.com"]; !ok {
 		t.Errorf("want route set once docker health flips to healthy")
+	}
+}
+
+// TestApplyPlacesOnNode is the pivotal federation-placement test: an app
+// declaring node = "web1" must have its container run on the node resolved
+// for "web1", not on the local node, even though both are wired into the
+// same Reconciler via a single FakeResolver.
+func TestApplyPlacesOnNode(t *testing.T) {
+	n0 := node.NewFake()
+	n1 := node.NewFake()
+	fr := router.NewFakeRouter()
+	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	resolver := node.FakeResolver{"local": n0, "web1": n1}
+	r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+	app := testApp()
+	app.Node = "web1"
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	dep, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if dep.Status != store.StatusRunning {
+		t.Errorf("status = %q, want running", dep.Status)
+	}
+
+	if !contains(n1.Calls, "RunContainer:lwd-blog-1") {
+		t.Errorf("want the container run on the resolved node (web1), calls: %v", n1.Calls)
+	}
+	for _, c := range n0.Calls {
+		if strings.HasPrefix(c, "RunContainer:") {
+			t.Errorf("want no RunContainer call on the local node when app.Node=web1, calls: %v", n0.Calls)
+		}
+	}
+
+	// Remove must also resolve back to web1 (from the stored spec snapshot's
+	// Node field), not the local node.
+	if err := r.Remove(context.Background(), "blog"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if !contains(n1.Calls, "RemoveContainer:"+dep.ContainerID) {
+		t.Errorf("want Remove to remove the container on web1, calls: %v", n1.Calls)
+	}
+}
+
+// TestApplyUnknownNodeRecordsFailed ensures a bad `node = "..."` fails the
+// deploy closed (no container ever started) and is recorded in history,
+// rather than silently falling back to the local node.
+func TestApplyUnknownNodeRecordsFailed(t *testing.T) {
+	r, f, _, s := newTestReconciler(t)
+	app := testApp()
+	app.Node = "ghost"
+
+	_, err := r.Apply(context.Background(), app)
+	if err == nil {
+		t.Fatal("want error for an unregistered node")
+	}
+	for _, c := range f.Calls {
+		if strings.HasPrefix(c, "RunContainer:") {
+			t.Errorf("want no RunContainer call when the node can't be resolved, calls: %v", f.Calls)
+		}
+	}
+	history, err := s.DeploymentsForApp(app.Name)
+	if err != nil {
+		t.Fatalf("DeploymentsForApp: %v", err)
+	}
+	var sawFailed bool
+	for _, d := range history {
+		if d.Status == store.StatusFailed {
+			sawFailed = true
+		}
+	}
+	if !sawFailed {
+		t.Errorf("want a StatusFailed deployment recorded, history: %+v", history)
 	}
 }
 

@@ -103,7 +103,7 @@ func TestEndToEndBlueGreenRollback(t *testing.T) {
 		t.Fatalf("secrets.NewCipher: %v", err)
 	}
 	secStore := secrets.NewStore(cipher, s)
-	rec := reconciler.New(n, rtr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
+	rec := reconciler.New(node.FakeResolver{"local": n}, rtr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
 
 	// Cleanup runs regardless of how the test ends (pass, fail, or panic via
 	// t.Fatal) and is best-effort: each step's error is logged, not fatal, so
@@ -255,7 +255,7 @@ func TestEndToEndSecretInjection(t *testing.T) {
 		t.Fatalf("secrets.NewCipher: %v", err)
 	}
 	secStore := secrets.NewStore(cipher, s)
-	rec := reconciler.New(n, rtr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
+	rec := reconciler.New(node.FakeResolver{"local": n}, rtr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
 
 	t.Cleanup(func() {
 		cleanupLWDResources(t, secretAppLabel, failClosedAppLabel)
@@ -388,7 +388,7 @@ func TestEndToEndComposeApp(t *testing.T) {
 		t.Fatalf("secrets.NewCipher: %v", err)
 	}
 	secStore := secrets.NewStore(cipher, s)
-	rec := reconciler.New(n, rtr, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI())
+	rec := reconciler.New(node.FakeResolver{"local": n}, rtr, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI())
 
 	// Cleanup runs regardless of how the test ends. It tears the compose
 	// stack down (via the reconciler, exercising Remove/`compose down` as a
@@ -523,7 +523,7 @@ func TestEndToEndGitDeploy(t *testing.T) {
 		t.Fatalf("secrets.NewCipher: %v", err)
 	}
 	secStore := secrets.NewStore(cipher, s)
-	rec := reconciler.New(n, rtr, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI())
+	rec := reconciler.New(node.FakeResolver{"local": n}, rtr, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI())
 
 	t.Cleanup(func() {
 		cleanupGitDeployResources(t, rec)

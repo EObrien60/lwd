@@ -101,7 +101,22 @@ func runDaemon() int {
 	}
 	secStore := secrets.NewStore(cipher, s)
 
-	srv := api.New(reconciler.New(n, r, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI()), s, n, r, secStore)
+	// The reconciler places each app's containers on the node its spec
+	// declares via a Resolver: "" and "local" always resolve to n, the
+	// daemon's own local Docker; any other name is looked up in the store's
+	// nodes registry (populated by `lwd node add`).
+	resolver := node.NewRegistryResolver(n, func(name string) (string, bool, error) {
+		rec, err := s.GetNode(name)
+		if err != nil {
+			return "", false, err
+		}
+		if rec == nil {
+			return "", false, nil
+		}
+		return rec.SSHHost, true, nil
+	})
+
+	srv := api.New(reconciler.New(resolver, r, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI()), s, n, r, secStore)
 
 	sock := config.SocketPath()
 	_ = os.Remove(sock) // clean stale socket
