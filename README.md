@@ -11,8 +11,9 @@ that replaces raw docker-over-ssh for a registered node).
 > This is the **router + blue-green + secrets + compose apps + web UI + git
 > deploy + backing services + multi-node federation + dumb node agent + node
 > UX + continuous reconciler/self-heal + capacity-aware scheduler + node
-> pools** milestone (Phases 1–11a). Node drain/evacuate and automatic
-> cross-node failover on node loss are next (see `docs/VISION.md`).
+> pools + node drain/evacuate + automatic node-loss failover** milestone
+> (Phases 1–11b — **Phase 11 is now complete**). Surface replicas +
+> load-balancing (P12) are next (see `docs/VISION.md`).
 
 ## Build
 
@@ -404,12 +405,11 @@ same — see [Web UI](#web-ui-lwd-web) and [Agent access](#agent-access-lwd-mcp)
 - Node reachability is now continuously observed (see [Self-healing &
   health](#self-healing--health)), and a dead surface is healed in place on
   its existing node. An unpinned app is placed once, at apply time, by the
-  capacity-aware scheduler (see [Scheduling & pools](#scheduling--pools)) —
-  but **cross-node reschedule when a node goes away entirely** (node
-  drain/evacuate, automatic failover) is a later milestone (P11b, see
-  `docs/VISION.md`'s roadmap): today, if the node an app already landed on
-  disappears, self-healing has nothing to recreate the surface onto until
-  that node comes back.
+  capacity-aware scheduler (see [Scheduling & pools](#scheduling--pools)).
+  **Cross-node reschedule when a node goes away entirely** — both
+  operator-initiated (`lwd node drain`/`evacuate`) and fully automatic on
+  node loss — is now live; see [Node maintenance &
+  failover](#node-maintenance--failover).
 
 ## Scheduling & pools
 
@@ -438,7 +438,10 @@ web                  2
   the most free memory (ties broken by free CPU, then name), and deploys
   there. This is a one-time placement decision made at `apply`, not a
   continuously rebalanced one — redeploying the same app schedules it again
-  from scratch (it may land somewhere different if capacity shifted).
+  from scratch (it may land somewhere different if capacity shifted). Once
+  placed, a scheduled app's surface can still move later — but only via
+  drain/evacuate or automatic failover, never a background rebalancer; see
+  [Node maintenance & failover](#node-maintenance--failover).
 - **`node = "local"`** or **`node = "<registered-name>"`** — pins the app
   exactly as before Phase 11a; the scheduler is never consulted.
 - **`pool = "<name>"`** narrows which pool an unpinned app schedules into.
@@ -656,11 +659,14 @@ crashed, exited, or gone.
   observe or touch them at all (no entry appears for them in the health
   snapshot). Recover a broken compose stack with `lwd rollback`, same as
   today.
-- **Node and edge reachability are observed, not acted on.** Every pass
-  probes every registered node (plus the implicit `local` one) and the
-  shared edge (Caddy)'s admin API, and records what it saw — but nothing is
-  rescheduled onto a different node if one goes away. Cross-node reschedule
-  on node loss is planned for a later milestone (see `docs/VISION.md`).
+- **Edge reachability is observed, not acted on** — every pass probes the
+  shared edge (Caddy)'s admin API and records what it saw, but there is only
+  one edge, so there is nothing to reschedule it onto.
+- **Node reachability is observed AND, past a grace period, acted on**: a
+  registered node that stays unreachable is automatically failed over — see
+  [Node maintenance & failover](#node-maintenance--failover) for the full
+  mechanics (grace period, what moves vs. what doesn't, single-node
+  behavior).
 
 **Checking on it:**
 
@@ -688,6 +694,122 @@ UI](#web-ui-lwd-web)) also renders live in the browser. `state` is one of
 `healthy`, `degraded` (observed unhealthy, not yet healing or waiting on
 backoff), `healing` (a heal attempt is in flight), or `failed` (gave up after
 `LWD_HEAL_MAX_ATTEMPTS`).
+
+## Node maintenance & failover
+
+Phase 10 heals a dead surface **in place**, on the node it's already on.
+Phase 11a schedules an unpinned surface **once**, at `apply` time. Neither
+moves an already-running surface **off a node that later disappears** — that
+gap is what this section closes: cross-node reschedule, both
+operator-initiated (planned maintenance) and fully automatic (unplanned node
+loss).
+
+**Only scheduler-placed ("scheduled") surfaces are ever moved.** A surface is
+"scheduled" if it landed on its node because `node` was left unset in
+`lwd.toml` (see [Scheduling & pools](#scheduling--pools)) — its concrete node
+is recorded in the deployment's spec snapshot as
+`store.Deployment.Scheduled`. Everything else is left exactly where it is,
+no matter what:
+
+- An app with `node = "..."` **pinned** explicitly — you asked for that node
+  by name, so lwd never second-guesses it.
+- A `compose =` app — its lifecycle belongs to `docker compose`, not lwd's
+  blue-green surface model (same carve-out as [self-healing](#self-healing--health)).
+- Any backing service (`[[services]]`) — always pinned alongside its
+  surface's node.
+
+### Operator-initiated: drain, evacuate, uncordon
+
+```bash
+lwd node drain web1      # cordon web1, then move its scheduled surfaces off it
+lwd node evacuate web1   # move its scheduled surfaces off it, WITHOUT cordoning
+lwd node uncordon web1   # clear the cordon — web1 is eligible for placement again
+```
+
+- **`drain`** = cordon (`store.Node.Schedulable = false`, excluding the node
+  from future scheduler placement — see [Placing an app](#placing-an-app))
+  **then** evacuate: every scheduled surface currently on the node is moved,
+  via the same blue-green redeploy path a self-heal uses, onto whichever
+  other reachable, schedulable, in-pool node the scheduler ranks highest.
+  Use this ahead of planned maintenance (a reboot, a decommission) — nothing
+  new will land on the node afterward, and everything already there is gone.
+- **`evacuate`** does the move WITHOUT cordoning first: the node stays
+  eligible for new placements. Useful for a one-off rebalance without taking
+  the node out of rotation.
+- **`uncordon`** clears the cordon. It never touches anything already
+  running — a cordoned node's existing surfaces (if you evacuated instead of
+  draining, or added the node cordoned) keep running untouched.
+
+Every one of these prints (or, via the daemon API/`lwd-web`/`lwd-mcp`,
+returns as JSON) an **`EvacuateResult`**: which apps' surfaces actually
+**moved**, which were **skipped** (pinned — see above), and which **failed**
+to move (with why — typically "no other node has room"). A failed move
+leaves the original surface running untouched; nothing is torn down until
+its replacement is confirmed live, same blue-green guarantee as every other
+redeploy path in lwd.
+
+```
+$ lwd node drain web1
+Moved: blog
+Skipped (pinned): payments-db-proxy
+Failed: (none)
+```
+
+`lwd node ls` and `lwd node capacity`'s `SCHEDULABLE` column (see
+[Inspecting capacity and placement](#inspecting-capacity-and-placement))
+show `yes` or `cordoned` for every registered node.
+
+### Automatic failover on node loss
+
+The [continuous reconciler](#self-healing--health) tracks how long each
+registered node has been continuously unreachable. Once that streak exceeds
+`LWD_FAILOVER_GRACE` (a duration string, e.g. `2m`; **default `60s`**), the
+next reconcile pass automatically evacuates every scheduled surface on that
+node — exactly as a manual `lwd node drain` would, minus the cordon (a node
+that comes back is immediately eligible again; nothing re-populates it
+automatically — see [Known limitations](#known-limitations-this-milestone)).
+The grace period exists so a brief network blip doesn't trigger a
+reschedule; a genuinely dead node is moved off within one grace window of
+going dark.
+
+- A **pinned** surface on the lost node is left running (it can't be —
+  reachability permitting — it's simply reported `degraded` in the health
+  snapshot, same as any surface on an unreachable node) and is **never**
+  moved by automatic failover, same as a manual evacuate.
+- The old container is removed from the dead node **only if the node is
+  still reachable enough to ask** (e.g. an evacuate triggered manually while
+  it's flapping); for an actually-gone node, there's nothing to ask, so
+  cleanup is skipped and the old deployment row is still marked retired —
+  its container simply dies along with the node.
+- **Single-node installs have nothing to fail over**: with no other node
+  registered, there's no failure to detect (nothing but `local` is ever
+  probed for loss) and nowhere to move a surface even if there were —
+  behavior is completely unchanged from every earlier phase.
+- This is loss-triggered reschedule, not a background rebalancer: a
+  healthy fleet is never touched, and a node that comes back after a
+  failover stays empty (of that surface) until you place something on it
+  again — see the one-shot/no-rebalancing note in [Scheduling &
+  pools](#scheduling--pools).
+- **Controller-partition case**: if the *controller* loses mesh connectivity
+  to its nodes (rather than a single node dying), every registered node
+  reads unreachable after `LWD_FAILOVER_GRACE`, and each one's scheduled
+  `default`-pool surfaces are evacuated onto the local node — bounded by
+  local capacity; surfaces that don't fit are left reported-degraded rather
+  than force-placed. This is the correct recovery for the realistic version
+  of this partition, since the controller also hosts Caddy and so can't
+  route to those remote surfaces either way. When the partition heals, the
+  original remote containers are orphaned on their nodes — their deployment
+  rows are already retired, so a future reconcile pass or `lwd node rm`
+  cleans them up; nothing removes them automatically today. Single
+  edge/controller is the current design; multi-edge is P13 (see
+  `docs/VISION.md`).
+
+`lwd-web`'s **Nodes** view exposes drain/evacuate/uncordon as buttons (per
+node, rendering the returned `EvacuateResult`) and a schedulable/cordoned
+badge; its **Health** panel also flags a cordoned node. `lwd-mcp` exposes the
+same three operations as `lwd_node_drain`/`lwd_node_evacuate`/
+`lwd_node_uncordon` tools — see [Web UI](#web-ui-lwd-web) and [Agent
+access](#agent-access-lwd-mcp).
 
 ## Secrets
 
@@ -828,20 +950,25 @@ built-in TLS, so don't expose it directly to the internet. Instead:
 - **Nodes** — a dedicated view (reachable from the header, alongside the
   Fleet overview) listing every registered [node](#multi-node-federation):
   **pool**, ssh host, mesh address, agent URL, live **transport**
-  (`agent`/`ssh`), and a **reachable/unreachable** indicator, probed fresh on
-  every load; an inline form to register a new node (name, ssh host, mesh
-  address, optional agent URL, optional pool) and a **Remove** action per
-  node. The Deploy modal's **From Git**/**Builder** tabs also have a **Node**
+  (`agent`/`ssh`), a **reachable/unreachable** indicator probed fresh on
+  every load, and a **schedulable/cordoned** badge; an inline form to
+  register a new node (name, ssh host, mesh address, optional agent URL,
+  optional pool). Each node row has **Drain**, **Evacuate**, and (once
+  cordoned) **Uncordon** actions — see [Node maintenance &
+  failover](#node-maintenance--failover) — plus a **Remove** action; a
+  drain/evacuate renders the returned moved/skipped/failed result inline.
+  The Deploy modal's **From Git**/**Builder** tabs also have a **Node**
   dropdown (populated from this same list, plus `Auto` and `local`) and a
   **Pool** dropdown (from `GET /api/pools`) — see
   [Scheduling & pools](#scheduling--pools).
 - **Health** — a dedicated view (reachable from the header, alongside Fleet
   and Nodes) rendering the [continuous reconciler's](#self-healing--health)
   live snapshot from `GET /api/health`: every node's pool, transport/
-  reachability, and live **CPU/memory/disk** (as small meter bars, or
-  "unknown" if the last probe couldn't measure it — see [Node capacity:
-  agent vs ssh](#node-capacity-agent-vs-ssh)); the shared edge (Caddy)
-  reachability; and every self-healed app's state
+  reachability, a **cordoned** badge (see [Node maintenance &
+  failover](#node-maintenance--failover)), and live **CPU/memory/disk** (as
+  small meter bars, or "unknown" if the last probe couldn't measure it — see
+  [Node capacity: agent vs ssh](#node-capacity-agent-vs-ssh)); the shared
+  edge (Caddy) reachability; and every self-healed app's state
   (`healthy`/`degraded`/`healing`/`failed`) with its heal-attempt count and
   last error, auto-refreshing every few seconds. Read-only, and carries no
   secret values.
@@ -912,18 +1039,24 @@ ever returned by any tool):
 | `lwd_secret_set` | Set (or overwrite) a secret value for an app. The value is never echoed back. |
 | `lwd_secret_list` | List the names of secrets set for an app — names only, never values. |
 | `lwd_secret_delete` | Delete a secret from an app. |
-| `lwd_node_list` | List every registered [node](#multi-node-federation): ssh host, mesh address, agent URL, pool, and its live transport (`agent`/`ssh`), reachability, and [capacity](#scheduling--pools) (CPU/memory/disk). |
+| `lwd_node_list` | List every registered [node](#multi-node-federation): ssh host, mesh address, agent URL, pool, `schedulable` (cordon state), and its live transport (`agent`/`ssh`), reachability, and [capacity](#scheduling--pools) (CPU/memory/disk). |
 | `lwd_node_add` | Register (or update) a node: `name`, `ssh_host`, `mesh_addr`, and optional `agent_url`/`pool`. |
 | `lwd_node_remove` | Deregister a node. Apps already placed on it are not moved or removed. |
+| `lwd_node_drain` | Cordon a node then move every scheduler-placed surface off it onto another fitting node — see [Node maintenance & failover](#node-maintenance--failover). Pinned surfaces are left untouched. |
+| `lwd_node_evacuate` | Move every scheduler-placed surface off a node onto another fitting node, without cordoning it. |
+| `lwd_node_uncordon` | Clear a node's cordon, making it eligible for scheduler placement again. Never moves or touches anything already deployed. |
 
 `lwd_list`, `lwd_status`, `lwd_logs`, `lwd_history`, `lwd_secret_list`, and
 `lwd_node_list` are annotated `readOnlyHint: true`; `lwd_remove`,
-`lwd_secret_delete`, and `lwd_node_remove` are annotated
-`destructiveHint: true`. lwd-mcp itself asks nothing before calling the
-daemon — it relies entirely on **the MCP host's own per-call approval UI**
-(e.g. Claude Code's tool-permission prompt) to gate destructive and
-state-changing tools before they run; there is no additional confirmation
-argument to pass.
+`lwd_secret_delete`, `lwd_node_remove`, `lwd_node_drain`, and
+`lwd_node_evacuate` are annotated `destructiveHint: true` (drain/evacuate
+actually move — and tear down — running surfaces); `lwd_node_uncordon` is
+deliberately NOT annotated destructive — it only lifts a placement
+restriction and never touches anything already running. lwd-mcp itself asks
+nothing before calling the daemon — it relies entirely on **the MCP host's
+own per-call approval UI** (e.g. Claude Code's tool-permission prompt) to
+gate destructive and state-changing tools before they run; there is no
+additional confirmation argument to pass.
 
 ## Networking model
 
@@ -972,41 +1105,50 @@ argument to pass.
   and `[git]`+`[build]` apps (with or without `[[services]]`). A `compose =`
   app can only be placed on `local` for now (validation rejects the
   combination). The single-node path (`node` unset, no other nodes
-  registered) is fully unchanged. Node reachability is continuously observed
-  and a dead surface is healed in place (see the next bullet); cross-node
-  **reschedule when a node goes away entirely** is a later milestone (P11b).
+  registered) is fully unchanged.
 - **Capacity-aware scheduling and node pools** (see
   [Scheduling & pools](#scheduling--pools)) are fully live: an app with
   `node` unset is placed, once, at apply time, on the most-free node in its
   `pool` (`[requirements]` optionally gates candidates by free CPU/memory);
   `lwd node capacity`/`lwd node inspect`/`lwd pool ls`, `lwd-web`'s Nodes and
   Health views, and `lwd-mcp`'s `lwd_node_list` all surface pool + live
-  capacity. This is one-shot placement, not continuous rebalancing or
-  failover — see the multi-node bullet above.
+  capacity. Initial placement is one-shot, not a continuous rebalancer — see
+  the next bullet for what moves a surface *after* it's placed.
+- **Node drain/evacuate/uncordon and automatic node-loss failover** (see
+  [Node maintenance & failover](#node-maintenance--failover)) are fully
+  live: `lwd node drain`/`evacuate`/`uncordon` (+ the daemon API, `lwd-web`
+  buttons, and `lwd-mcp` tools) for operator-initiated migration off a node,
+  and a continuous-reconciler pass that automatically evacuates a node's
+  scheduled surfaces once it's been unreachable past `LWD_FAILOVER_GRACE`
+  (default `60s`). Only scheduler-placed surfaces ever move — pinned apps,
+  compose apps, and backing services never do. Single-node installs are
+  unaffected (nothing to fail over with no other node registered).
 - [`lwd-web`](#web-ui-lwd-web) (a separate dashboard binary) is fully live:
   overview, live logs, history/rollback, secrets, redeploy, config edit, a
-  **Nodes** view (list/add/remove, live transport + reachability + pool), a
-  **Health** view (the continuous reconciler's live snapshot, including
-  per-node CPU/memory/disk), and a Deploy modal with **From Git**,
-  **Builder**, and **Paste** tabs (From Git and Builder support declaring
-  backing services, picking a node/pool, and setting resource requirements),
-  all as a thin client of the same daemon API the CLI uses. Deploying
-  `lwd-web` itself as an lwd-managed app and multi-user auth are not built
-  yet.
+  **Nodes** view (list/add/remove/drain/evacuate/uncordon, live transport +
+  reachability + pool + schedulable state), a **Health** view (the
+  continuous reconciler's live snapshot, including per-node CPU/memory/disk
+  and cordon state), and a Deploy modal with **From Git**, **Builder**, and
+  **Paste** tabs (From Git and Builder support declaring backing services,
+  picking a node/pool, and setting resource requirements), all as a thin
+  client of the same daemon API the CLI uses. Deploying `lwd-web` itself as
+  an lwd-managed app and multi-user auth are not built yet.
 - [`lwd-mcp`](#agent-access-lwd-mcp) (a separate stdio MCP server binary) is
-  fully live: all fourteen tools (list/status/logs/history/apply/deploy_git/
-  rollback/remove/secret set-list-delete/node list-add-remove), including
-  pool/requirements/capacity, as a thin client of the same daemon API the CLI
-  and `lwd-web` use — no daemon changes, no network listener, no secret value
-  ever returned. Networked MCP transport is not built yet.
+  fully live: all seventeen tools (list/status/logs/history/apply/deploy_git/
+  rollback/remove/secret set-list-delete/node list-add-remove-drain-evacuate-
+  uncordon), including pool/requirements/capacity and node
+  drain/evacuate/uncordon (see [Node maintenance &
+  failover](#node-maintenance--failover)), as a thin client of the same
+  daemon API the CLI and `lwd-web` use — no daemon changes, no network
+  listener, no secret value ever returned. Networked MCP transport is not
+  built yet.
 - [Self-healing & health](#self-healing--health) — a continuous reconciler
   loop, off the request path, self-heals dead single-service surfaces
-  (`image`/`[git]` apps) and observes (without acting on) node and edge
-  reachability, exposed via `lwd health`, `GET /health`, and `lwd-web`'s
-  **Health** panel — is fully live. `compose=` apps are not self-healed (see
-  [Known limitations](#known-limitations-this-milestone)). Cross-node
-  reschedule of a surface whose node has gone away is a later milestone
-  (P11b).
+  (`image`/`[git]` apps), observes edge (Caddy) reachability, and
+  automatically fails scheduled surfaces over off a node that's gone
+  unreachable past grace (see the bullet above) — is fully live. `compose=`
+  apps are not self-healed (see [Known
+  limitations](#known-limitations-this-milestone)).
 
 ### Known limitations (this milestone)
 
@@ -1054,11 +1196,16 @@ argument to pass.
   directory can decrypt every secret. This is a data-at-rest control, not a
   substitute for host security.
 - **A `compose =` app cannot be placed on a remote node** — see [What's
-  remote-capable today](#whats-remote-capable-today). Placement is also
-  still one-shot: node capacity is reported and used to schedule an unpinned
-  app at `apply` time (see [Scheduling & pools](#scheduling--pools)), but
-  nothing yet detects a node going away afterward and reschedules what was
-  already running on it — that's P11b per `docs/VISION.md`.
+  remote-capable today](#whats-remote-capable-today), so it can never be
+  drained/evacuated/failed-over either (it's always on `local`, and `local`
+  can't be cordoned/evacuated).
+- **No fail-back and no rebalancing**: once [automatic
+  failover](#node-maintenance--failover) moves a surface off a lost node, it
+  stays on its new node even after the old one comes back — nothing
+  re-populates a recovered node automatically, and a healthy fleet is never
+  rebalanced in the background. Surface **replicas** and load-balancing
+  across them (so losing one instance is a non-event, and load can be
+  spread deliberately) are a later milestone (P12, see `docs/VISION.md`).
 - A remote surface's mesh-address traffic between the controller's Caddy and
   the node is **plain HTTP** — lwd relies on the mesh itself (e.g.
   WireGuard) for transport encryption between nodes; it adds none of its
@@ -1086,7 +1233,7 @@ stack, drives `lwd-web`'s HTTP handler over real HTTP through a real
 tag): it starts the same kind of fake-backed daemon on a temp unix socket,
 builds a real `internal/client`, wires it into `mcp.NewServer`, and drives
 the real go-sdk MCP server over an in-memory transport — `tools/list`
-(asserting every one of the fourteen tools is registered), then `lwd_list`
+(asserting every one of the seventeen tools is registered), then `lwd_list`
 (empty), `lwd_apply` with an inline `lwd.toml`, and `lwd_list` again to
 confirm the app appears — proving the agent tool call → `lwd-mcp` →
 `internal/client` → daemon chain end to end.
@@ -1180,6 +1327,20 @@ deployment row's spec snapshot records that concrete node — proving
 `resolvePlacement`'s full candidate-gathering (local + every registered node
 in the app's pool) and `scheduler.Place`'s most-free ranking end to end, with
 no Docker involved.
+
+Nor does the **[node maintenance & failover](#node-maintenance--failover)
+path**, also always part of `go test ./...`, entirely against fakes:
+`TestEndToEndNodeDrain` deploys an unpinned app across two registered fake
+nodes (it lands on the more-free one), then cordons and `EvacuateNode`s that
+node — exactly what `POST /nodes/{name}/drain` (and `lwd node drain`) do —
+and asserts the surface is redeployed on the other node, the old container
+removed, and the old deployment row retired.
+`TestEndToEndNodeLossFailover` deploys a scheduled surface plus a surface
+explicitly pinned to the same node, marks that node unreachable, seeds
+`unreachableSince` past `config.FailoverGrace()` (via the exported
+`Reconciler.SeedUnreachableSince`, so the test doesn't sleep), and asserts a
+plain `Reconcile` pass moves only the scheduled surface — the pinned one is
+left running untouched, reported `degraded`.
 
 All six Docker-gated tests clean up every container, network, node
 registration, and (for the git test) built image they create, and will

@@ -1775,6 +1775,395 @@ func TestEndToEndScheduling(t *testing.T) {
 	}
 }
 
+// callsContain reports whether calls contains target exactly — a small
+// e2e-local stand-in for the internal reconciler test suite's unexported
+// `contains` helper (test/e2e_test.go is a separate package and can't reach
+// it).
+func callsContain(calls []string, target string) bool {
+	for _, c := range calls {
+		if c == target {
+			return true
+		}
+	}
+	return false
+}
+
+// e2eRanOn reports whether f ever ran a container (a RunContainer: call),
+// matching TestEndToEndScheduling's inline ranOn helper.
+func e2eRanOn(f *node.Fake) bool {
+	for _, c := range f.Calls {
+		if strings.HasPrefix(c, "RunContainer:") {
+			return true
+		}
+	}
+	return false
+}
+
+// drainAppLabel, drainDomain, and the two node names are used by
+// TestEndToEndNodeDrain, kept distinct from every other test's labels so
+// assertions never collide.
+const drainAppLabel = "e2e-drain-whoami"
+const drainDomain = "drain-whoami.localhost"
+const drainNodeAName = "e2e-drain-node-a"
+const drainNodeBName = "e2e-drain-node-b"
+
+// TestEndToEndNodeDrain covers Phase 11b Task 6's operator-initiated
+// maintenance path end to end: two registered nodes, an unpinned app that
+// the scheduler places on the more-free one (nodeA), then a manual
+// cordon+EvacuateNode (exactly what the daemon's POST /nodes/{name}/drain —
+// and `lwd node drain` — do) moves its surface onto the other node (nodeB),
+// retiring the old deployment and removing its container from nodeA. This
+// is the same reschedule path internal/reconciler's own
+// TestRescheduleMovesToAnotherNode/TestEvacuateNode* tests cover in-package;
+// this is the black-box, real-store version of it.
+//
+// Deliberately NOT gated by LWD_DOCKER_TEST, like TestEndToEndScheduling:
+// everything here runs against fake nodes and a fake router.
+func TestEndToEndNodeDrain(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	// local's capacity is left unmeasured (Known: false), so it can never
+	// outrank nodeA/nodeB's measured availability (see freeMem's fallback to
+	// MemTotal==0 for an unmeasured node) — same trick TestEndToEndScheduling
+	// uses to prove placement is deliberate, not by default.
+	local := node.NewFake()
+
+	nodeA := node.NewFake()
+	nodeA.Cap = node.Capacity{CPUCores: 4, MemTotal: 8 << 30, MemAvailable: 6 << 30, Known: true}
+	nodeA.MeshAddr = "100.64.0.20"
+	nodeB := node.NewFake()
+	nodeB.Cap = node.Capacity{CPUCores: 4, MemTotal: 8 << 30, MemAvailable: 2 << 30, Known: true}
+	nodeB.MeshAddr = "100.64.0.21"
+
+	if err := s.AddNode(store.Node{Name: drainNodeAName, SSHHost: "deploy@nodea", MeshAddr: "100.64.0.20", Pool: store.DefaultPool, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("AddNode %s: %v", drainNodeAName, err)
+	}
+	if err := s.AddNode(store.Node{Name: drainNodeBName, SSHHost: "deploy@nodeb", MeshAddr: "100.64.0.21", Pool: store.DefaultPool, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("AddNode %s: %v", drainNodeBName, err)
+	}
+	t.Cleanup(func() {
+		_ = s.DeleteNode(drainNodeAName)
+		_ = s.DeleteNode(drainNodeBName)
+	})
+
+	resolver := node.FakeResolver{"local": local, drainNodeAName: nodeA, drainNodeBName: nodeB}
+	reach := schedFakeReach{drainNodeAName: true, drainNodeBName: true}
+
+	fr := router.NewFakeRouter()
+	fr.ProbeStatus = http.StatusOK
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	secStore := secrets.NewStore(cipher, s)
+
+	rec := reconciler.New(resolver, fr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
+	rec.SetReachability(reach)
+
+	app := &spec.App{
+		Name:   drainAppLabel,
+		Image:  "whoami:fake",
+		Domain: drainDomain,
+		Port:   8080,
+		// Node/Pool left unset: the scheduler places it.
+	}
+	app.Health.Timeout = 150 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dep, err := rec.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("initial Apply: %v", err)
+	}
+	if dep.Status != store.StatusRunning {
+		t.Fatalf("initial deployment status = %q, want %q", dep.Status, store.StatusRunning)
+	}
+
+	cur, err := s.CurrentDeployment(app.Name)
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil {
+		t.Fatalf("want a current deployment after Apply, got none")
+	}
+	var recorded spec.App
+	if err := json.Unmarshal([]byte(cur.Spec), &recorded); err != nil {
+		t.Fatalf("unmarshal recorded spec snapshot: %v", err)
+	}
+	if recorded.Node != drainNodeAName {
+		t.Fatalf("initial placement = %q, want %q (the most-free-memory candidate)", recorded.Node, drainNodeAName)
+	}
+	if !cur.Scheduled {
+		t.Fatalf("want a Scheduled deployment (unpinned app), got %+v", cur)
+	}
+	if !e2eRanOn(nodeA) {
+		t.Fatalf("want nodeA to have run the surface container, calls: %v", nodeA.Calls)
+	}
+
+	// Drain nodeA: cordon it (store.SetSchedulable(name, false)) THEN
+	// evacuate — exactly what the daemon's POST /nodes/{name}/drain handler
+	// (and `lwd node drain`) do.
+	if err := s.SetSchedulable(drainNodeAName, false); err != nil {
+		t.Fatalf("SetSchedulable(%s, false): %v", drainNodeAName, err)
+	}
+	result, err := rec.EvacuateNode(ctx, drainNodeAName)
+	if err != nil {
+		t.Fatalf("EvacuateNode: %v", err)
+	}
+	if !callsContain(result.Moved, drainAppLabel) {
+		t.Fatalf("Moved = %v, want to contain %q", result.Moved, drainAppLabel)
+	}
+	if len(result.Failed) != 0 {
+		t.Errorf("Failed = %v, want empty", result.Failed)
+	}
+
+	// nodeA must now be cordoned in the registry.
+	got, err := s.GetNode(drainNodeAName)
+	if err != nil {
+		t.Fatalf("GetNode(%s): %v", drainNodeAName, err)
+	}
+	if got == nil || got.Schedulable {
+		t.Errorf("want %s cordoned (Schedulable=false), got %+v", drainNodeAName, got)
+	}
+
+	// The app must now be redeployed on nodeB, the old deployment retired.
+	newCur, err := s.CurrentDeployment(app.Name)
+	if err != nil {
+		t.Fatalf("CurrentDeployment after drain: %v", err)
+	}
+	if newCur == nil || newCur.ID == cur.ID {
+		t.Fatalf("want a new current deployment after drain, got %+v (was %+v)", newCur, cur)
+	}
+	if newCur.Status != store.StatusRunning {
+		t.Errorf("moved deployment status = %q, want %q", newCur.Status, store.StatusRunning)
+	}
+	if !newCur.Scheduled {
+		t.Errorf("moved deployment Scheduled = false, want true")
+	}
+	var movedSpec spec.App
+	if err := json.Unmarshal([]byte(newCur.Spec), &movedSpec); err != nil {
+		t.Fatalf("unmarshal moved spec snapshot: %v", err)
+	}
+	if movedSpec.Node != drainNodeBName {
+		t.Fatalf("moved to %q, want %q", movedSpec.Node, drainNodeBName)
+	}
+	if !e2eRanOn(nodeB) {
+		t.Errorf("want nodeB to have run the surface container, calls: %v", nodeB.Calls)
+	}
+	if !callsContain(nodeA.Calls, "RemoveContainer:"+cur.ContainerID) {
+		t.Errorf("want old container %q removed from nodeA, calls: %v", cur.ContainerID, nodeA.Calls)
+	}
+
+	deps, err := s.DeploymentsForApp(app.Name)
+	if err != nil {
+		t.Fatalf("DeploymentsForApp: %v", err)
+	}
+	var oldRow *store.Deployment
+	for i := range deps {
+		if deps[i].ID == cur.ID {
+			oldRow = &deps[i]
+		}
+	}
+	if oldRow == nil || oldRow.Status != store.StatusRetired {
+		t.Errorf("old deployment %+v, want status retired", oldRow)
+	}
+
+	// The router's live route must now point at nodeB's surface.
+	route, ok := fr.Routes[app.Domain]
+	if !ok {
+		t.Fatalf("want a live route for %q", app.Domain)
+	}
+	if route.Upstream == "" {
+		t.Errorf("want a live route upstream set, got %+v", route)
+	}
+}
+
+// failoverAppLabel/failoverDomain and failoverPinnedAppLabel/
+// failoverPinnedDomain, plus the two node names, are used by
+// TestEndToEndNodeLossFailover, kept distinct from every other test's labels
+// so assertions never collide.
+const failoverAppLabel = "e2e-failover-whoami"
+const failoverDomain = "failover-whoami.localhost"
+const failoverPinnedAppLabel = "e2e-failover-pinned"
+const failoverPinnedDomain = "failover-pinned.localhost"
+const failoverNodeAName = "e2e-failover-node-a"
+const failoverNodeBName = "e2e-failover-node-b"
+
+// TestEndToEndNodeLossFailover covers Phase 11b Task 5's automatic
+// node-loss failover end to end: a scheduler-placed ("scheduled") surface
+// hosted on a node that goes unreachable is moved to a healthy node by a
+// plain Reconcile pass, once the outage has lasted past
+// config.FailoverGrace() — seeded directly via Reconciler.SeedUnreachableSince
+// so the test doesn't need to sleep. A surface explicitly PINNED to the same
+// dead node must be left exactly where it is (never moved), matching
+// EvacuateNode's own pinned-skip semantics that automatic failover reuses.
+//
+// This is the black-box, real-store counterpart of internal/reconciler's
+// same-package TestFailoverAfterGrace/TestFailoverLeavesPinned tests, which
+// seed r.unreachableSince directly (unavailable to this external package).
+// Deliberately NOT gated by LWD_DOCKER_TEST, for the same reason as
+// TestEndToEndScheduling/TestEndToEndNodeDrain: everything here runs against
+// fake nodes and a fake router.
+func TestEndToEndNodeLossFailover(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	local := node.NewFake() // unmeasured (Known: false); never outranks nodeA/nodeB
+
+	nodeA := node.NewFake()
+	nodeA.Cap = node.Capacity{CPUCores: 4, MemTotal: 8 << 30, MemAvailable: 6 << 30, Known: true}
+	nodeA.MeshAddr = "100.64.0.30"
+	nodeB := node.NewFake()
+	nodeB.Cap = node.Capacity{CPUCores: 4, MemTotal: 8 << 30, MemAvailable: 2 << 30, Known: true}
+	nodeB.MeshAddr = "100.64.0.31"
+
+	if err := s.AddNode(store.Node{Name: failoverNodeAName, SSHHost: "deploy@nodea", MeshAddr: "100.64.0.30", Pool: store.DefaultPool, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("AddNode %s: %v", failoverNodeAName, err)
+	}
+	if err := s.AddNode(store.Node{Name: failoverNodeBName, SSHHost: "deploy@nodeb", MeshAddr: "100.64.0.31", Pool: store.DefaultPool, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("AddNode %s: %v", failoverNodeBName, err)
+	}
+	t.Cleanup(func() {
+		_ = s.DeleteNode(failoverNodeAName)
+		_ = s.DeleteNode(failoverNodeBName)
+	})
+
+	resolver := node.FakeResolver{"local": local, failoverNodeAName: nodeA, failoverNodeBName: nodeB}
+	reach := schedFakeReach{failoverNodeAName: true, failoverNodeBName: true}
+
+	fr := router.NewFakeRouter()
+	fr.ProbeStatus = http.StatusOK
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	secStore := secrets.NewStore(cipher, s)
+
+	rec := reconciler.New(resolver, fr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
+	rec.SetReachability(reach)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Unpinned: the scheduler places it on nodeA (most free memory).
+	scheduledApp := &spec.App{
+		Name:   failoverAppLabel,
+		Image:  "whoami:fake",
+		Domain: failoverDomain,
+		Port:   8080,
+	}
+	scheduledApp.Health.Timeout = 150 * time.Millisecond
+	if _, err := rec.Apply(ctx, scheduledApp); err != nil {
+		t.Fatalf("Apply scheduled app: %v", err)
+	}
+	scheduledCur, err := s.CurrentDeployment(failoverAppLabel)
+	if err != nil || scheduledCur == nil {
+		t.Fatalf("CurrentDeployment(%s): %v / %+v", failoverAppLabel, err, scheduledCur)
+	}
+	var scheduledSpec spec.App
+	if err := json.Unmarshal([]byte(scheduledCur.Spec), &scheduledSpec); err != nil {
+		t.Fatalf("unmarshal scheduled spec snapshot: %v", err)
+	}
+	if scheduledSpec.Node != failoverNodeAName {
+		t.Fatalf("setup: scheduled app landed on %q, want %q", scheduledSpec.Node, failoverNodeAName)
+	}
+
+	// Pinned explicitly to nodeA: must never move, no matter what happens to
+	// nodeA.
+	pinnedApp := &spec.App{
+		Name:   failoverPinnedAppLabel,
+		Image:  "whoami:fake",
+		Domain: failoverPinnedDomain,
+		Port:   8080,
+		Node:   failoverNodeAName,
+	}
+	pinnedApp.Health.Timeout = 150 * time.Millisecond
+	pinnedDep, err := rec.Apply(ctx, pinnedApp)
+	if err != nil {
+		t.Fatalf("Apply pinned app: %v", err)
+	}
+
+	// Simulate node loss, already past the grace period (seeded directly
+	// rather than sleeping — see Reconciler.SeedUnreachableSince's doc
+	// comment).
+	reach[failoverNodeAName] = false
+	rec.SeedUnreachableSince(failoverNodeAName, time.Now().Add(-2*time.Minute))
+
+	if err := rec.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// The scheduled surface must have moved to nodeB.
+	newCur, err := s.CurrentDeployment(failoverAppLabel)
+	if err != nil {
+		t.Fatalf("CurrentDeployment(%s) after Reconcile: %v", failoverAppLabel, err)
+	}
+	if newCur == nil || newCur.ID == scheduledCur.ID {
+		t.Fatalf("want %s moved to a new deployment row after failover, got %+v", failoverAppLabel, newCur)
+	}
+	var movedSpec spec.App
+	if err := json.Unmarshal([]byte(newCur.Spec), &movedSpec); err != nil {
+		t.Fatalf("unmarshal moved spec snapshot: %v", err)
+	}
+	if movedSpec.Node != failoverNodeBName {
+		t.Errorf("failover moved %s to %q, want %q", failoverAppLabel, movedSpec.Node, failoverNodeBName)
+	}
+	if !newCur.Scheduled {
+		t.Errorf("failed-over deployment Scheduled = false, want true")
+	}
+	if !e2eRanOn(nodeB) {
+		t.Errorf("want nodeB to have run the failed-over surface container, calls: %v", nodeB.Calls)
+	}
+
+	deps, err := s.DeploymentsForApp(failoverAppLabel)
+	if err != nil {
+		t.Fatalf("DeploymentsForApp(%s): %v", failoverAppLabel, err)
+	}
+	var oldRow *store.Deployment
+	for i := range deps {
+		if deps[i].ID == scheduledCur.ID {
+			oldRow = &deps[i]
+		}
+	}
+	if oldRow == nil || oldRow.Status != store.StatusRetired {
+		t.Errorf("old deployment %+v, want status retired", oldRow)
+	}
+
+	// The pinned surface must be left completely untouched on the dead node.
+	pinnedAfter, err := s.CurrentDeployment(failoverPinnedAppLabel)
+	if err != nil {
+		t.Fatalf("CurrentDeployment(%s) after Reconcile: %v", failoverPinnedAppLabel, err)
+	}
+	if pinnedAfter == nil || pinnedAfter.ID != pinnedDep.ID || pinnedAfter.Status != store.StatusRunning {
+		t.Errorf("want pinned deployment untouched by failover, got %+v", pinnedAfter)
+	}
+
+	// A subsequent failover pass must not re-fire: the grace timer was
+	// cleared once the evacuation ran.
+	snap := rec.HealthSnapshot()
+	var pinnedHealth *reconciler.AppHealth
+	for i := range snap.Apps {
+		if snap.Apps[i].App == failoverPinnedAppLabel {
+			pinnedHealth = &snap.Apps[i]
+		}
+	}
+	if pinnedHealth == nil || pinnedHealth.State != reconciler.SurfaceDegraded {
+		t.Errorf("pinned app on unreachable node: health = %+v, want state %q", pinnedHealth, reconciler.SurfaceDegraded)
+	}
+}
+
 // splitLines splits docker CLI output into non-empty trimmed lines.
 func splitLines(s string) []string {
 	var out []string

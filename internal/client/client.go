@@ -323,3 +323,56 @@ func (c *Client) RemoveNode(ctx context.Context, name string) error {
 	}
 	return nil
 }
+
+// Uncordon clears a node's cordon, making it eligible for scheduler
+// placement again. It never touches anything already deployed on it.
+func (c *Client) Uncordon(ctx context.Context, name string) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.url("/nodes/"+name+"/uncordon"), nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return decodeErr(resp)
+	}
+	return nil
+}
+
+// Evacuate moves every scheduler-placed surface off name onto some other
+// fitting node, without changing name's schedulable bit.
+func (c *Client) Evacuate(ctx context.Context, name string) (reconciler.EvacuateResult, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.url("/nodes/"+name+"/evacuate"), nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return reconciler.EvacuateResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return reconciler.EvacuateResult{}, decodeErr(resp)
+	}
+	var res reconciler.EvacuateResult
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return reconciler.EvacuateResult{}, err
+	}
+	return res, nil
+}
+
+// Drain cordons name (excluding it from future scheduler placement) THEN
+// evacuates every scheduler-placed surface off it.
+func (c *Client) Drain(ctx context.Context, name string) (reconciler.EvacuateResult, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.url("/nodes/"+name+"/drain"), nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return reconciler.EvacuateResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return reconciler.EvacuateResult{}, decodeErr(resp)
+	}
+	var res reconciler.EvacuateResult
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return reconciler.EvacuateResult{}, err
+	}
+	return res, nil
+}

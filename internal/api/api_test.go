@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"lwd/internal/build"
 	"lwd/internal/compose"
@@ -1169,4 +1170,323 @@ func TestNodeListIncludesReachability(t *testing.T) {
 	if got := byName["web2"]; got.Transport != "ssh" || got.Reachable {
 		t.Fatalf("web2 = %+v, want transport=ssh reachable=false", got)
 	}
+}
+
+// newSchedulingTestServer is like newTestServer but exposes the underlying
+// node.FakeResolver (so drain/evacuate tests can register additional nodes —
+// web1, web2, ... — each with independently settable Capacity) and the
+// *store.Store, matching the reconciler package's own newSchedulingReconciler
+// test helper. It's used by Phase 11b Task 4's drain/evacuate/uncordon tests,
+// which need a real reconciler (not a fake) since they exercise
+// rec.EvacuateNode end to end, including actual reschedule placement.
+func newSchedulingTestServer(t *testing.T, extra ...string) (*httptest.Server, node.FakeResolver, *store.Store) {
+	t.Helper()
+	f := node.NewFake()
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	rt := router.NewFakeRouter()
+	secStore := testSecretResolver(t, s, dir)
+	resolver := node.FakeResolver{"local": f}
+	for _, name := range extra {
+		resolver[name] = node.NewFake()
+	}
+	rec := reconciler.New(resolver, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
+	srv := New(rec, s, f, rt, secStore, nil)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts, resolver, s
+}
+
+// TestNodeDrainCordonsAndEvacuates covers Phase 11b Task 4: POST
+// /nodes/{name}/drain must cordon the node (schedulable -> false) AND move
+// every scheduler-placed surface off it, in one call. web1 hosts a scheduled
+// ("blog") surface; web2 is the only other node with enough capacity to take
+// it once web1 is excluded (local is starved so it's never a candidate).
+func TestNodeDrainCordonsAndEvacuates(t *testing.T) {
+	ts, resolver, s := newSchedulingTestServer(t, "web1", "web2")
+
+	localFake := resolver["local"].(*node.Fake)
+	localFake.Cap = node.Capacity{Known: true, CPUCores: 1, MemAvailable: 1}
+	web1 := resolver["web1"].(*node.Fake)
+	web2 := resolver["web2"].(*node.Fake)
+	web1.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 9000}
+	web2.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 3000}
+
+	if err := s.AddNode(store.Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", Pool: "default"}); err != nil {
+		t.Fatalf("AddNode web1: %v", err)
+	}
+	if err := s.AddNode(store.Node{Name: "web2", SSHHost: "deploy@web2", MeshAddr: "100.64.0.3", Pool: "default"}); err != nil {
+		t.Fatalf("AddNode web2: %v", err)
+	}
+
+	app := spec.App{
+		Name:         "blog",
+		Image:        "img:1",
+		Domain:       "blog.example.com",
+		Port:         8080,
+		Requirements: &spec.Requirements{Memory: "2000"}, // fits web1/web2, not starved local
+		Health:       spec.Health{Path: "/healthz", Timeout: 150 * time.Millisecond},
+	}
+	body, _ := json.Marshal(app)
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /apply: %v", err)
+	}
+	var dep store.Deployment
+	if err := json.NewDecoder(resp.Body).Decode(&dep); err != nil {
+		t.Fatalf("decode apply response: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("apply status = %d", resp.StatusCode)
+	}
+	if got := specNodeField(t, dep.Spec); got != "web1" {
+		t.Fatalf("setup: initial placement = %q, want web1", got)
+	}
+
+	resp, err = http.Post(ts.URL+"/nodes/web1/drain", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /nodes/web1/drain: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, b)
+	}
+	var result reconciler.EvacuateResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !contains(result.Moved, "blog") {
+		t.Fatalf("Moved = %v, want to contain %q", result.Moved, "blog")
+	}
+
+	n, err := s.GetNode("web1")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if n == nil || n.Schedulable {
+		t.Fatalf("web1 = %+v, want Schedulable=false after drain", n)
+	}
+
+	newCur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if newCur == nil || specNodeField(t, newCur.Spec) != "web2" {
+		t.Fatalf("blog current deployment = %+v, want placed on web2", newCur)
+	}
+}
+
+// TestNodeUncordon covers Phase 11b Task 4: POST /nodes/{name}/uncordon
+// flips schedulable back to true without touching anything already deployed.
+func TestNodeUncordon(t *testing.T) {
+	ts, _, s := newSchedulingTestServer(t, "web1")
+
+	if err := s.AddNode(store.Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", Pool: "default"}); err != nil {
+		t.Fatalf("AddNode web1: %v", err)
+	}
+	if err := s.SetSchedulable("web1", false); err != nil {
+		t.Fatalf("SetSchedulable: %v", err)
+	}
+
+	resp, err := http.Post(ts.URL+"/nodes/web1/uncordon", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /nodes/web1/uncordon: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, b)
+	}
+
+	n, err := s.GetNode("web1")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if n == nil || !n.Schedulable {
+		t.Fatalf("web1 = %+v, want Schedulable=true after uncordon", n)
+	}
+}
+
+// TestNodeEvacuate covers Phase 11b Task 4: POST /nodes/{name}/evacuate moves
+// scheduler-placed surfaces off the node but leaves its schedulable bit
+// unchanged (evacuate is not cordon+evacuate — that's drain).
+func TestNodeEvacuate(t *testing.T) {
+	ts, resolver, s := newSchedulingTestServer(t, "web1", "web2")
+
+	localFake := resolver["local"].(*node.Fake)
+	localFake.Cap = node.Capacity{Known: true, CPUCores: 1, MemAvailable: 1}
+	web1 := resolver["web1"].(*node.Fake)
+	web2 := resolver["web2"].(*node.Fake)
+	web1.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 9000}
+	web2.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 3000}
+
+	if err := s.AddNode(store.Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", Pool: "default"}); err != nil {
+		t.Fatalf("AddNode web1: %v", err)
+	}
+	if err := s.AddNode(store.Node{Name: "web2", SSHHost: "deploy@web2", MeshAddr: "100.64.0.3", Pool: "default"}); err != nil {
+		t.Fatalf("AddNode web2: %v", err)
+	}
+
+	app := spec.App{
+		Name:         "blog",
+		Image:        "img:1",
+		Domain:       "blog.example.com",
+		Port:         8080,
+		Requirements: &spec.Requirements{Memory: "2000"},
+		Health:       spec.Health{Path: "/healthz", Timeout: 150 * time.Millisecond},
+	}
+	body, _ := json.Marshal(app)
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /apply: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("apply status = %d", resp.StatusCode)
+	}
+
+	resp, err = http.Post(ts.URL+"/nodes/web1/evacuate", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /nodes/web1/evacuate: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, b)
+	}
+	var result reconciler.EvacuateResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !contains(result.Moved, "blog") {
+		t.Fatalf("Moved = %v, want to contain %q", result.Moved, "blog")
+	}
+
+	n, err := s.GetNode("web1")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if n == nil || !n.Schedulable {
+		t.Fatalf("web1 = %+v, want Schedulable unchanged (true) after plain evacuate", n)
+	}
+}
+
+// TestNodeEvacuateLocalRejected covers the final-review nit for Phase 11b
+// Task 4: evacuate must share checkCordonTarget with drain/uncordon, so the
+// implicit local node can never be evacuated — 400, not a silent no-op.
+func TestNodeEvacuateLocalRejected(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	resp, err := http.Post(ts.URL+"/nodes/local/evacuate", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /nodes/local/evacuate: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestNodeEvacuateUnknown covers the final-review nit for Phase 11b Task 4:
+// evacuating a node that was never registered is a 404, not a silent no-op,
+// matching drain/uncordon.
+func TestNodeEvacuateUnknown(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	resp, err := http.Post(ts.URL+"/nodes/ghost/evacuate", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /nodes/ghost/evacuate: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestDrainLocalRejected covers Phase 11b Task 4: the implicit local node can
+// never be drained (or uncordoned) — 400, and no state changes.
+func TestDrainLocalRejected(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	resp, err := http.Post(ts.URL+"/nodes/local/drain", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /nodes/local/drain: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestUncordonUnknownNode covers Phase 11b Task 4: uncordoning a node that
+// was never registered is a 404, not a silent no-op.
+func TestUncordonUnknownNode(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	resp, err := http.Post(ts.URL+"/nodes/ghost/uncordon", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /nodes/ghost/uncordon: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestNodeListIncludesSchedulable covers Phase 11b Task 4: the GET /nodes
+// status DTO serializes schedulable (it rides via the embedded store.Node,
+// same as pool did in Phase 11a).
+func TestNodeListIncludesSchedulable(t *testing.T) {
+	ts, inv := newTestServerWithInvalidator(t)
+
+	body, _ := json.Marshal(map[string]string{
+		"name": "web1", "ssh_host": "deploy@web1", "mesh_addr": "100.64.0.2",
+	})
+	resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /nodes: %v", err)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Get(ts.URL + "/nodes")
+	if err != nil {
+		t.Fatalf("GET /nodes: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !strings.Contains(string(raw), `"schedulable":true`) {
+		t.Fatalf("body = %s, want it to contain %q", raw, `"schedulable":true`)
+	}
+	_ = inv
+}
+
+// specNodeField unmarshals a deployment's JSON Spec snapshot and returns its
+// Node field — the api package's own equivalent of the reconciler package's
+// unexported specNode test helper.
+func specNodeField(t *testing.T, specJSON string) string {
+	t.Helper()
+	var a spec.App
+	if err := json.Unmarshal([]byte(specJSON), &a); err != nil {
+		t.Fatalf("unmarshal spec snapshot: %v", err)
+	}
+	return a.Node
+}
+
+// contains reports whether ss contains s.
+func contains(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }

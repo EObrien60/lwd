@@ -71,3 +71,27 @@ func HealMaxAttempts() int {
 	}
 	return n
 }
+
+// defaultFailoverGrace is how long a registered node must be observed
+// continuously unreachable before the continuous reconciler loop
+// automatically evacuates its scheduled surfaces, used when
+// LWD_FAILOVER_GRACE is unset, unparseable, or not positive.
+const defaultFailoverGrace = 60 * time.Second
+
+// FailoverGrace returns the grace period a registered node must stay
+// unreachable before Phase 11b Task 5's automatic node-loss failover kicks
+// in (LWD_FAILOVER_GRACE, parsed with time.ParseDuration; an empty,
+// unparseable, or non-positive value falls back to the 60s default — mirrors
+// ReconcileInterval's guard, since a degenerate zero grace would evacuate a
+// node on its very first missed probe).
+func FailoverGrace() time.Duration {
+	v := os.Getenv("LWD_FAILOVER_GRACE")
+	if v == "" {
+		return defaultFailoverGrace
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return defaultFailoverGrace
+	}
+	return d
+}

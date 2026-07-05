@@ -432,6 +432,15 @@ function dashboard() {
     nodeAddBusy: false,
     nodeRemoveBusy: '',
 
+    // ---- node lifecycle (drain/evacuate/uncordon, Phase 11b) -----------
+    // nodeActionBusy is "<action>:<name>" while a drain/evacuate/uncordon
+    // call is in flight (e.g. "drain:web1"), so buttons for OTHER nodes stay
+    // usable and each button's own busy label can be derived from it.
+    nodeActionBusy: '',
+    // evacResult holds the last drain/evacuate outcome to render: { node,
+    // action, moved, skipped, failed } — see drainNode/evacuateNode.
+    evacResult: null,
+
     // ---- pools (Phase 11a Task 8) --------------------------------------
     // Populated from /api/pools; used to fill the deploy modal's Pool
     // <select> and the Nodes view's pool badges.
@@ -754,6 +763,70 @@ function dashboard() {
         this.nodesError = e.message || 'Failed to add node.';
       } finally {
         this.nodeAddBusy = false;
+      }
+    },
+
+    // nodeBusy reports whether ANY lifecycle action (drain/evacuate/
+    // uncordon) is currently in flight for node name, so every action
+    // button on that row disables together — overlapping calls against the
+    // same node would race each other's cordon/evacuate side effects.
+    nodeBusy(name) {
+      return !!this.nodeActionBusy && this.nodeActionBusy.endsWith(':' + name);
+    },
+
+    // showEvacResult normalizes a reconciler.EvacuateResult (moved/skipped/
+    // failed may each be omitted or null from an older daemon) into the
+    // shape the result panel renders, and opens it.
+    showEvacResult(node, action, result) {
+      this.evacResult = {
+        node,
+        action,
+        moved: (result && result.moved) || [],
+        skipped: (result && result.skipped) || [],
+        failed: (result && result.failed) || [],
+      };
+    },
+
+    async drainNode(name) {
+      if (!confirm(`Drain "${name}"? This cordons it (no new placements) and moves every scheduler-placed app currently there onto another node. Pinned apps are left running.`)) return;
+      this.nodeActionBusy = 'drain:' + name;
+      try {
+        const result = await apiFetch(`/api/nodes/${encodeURIComponent(name)}/drain`, { method: 'POST' });
+        this.showEvacResult(name, 'drain', result);
+        this.notify('ok', `Drained "${name}".`);
+        await this.loadNodes();
+      } catch (e) {
+        this.notify('err', e.message || `Failed to drain "${name}".`);
+      } finally {
+        this.nodeActionBusy = '';
+      }
+    },
+
+    async evacuateNode(name) {
+      if (!confirm(`Evacuate "${name}"? This moves every scheduler-placed app currently there onto another node, without cordoning it — new placements may still land on it afterward.`)) return;
+      this.nodeActionBusy = 'evacuate:' + name;
+      try {
+        const result = await apiFetch(`/api/nodes/${encodeURIComponent(name)}/evacuate`, { method: 'POST' });
+        this.showEvacResult(name, 'evacuate', result);
+        this.notify('ok', `Evacuated "${name}".`);
+        await this.loadNodes();
+      } catch (e) {
+        this.notify('err', e.message || `Failed to evacuate "${name}".`);
+      } finally {
+        this.nodeActionBusy = '';
+      }
+    },
+
+    async uncordonNode(name) {
+      this.nodeActionBusy = 'uncordon:' + name;
+      try {
+        await apiFetch(`/api/nodes/${encodeURIComponent(name)}/uncordon`, { method: 'POST' });
+        this.notify('ok', `Uncordoned "${name}".`);
+        await this.loadNodes();
+      } catch (e) {
+        this.notify('err', e.message || `Failed to uncordon "${name}".`);
+      } finally {
+        this.nodeActionBusy = '';
       }
     },
 

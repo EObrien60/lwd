@@ -50,6 +50,10 @@ type NodeHealth struct {
 	// fetch leaves this zero-valued (Capacity.Known == false) rather than
 	// failing the whole probe.
 	Capacity node.Capacity `json:"capacity"`
+	// Cordoned reports whether the node is marked non-schedulable
+	// (store.Node.Schedulable == false — see `lwd node cordon`, Phase 11b
+	// Task 1). Always false for "local", which cannot be cordoned.
+	Cordoned bool `json:"cordoned"`
 }
 
 // EdgeHealth is the observed reachability of the shared edge (router/Caddy).

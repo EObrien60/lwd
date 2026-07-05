@@ -49,6 +49,17 @@ type fakeDaemon struct {
 	removedNodes  []string
 	removeNodeErr error
 
+	drainResult reconciler.EvacuateResult
+	drainErr    error
+	drainCalls  []string
+
+	evacuateResult reconciler.EvacuateResult
+	evacuateErr    error
+	evacuateCalls  []string
+
+	uncordonErr   error
+	uncordonCalls []string
+
 	health    reconciler.Health
 	healthErr error
 
@@ -174,6 +185,30 @@ func (f *fakeDaemon) RemoveNode(ctx context.Context, name string) error {
 		return f.removeNodeErr
 	}
 	f.removedNodes = append(f.removedNodes, name)
+	return nil
+}
+
+func (f *fakeDaemon) Drain(ctx context.Context, name string) (reconciler.EvacuateResult, error) {
+	f.drainCalls = append(f.drainCalls, name)
+	if f.drainErr != nil {
+		return reconciler.EvacuateResult{}, f.drainErr
+	}
+	return f.drainResult, nil
+}
+
+func (f *fakeDaemon) Evacuate(ctx context.Context, name string) (reconciler.EvacuateResult, error) {
+	f.evacuateCalls = append(f.evacuateCalls, name)
+	if f.evacuateErr != nil {
+		return reconciler.EvacuateResult{}, f.evacuateErr
+	}
+	return f.evacuateResult, nil
+}
+
+func (f *fakeDaemon) Uncordon(ctx context.Context, name string) error {
+	f.uncordonCalls = append(f.uncordonCalls, name)
+	if f.uncordonErr != nil {
+		return f.uncordonErr
+	}
 	return nil
 }
 

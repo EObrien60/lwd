@@ -751,6 +751,161 @@ func TestToolNodeRemove(t *testing.T) {
 	}
 }
 
+// TestToolNodeDrain covers lwd_node_drain: it must be annotated
+// destructiveHint=true (it cordons AND evacuates — surfaces actually move),
+// call client.Drain with the given name, and return the resulting
+// reconciler.EvacuateResult (moved/skipped/failed) as structured output.
+func TestToolNodeDrain(t *testing.T) {
+	fc := newFakeClient()
+	fc.drainResult = reconciler.EvacuateResult{
+		Moved:   []string{"blog"},
+		Skipped: []string{"pinned"},
+		Failed:  []reconciler.EvacFailure{{App: "shop", Err: "no capacity"}},
+	}
+	cs := connectTestServer(t, fc)
+
+	lr, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	tool := findTool(lr.Tools, "lwd_node_drain")
+	if tool == nil {
+		t.Fatalf("lwd_node_drain tool not registered; got %+v", lr.Tools)
+	}
+	if tool.Annotations == nil || tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint {
+		t.Errorf("lwd_node_drain should be annotated destructiveHint=true, got %+v", tool.Annotations)
+	}
+
+	res := callTool(t, cs, "lwd_node_drain", map[string]any{"name": "web1"})
+	if res.IsError {
+		t.Fatalf("lwd_node_drain returned tool error: %+v", res.Content)
+	}
+	if len(fc.drainCalls) != 1 || fc.drainCalls[0] != "web1" {
+		t.Fatalf("expected Drain called with \"web1\", got %+v", fc.drainCalls)
+	}
+	var out reconciler.EvacuateResult
+	decodeStructured(t, res, &out)
+	if len(out.Moved) != 1 || out.Moved[0] != "blog" {
+		t.Errorf("Moved = %v", out.Moved)
+	}
+	if len(out.Skipped) != 1 || out.Skipped[0] != "pinned" {
+		t.Errorf("Skipped = %v", out.Skipped)
+	}
+	if len(out.Failed) != 1 || out.Failed[0].App != "shop" {
+		t.Errorf("Failed = %v", out.Failed)
+	}
+
+	fc.drainErr = fmt.Errorf("drain failed")
+	res = callTool(t, cs, "lwd_node_drain", map[string]any{"name": "web1"})
+	if !res.IsError {
+		t.Errorf("lwd_node_drain should surface a daemon error as a tool error, got %+v", res)
+	}
+}
+
+// TestToolNodeEvacuate covers lwd_node_evacuate: destructiveHint=true (it
+// moves surfaces, just without cordoning first), calls client.Evacuate, and
+// returns the resulting reconciler.EvacuateResult.
+func TestToolNodeEvacuate(t *testing.T) {
+	fc := newFakeClient()
+	fc.evacuateResult = reconciler.EvacuateResult{Moved: []string{"blog"}}
+	cs := connectTestServer(t, fc)
+
+	lr, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	tool := findTool(lr.Tools, "lwd_node_evacuate")
+	if tool == nil {
+		t.Fatalf("lwd_node_evacuate tool not registered; got %+v", lr.Tools)
+	}
+	if tool.Annotations == nil || tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint {
+		t.Errorf("lwd_node_evacuate should be annotated destructiveHint=true, got %+v", tool.Annotations)
+	}
+
+	res := callTool(t, cs, "lwd_node_evacuate", map[string]any{"name": "web1"})
+	if res.IsError {
+		t.Fatalf("lwd_node_evacuate returned tool error: %+v", res.Content)
+	}
+	if len(fc.evacuateCalls) != 1 || fc.evacuateCalls[0] != "web1" {
+		t.Fatalf("expected Evacuate called with \"web1\", got %+v", fc.evacuateCalls)
+	}
+	var out reconciler.EvacuateResult
+	decodeStructured(t, res, &out)
+	if len(out.Moved) != 1 || out.Moved[0] != "blog" {
+		t.Errorf("Moved = %v", out.Moved)
+	}
+
+	fc.evacuateErr = fmt.Errorf("evacuate failed")
+	res = callTool(t, cs, "lwd_node_evacuate", map[string]any{"name": "web1"})
+	if !res.IsError {
+		t.Errorf("lwd_node_evacuate should surface a daemon error as a tool error, got %+v", res)
+	}
+}
+
+// TestToolNodeUncordon covers lwd_node_uncordon: low-risk (no
+// destructiveHint — it only clears a cordon, touching nothing already
+// deployed), calls client.Uncordon, and confirms via a simple ok/name
+// output.
+func TestToolNodeUncordon(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	lr, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	tool := findTool(lr.Tools, "lwd_node_uncordon")
+	if tool == nil {
+		t.Fatalf("lwd_node_uncordon tool not registered; got %+v", lr.Tools)
+	}
+	if tool.Annotations != nil && tool.Annotations.DestructiveHint != nil && *tool.Annotations.DestructiveHint {
+		t.Errorf("lwd_node_uncordon should NOT be annotated destructiveHint=true (it's low-risk), got %+v", tool.Annotations)
+	}
+
+	res := callTool(t, cs, "lwd_node_uncordon", map[string]any{"name": "web1"})
+	if res.IsError {
+		t.Fatalf("lwd_node_uncordon returned tool error: %+v", res.Content)
+	}
+	if len(fc.uncordonCalls) != 1 || fc.uncordonCalls[0] != "web1" {
+		t.Fatalf("expected Uncordon called with \"web1\", got %+v", fc.uncordonCalls)
+	}
+	var out lwdNodeUncordonOutput
+	decodeStructured(t, res, &out)
+	if !out.OK || out.Name != "web1" {
+		t.Errorf("unexpected output: %+v", out)
+	}
+
+	fc.uncordonErr = fmt.Errorf("uncordon failed")
+	res = callTool(t, cs, "lwd_node_uncordon", map[string]any{"name": "web1"})
+	if !res.IsError {
+		t.Errorf("lwd_node_uncordon should surface a daemon error as a tool error, got %+v", res)
+	}
+}
+
+// TestToolNodeListIncludesSchedulable covers that lwd_node_list's structured
+// output round-trips each node's cordon state (store.Node.Schedulable,
+// embedded via client.NodeStatus) — the field a caller checks before
+// deciding whether to place something on it, or as a signal that a node
+// needs lwd_node_uncordon.
+func TestToolNodeListIncludesSchedulable(t *testing.T) {
+	fc := newFakeClient()
+	fc.nodes = []client.NodeStatus{
+		{Node: store.Node{Name: "web1", Schedulable: true}, Transport: "agent", Reachable: true},
+		{Node: store.Node{Name: "web2", Schedulable: false}, Transport: "ssh", Reachable: true},
+	}
+	cs := connectTestServer(t, fc)
+
+	res := callTool(t, cs, "lwd_node_list", map[string]any{})
+	if res.IsError {
+		t.Fatalf("lwd_node_list returned tool error: %+v", res.Content)
+	}
+	var out lwdNodeListOutput
+	decodeStructured(t, res, &out)
+	if len(out.Nodes) != 2 || !out.Nodes[0].Schedulable || out.Nodes[1].Schedulable {
+		t.Fatalf("unexpected schedulable states: %+v", out.Nodes)
+	}
+}
+
 func TestToolApplyWithNode(t *testing.T) {
 	fc := newFakeClient()
 	cs := connectTestServer(t, fc)

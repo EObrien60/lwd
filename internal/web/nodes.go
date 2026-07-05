@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"lwd/internal/client"
+	"lwd/internal/reconciler"
 )
 
 // nodeRequest is the wire shape for POST /api/nodes.
@@ -49,6 +50,63 @@ func (s *Server) handleNodeAdd(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNodeRemove(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := s.client.RemoveNode(r.Context(), name); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// normalizeEvacuateResult normalizes a reconciler.EvacuateResult's nil
+// Moved/Skipped/Failed slices to empty, matching every other list-shaped
+// /api response (handleApps, handleNodes, handleHealth, handlePools) — so
+// the frontend can call .length on them unconditionally.
+func normalizeEvacuateResult(res reconciler.EvacuateResult) reconciler.EvacuateResult {
+	if res.Moved == nil {
+		res.Moved = []string{}
+	}
+	if res.Skipped == nil {
+		res.Skipped = []string{}
+	}
+	if res.Failed == nil {
+		res.Failed = []reconciler.EvacFailure{}
+	}
+	return res
+}
+
+// handleNodeDrain proxies the daemon's POST /nodes/{name}/drain: cordon the
+// node (excluding it from future scheduler placement) THEN evacuate every
+// scheduler-placed surface off it onto some other fitting node, rendering
+// the resulting reconciler.EvacuateResult (moved/skipped/failed).
+func (s *Server) handleNodeDrain(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	res, err := s.client.Drain(r.Context(), name)
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, normalizeEvacuateResult(res))
+}
+
+// handleNodeEvacuate proxies the daemon's POST /nodes/{name}/evacuate: move
+// every scheduler-placed surface off the node without changing its
+// schedulable bit, rendering the same reconciler.EvacuateResult shape as
+// drain.
+func (s *Server) handleNodeEvacuate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	res, err := s.client.Evacuate(r.Context(), name)
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, normalizeEvacuateResult(res))
+}
+
+// handleNodeUncordon proxies the daemon's POST /nodes/{name}/uncordon:
+// clears the node's cordon, making it eligible for scheduler placement
+// again. It never touches anything already deployed on it.
+func (s *Server) handleNodeUncordon(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := s.client.Uncordon(r.Context(), name); err != nil {
 		writeClientErr(w, err)
 		return
 	}

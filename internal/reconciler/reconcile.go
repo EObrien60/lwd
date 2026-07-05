@@ -3,6 +3,7 @@ package reconciler
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"lwd/internal/config"
@@ -23,11 +24,15 @@ const (
 // that app's current surface via reconcileApp, then stores a fresh Health
 // snapshot combining the collected per-app health with a probe of every
 // registered node's reachability and the shared edge (router)'s health.
+// Finally (Phase 11b Task 5), it runs failoverLostNodes to automatically
+// evacuate any registered node that has been unreachable past
+// config.FailoverGrace().
 //
 // A per-app error (an unresolvable node, a failed heal attempt, ...) is
 // isolated into that app's AppHealth entry and never aborts the pass — only
 // a failure to even list the apps to reconcile (a store error) fails the
-// whole call.
+// whole call. failoverLostNodes similarly isolates its own errors/panics
+// (see its doc comment) so a failover hiccup never aborts a pass either.
 func (r *Reconciler) Reconcile(ctx context.Context) error {
 	apps, err := r.store.ListApps()
 	if err != nil {
@@ -46,7 +51,105 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		Edge:  r.probeEdge(ctx),
 		Apps:  appHealth,
 	})
+
+	r.failoverLostNodes(ctx)
+
 	return nil
+}
+
+// failoverLostNodes implements Phase 11b Task 5's automatic node-loss
+// failover: for every REGISTERED node (r.store.ListNodes() — this never
+// includes the implicit "local" node, which is also defensively skipped
+// below even if somehow seeded into unreachableSince), it tracks how long
+// that node has been continuously unreachable and, once that streak exceeds
+// config.FailoverGrace(), evacuates its scheduler-placed surfaces via
+// EvacuateNode exactly as a manual `lwd node drain` would.
+//
+// If no Reachability has been wired up (r.reach == nil, e.g. a test that
+// never calls SetReachability), there is nothing to probe, so this is a
+// no-op — a node's reachability can never be determined, and treating
+// "unknown" as "unreachable" would evacuate healthy fleets on every pass.
+//
+// Lock discipline (critical — mirrors reconcileApp/tryHeal's split in
+// Reconcile's per-app loop): unreachableSince is read/mutated only under
+// short r.mu critical sections; EvacuateNode is ALWAYS called with r.mu NOT
+// held, since it takes the lock itself — holding it across that call would
+// deadlock the whole reconcile loop.
+//
+// The entire pass is wrapped in a deferred recover so a panic here (e.g. a
+// misbehaving Reachability/store implementation) can never crash the
+// reconcile loop or leave r.mu held; a plain error from EvacuateNode or
+// store.ListNodes is logged and otherwise swallowed for the same reason —
+// this is best-effort self-healing, not a critical path whose failure
+// should abort the pass.
+func (r *Reconciler) failoverLostNodes(ctx context.Context) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("failover: recovered from panic: %v", rec)
+		}
+	}()
+
+	if r.reach == nil {
+		return
+	}
+
+	nodes, err := r.store.ListNodes()
+	if err != nil {
+		log.Printf("failover: list nodes: %v", err)
+		return
+	}
+
+	for _, n := range nodes {
+		if n.Name == "local" {
+			// Defensive: store.ListNodes() never actually returns "local",
+			// but the implicit local node must never be a failover target
+			// regardless — it's the controller itself, not something that
+			// can be "lost".
+			continue
+		}
+
+		_, ok := r.reach.Reachable(ctx, n.Name)
+		if ok {
+			r.mu.Lock()
+			delete(r.unreachableSince, n.Name)
+			r.mu.Unlock()
+			continue
+		}
+
+		r.mu.Lock()
+		since, seen := r.unreachableSince[n.Name]
+		if !seen {
+			// First pass to observe this node unreachable: start the grace
+			// timer, but don't fail over yet.
+			r.unreachableSince[n.Name] = time.Now()
+			r.mu.Unlock()
+			continue
+		}
+		r.mu.Unlock()
+
+		if time.Since(since) < config.FailoverGrace() {
+			continue
+		}
+
+		// Past grace: evacuate WITHOUT r.mu held (EvacuateNode takes it
+		// itself).
+		log.Printf("failover: node %q unreachable for over %s, evacuating scheduled surfaces", n.Name, config.FailoverGrace())
+		result, everr := r.EvacuateNode(ctx, n.Name)
+		if everr != nil {
+			log.Printf("failover: evacuate %q: %v", n.Name, everr)
+		} else {
+			log.Printf("failover: evacuate %q done: moved=%v skipped=%v failed=%v", n.Name, result.Moved, result.Skipped, result.Failed)
+		}
+
+		// Clear the timer regardless of outcome: a fully successful
+		// evacuation has nothing left to move, and anything EvacuateNode
+		// couldn't move (result.Failed — e.g. no capacity elsewhere) is
+		// picked up by the app's own normal degraded/heal reporting rather
+		// than re-attempting a fresh failover on every subsequent pass.
+		r.mu.Lock()
+		delete(r.unreachableSince, n.Name)
+		r.mu.Unlock()
+	}
 }
 
 // reconcileApp observes the current health of one app's surface and, if it's
@@ -216,7 +319,7 @@ func (r *Reconciler) probeNodes(ctx context.Context) []NodeHealth {
 	}
 	for _, n := range nodes {
 		transport, ok := r.reach.Reachable(ctx, n.Name)
-		out = append(out, NodeHealth{Name: n.Name, Transport: transport, Reachable: ok, UpdatedAt: now, Capacity: r.probeCapacity(ctx, n.Name)})
+		out = append(out, NodeHealth{Name: n.Name, Transport: transport, Reachable: ok, UpdatedAt: now, Capacity: r.probeCapacity(ctx, n.Name), Cordoned: !n.Schedulable})
 	}
 	return out
 }

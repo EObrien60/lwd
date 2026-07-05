@@ -156,13 +156,35 @@ Everything on plain Linux. WireGuard mesh. No custom kernel/init/fs, no service 
   requirements. Single-node behavior is unchanged (an unpinned app with no
   other nodes registered still always lands on `local`). See `README.md`'s
   [Scheduling & pools](../README.md#scheduling--pools) section.
-- **P11b — next — Node drain/evacuate + automatic node-loss failover:**
-  **cross-node reschedule of a surface whose node has gone away** (P10 only
-  self-heals a surface in place on its *existing* node; P11a only schedules
-  an unpinned app once, at apply time — neither moves an already-running
-  surface off a node that later disappears); `lwd node drain`/`evacuate` for
-  operator-initiated migration off a node ahead of planned maintenance.
-- **P12 — Surface replicas + LB:** `lwd scale api N`; Caddy load-balances across healthy
+- **P11b — DONE (merged) — Node drain/evacuate + automatic node-loss
+  failover — P11 IS NOW COMPLETE:** `store.Node.Schedulable` (cordon) +
+  `store.Deployment.Scheduled` (provenance: does this surface belong to the
+  scheduler, or is it pinned?) thread through placement, self-heal, and
+  rollback so every mover agrees on what's movable; a pure
+  `reconciler.EvacuateNode` (+ `EvacuateResult{Moved, Skipped, Failed}`)
+  reschedules every scheduler-placed surface off a node onto another fitting
+  one via the same blue-green path self-heal uses, retiring the old
+  deployment and best-effort removing its old container (skipped, not
+  failed, if the old node is itself unreachable — the node-loss case);
+  `lwd node drain` (cordon + evacuate) / `evacuate` (no cordon) / `uncordon`
+  + the daemon API (`POST /nodes/{name}/{drain,evacuate,uncordon}`) for
+  operator-initiated migration ahead of planned maintenance; a continuous-
+  reconciler pass (`failoverLostNodes`, gated by `LWD_FAILOVER_GRACE`,
+  default `60s`) that automatically evacuates a node's scheduled surfaces
+  once it's been unreachable past grace — **cross-node reschedule of a
+  surface whose node has gone away**, the gap P10 (heals in place on the
+  *existing* node only) and P11a (schedules once, at apply time, never
+  moves it again) both left open. Only scheduler-placed surfaces ever
+  move — pinned apps, compose apps, and backing services never do, and
+  there's no fail-back/rebalancing (a recovered node stays empty until
+  placed on again). `lwd-web`'s Nodes view (drain/evacuate/uncordon buttons
+  + a schedulable/cordoned badge, rendering `EvacuateResult`) and Health
+  panel (cordoned badge), plus `lwd-mcp`'s `lwd_node_drain`/
+  `lwd_node_evacuate`/`lwd_node_uncordon` tools, surface all of it. Single-
+  node installs are completely unaffected (nothing registered to fail over).
+  See `README.md`'s [Node maintenance &
+  failover](../README.md#node-maintenance--failover) section.
+- **P12 — next — Surface replicas + LB:** `lwd scale api N`; Caddy load-balances across healthy
   replicas; blue/green across the replica set. Human scaling only (no autoscaler).
 - **P13 — Multi-edge routing:** N Caddy edges + DNS round-robin; edge-failure resilience.
 - **P14 — Resource drivers (single-mode):** postgres/valkey/minio/volume/backup as

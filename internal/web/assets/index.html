@@ -373,6 +373,62 @@
         </div>
       </div>
 
+      <!-- evacuate/drain result -->
+      <section class="panel" x-show="evacResult" x-cloak x-transition style="margin-bottom:18px;">
+        <template x-if="evacResult">
+          <div>
+            <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">
+              <div>
+                <h2>
+                  <span x-text="evacResult.action === 'drain' ? 'Drain' : 'Evacuate'"></span>
+                  result — <span class="mono" x-text="evacResult.node"></span>
+                </h2>
+                <p class="hint" x-show="!evacResult.moved.length && !evacResult.skipped.length && !evacResult.failed.length">
+                  Nothing to move — no scheduler-placed surfaces were running there.
+                </p>
+              </div>
+              <button type="button" class="btn btn-ghost btn-sm" @click="evacResult = null">Dismiss</button>
+            </div>
+
+            <div class="evac-result__group" x-show="evacResult.moved.length">
+              <div class="subhead-sm">Moved</div>
+              <div class="list">
+                <template x-for="app in evacResult.moved" :key="app">
+                  <div class="list-item">
+                    <span class="list-item__name mono" x-text="app"></span>
+                    <span class="pill pill-healthy"><span class="dot dot-healthy"></span>moved</span>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <div class="evac-result__group" x-show="evacResult.skipped.length">
+              <div class="subhead-sm">Skipped (pinned)</div>
+              <div class="list">
+                <template x-for="app in evacResult.skipped" :key="app">
+                  <div class="list-item">
+                    <span class="list-item__name mono" x-text="app"></span>
+                    <span class="pill pill-retired"><span class="dot dot-retired"></span>pinned</span>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <div class="evac-result__group" x-show="evacResult.failed.length">
+              <div class="subhead-sm">Failed</div>
+              <div class="list">
+                <template x-for="f in evacResult.failed" :key="f.app">
+                  <div class="list-item">
+                    <span class="list-item__name mono" x-text="f.app"></span>
+                    <span class="pill pill-failed" :title="f.err"><span class="dot dot-failed"></span>failed</span>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </div>
+        </template>
+      </section>
+
       <!-- loading -->
       <div class="grid" x-show="nodesLoading" x-cloak>
         <template x-for="i in 2" :key="i">
@@ -390,7 +446,7 @@
       <div class="table-wrap" x-show="!nodesLoading && nodes.length > 0" x-cloak>
         <table class="table">
           <thead>
-            <tr><th>Name</th><th>Pool</th><th>SSH host</th><th>Mesh addr</th><th>Agent URL</th><th>Transport</th><th>Reachable</th><th></th></tr>
+            <tr><th>Name</th><th>Pool</th><th>SSH host</th><th>Mesh addr</th><th>Agent URL</th><th>Transport</th><th>Reachable</th><th>Schedulable</th><th></th></tr>
           </thead>
           <tbody>
             <template x-for="n in nodes" :key="n.name">
@@ -407,10 +463,27 @@
                     <span x-text="n.reachable ? 'reachable' : 'unreachable'"></span>
                   </span>
                 </td>
+                <td>
+                  <span class="pill" :class="n.schedulable ? 'pill-healthy' : 'pill-cordoned'">
+                    <span class="dot" :class="n.schedulable ? 'dot-healthy' : 'dot-cordoned'"></span>
+                    <span x-text="n.schedulable ? 'schedulable' : 'cordoned'"></span>
+                  </span>
+                </td>
                 <td style="text-align:right;">
-                  <button type="button" class="btn btn-sm btn-danger" @click="removeNode(n.name)" :disabled="nodeRemoveBusy === n.name">
-                    <span x-text="nodeRemoveBusy === n.name ? 'Removing…' : 'Remove'"></span>
-                  </button>
+                  <div class="node-actions">
+                    <button type="button" class="btn btn-sm" @click="evacuateNode(n.name)" :disabled="nodeBusy(n.name)" title="Move scheduler-placed surfaces off this node, without cordoning it">
+                      <span x-text="nodeActionBusy === 'evacuate:' + n.name ? 'Evacuating…' : 'Evacuate'"></span>
+                    </button>
+                    <button type="button" class="btn btn-sm btn-danger" x-show="n.schedulable" @click="drainNode(n.name)" :disabled="nodeBusy(n.name)" title="Cordon then evacuate — take this node out of service">
+                      <span x-text="nodeActionBusy === 'drain:' + n.name ? 'Draining…' : 'Drain'"></span>
+                    </button>
+                    <button type="button" class="btn btn-sm btn-signal" x-show="!n.schedulable" @click="uncordonNode(n.name)" :disabled="nodeBusy(n.name)" title="Make this node eligible for scheduler placement again">
+                      <span x-text="nodeActionBusy === 'uncordon:' + n.name ? 'Uncordoning…' : 'Uncordon'"></span>
+                    </button>
+                    <button type="button" class="btn btn-sm btn-ghost" @click="removeNode(n.name)" :disabled="nodeRemoveBusy === n.name">
+                      <span x-text="nodeRemoveBusy === n.name ? 'Removing…' : 'Remove'"></span>
+                    </button>
+                  </div>
                 </td>
               </tr>
             </template>
@@ -503,6 +576,9 @@
                       <span class="pill" :class="n.reachable ? 'pill-healthy' : 'pill-failed'">
                         <span class="dot" :class="n.reachable ? 'dot-healthy' : 'dot-failed'"></span>
                         <span x-text="n.reachable ? 'reachable' : 'unreachable'"></span>
+                      </span>
+                      <span class="pill pill-cordoned" style="margin-left:6px;" x-show="n.cordoned" x-cloak>
+                        <span class="dot dot-cordoned"></span>cordoned
                       </span>
                     </td>
                     <td>

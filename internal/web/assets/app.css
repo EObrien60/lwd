@@ -510,6 +510,25 @@ button { cursor: pointer; }
 }
 
 /* ---------------------------------------------------------------------- */
+/* Node lifecycle (drain / evacuate / uncordon)                           */
+/* ---------------------------------------------------------------------- */
+
+.node-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* cordoned reuses the amber "signal" lamp already used for degraded/healing
+   surface states — "taken out of service deliberately", not a failure. */
+.pill-cordoned { background: var(--signal-pill-bg); color: var(--signal); }
+.dot-cordoned { background: var(--signal); box-shadow: 0 0 0 3px color-mix(in srgb, var(--signal) 22%, transparent); }
+
+.evac-result__group { margin-bottom: 14px; }
+.evac-result__group:last-child { margin-bottom: 0; }
+
+/* ---------------------------------------------------------------------- */
 /* Empty / loading / error states                                         */
 /* ---------------------------------------------------------------------- */
 

@@ -32,6 +32,9 @@ type DaemonClient interface {
 	Nodes(ctx context.Context) ([]client.NodeStatus, error)
 	AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL, pool string) error
 	RemoveNode(ctx context.Context, name string) error
+	Drain(ctx context.Context, name string) (reconciler.EvacuateResult, error)
+	Evacuate(ctx context.Context, name string) (reconciler.EvacuateResult, error)
+	Uncordon(ctx context.Context, name string) error
 	Health(ctx context.Context) (reconciler.Health, error)
 	Pools(ctx context.Context) ([]client.Pool, error)
 }
@@ -77,6 +80,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/nodes", s.handleNodes)
 	mux.HandleFunc("POST /api/nodes", s.handleNodeAdd)
 	mux.HandleFunc("DELETE /api/nodes/{name}", s.handleNodeRemove)
+	mux.HandleFunc("POST /api/nodes/{name}/drain", s.handleNodeDrain)
+	mux.HandleFunc("POST /api/nodes/{name}/evacuate", s.handleNodeEvacuate)
+	mux.HandleFunc("POST /api/nodes/{name}/uncordon", s.handleNodeUncordon)
 
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/pools", s.handlePools)

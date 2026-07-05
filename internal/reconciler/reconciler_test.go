@@ -1312,6 +1312,59 @@ func TestRollbackGitRedeploysPriorTag(t *testing.T) {
 	}
 }
 
+// TestRollbackPreservesScheduledImage covers the Phase 11b Task 5 folded fix:
+// rolling back a scheduler-placed ("movable") plain image app must preserve
+// the restored deployment's Scheduled provenance, not lose it. Before the
+// fix, Rollback's non-git branch delegated straight to Apply, which passes
+// the restored spec (its Node field already a concrete node from the
+// snapshot) through resolvePlacement — that sees a non-empty Node and
+// misclassifies it as an operator pin (Scheduled=false), exactly the bug
+// rollbackGitLocked already avoided for git apps by threading prev.Scheduled
+// through explicitly. rollbackImage now does the same for the image path.
+func TestRollbackPreservesScheduledImage(t *testing.T) {
+	r, _, _, fr, s := newSchedulingReconciler(t)
+	ctx := context.Background()
+	fr.ProbeStatus = 200
+
+	app := unpinnedApp("blog")
+	app.Health.Path = "/healthz"
+	app.Health.Timeout = shortTimeout
+	v1, err := r.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("v1 Apply: %v", err)
+	}
+	if !v1.Scheduled {
+		t.Fatalf("setup: want v1 scheduled, got %+v", v1)
+	}
+
+	app2 := unpinnedApp("blog")
+	app2.Image = "img:2"
+	app2.Health.Path = "/healthz"
+	app2.Health.Timeout = shortTimeout
+	if _, err := r.Apply(ctx, app2); err != nil {
+		t.Fatalf("v2 Apply: %v", err)
+	}
+
+	back, err := r.Rollback(ctx, "blog")
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if back.Image != v1.Image {
+		t.Errorf("Rollback image = %q, want %q (the prior tag)", back.Image, v1.Image)
+	}
+	if !back.Scheduled {
+		t.Errorf("Rollback().Scheduled = false, want true (provenance preserved from v1)")
+	}
+
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || !cur.Scheduled {
+		t.Errorf("current deployment after rollback = %+v, want Scheduled true", cur)
+	}
+}
+
 func TestRemoveGitDownsBacking(t *testing.T) {
 	r, f, fr, s, cf, _, _ := newTestReconcilerFull(t, &fakeResolver{vals: map[string]string{}})
 	app := testGitApp()

@@ -816,6 +816,239 @@ func TestMigrationFromPrePoolSchema(t *testing.T) {
 	}
 }
 
+// TestSchedulableRoundTrip covers Phase 11b Task 1: a node added without an
+// explicit Schedulable value defaults to schedulable (true) — a node is
+// schedulable when created; cordoning is an explicit follow-up action via
+// SetSchedulable, not something a caller opts into at AddNode time.
+func TestSchedulableRoundTrip(t *testing.T) {
+	s := openTemp(t)
+
+	n := Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", CreatedAt: time.Now()}
+	if err := s.AddNode(n); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	got, err := s.GetNode("web1")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("GetNode returned nil, want node")
+	}
+	if !got.Schedulable {
+		t.Fatalf("GetNode.Schedulable = %v, want true (default)", got.Schedulable)
+	}
+
+	if err := s.SetSchedulable("web1", false); err != nil {
+		t.Fatalf("SetSchedulable: %v", err)
+	}
+	got2, err := s.GetNode("web1")
+	if err != nil {
+		t.Fatalf("GetNode after cordon: %v", err)
+	}
+	if got2 == nil || got2.Schedulable {
+		t.Fatalf("GetNode.Schedulable after SetSchedulable(false) = %+v, want Schedulable=false", got2)
+	}
+
+	nodes, err := s.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].Schedulable {
+		t.Fatalf("ListNodes after cordon = %+v, want single cordoned node", nodes)
+	}
+
+	if err := s.SetSchedulable("web1", true); err != nil {
+		t.Fatalf("SetSchedulable(true): %v", err)
+	}
+	got3, err := s.GetNode("web1")
+	if err != nil {
+		t.Fatalf("GetNode after uncordon: %v", err)
+	}
+	if got3 == nil || !got3.Schedulable {
+		t.Fatalf("GetNode.Schedulable after SetSchedulable(true) = %+v, want Schedulable=true", got3)
+	}
+}
+
+// TestMigrationFromPreSchedulableSchema covers Phase 11b Task 1: a pre-11b
+// nodes table (no schedulable column) migrates cleanly on Open, and existing
+// rows default to schedulable (true) — a pre-existing node must not be
+// silently cordoned by the migration.
+func TestMigrationFromPreSchedulableSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lwd.db")
+
+	rawDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+
+	oldSchema := `
+	CREATE TABLE nodes (
+		name      TEXT    PRIMARY KEY,
+		ssh_host  TEXT    NOT NULL,
+		mesh_addr TEXT    NOT NULL,
+		created_at INTEGER NOT NULL,
+		agent_url TEXT    NOT NULL DEFAULT '',
+		pool      TEXT    NOT NULL DEFAULT 'default'
+	);
+	`
+	if _, err := rawDB.Exec(oldSchema); err != nil {
+		rawDB.Close()
+		t.Fatalf("create old schema: %v", err)
+	}
+
+	if _, err := rawDB.Exec(
+		`INSERT INTO nodes (name, ssh_host, mesh_addr, created_at, agent_url, pool) VALUES (?, ?, ?, ?, ?, ?)`,
+		"legacy", "deploy@legacy", "100.64.0.9", time.Now().Unix(), "", "default",
+	); err != nil {
+		rawDB.Close()
+		t.Fatalf("insert legacy row: %v", err)
+	}
+
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close raw DB: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (migrated): %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	got, err := s.GetNode("legacy")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("GetNode returned nil, want legacy row")
+	}
+	if got.SSHHost != "deploy@legacy" || got.MeshAddr != "100.64.0.9" {
+		t.Fatalf("GetNode data mismatch: got %+v", got)
+	}
+	if !got.Schedulable {
+		t.Fatalf("GetNode.Schedulable = %v, want true for migrated row", got.Schedulable)
+	}
+}
+
+// TestDeploymentScheduledRoundTrip covers Phase 11b Task 1: RecordDeployment
+// persists Scheduled, CurrentDeployment/PreviousDeployment/DeploymentsForApp
+// scan it back, and an unset Scheduled defaults to false.
+func TestDeploymentScheduledRoundTrip(t *testing.T) {
+	s := openTemp(t)
+
+	if _, err := s.RecordDeployment(Deployment{
+		App: "blog", Image: "img:1", ContainerID: "c1",
+		Status: StatusRunning, CreatedAt: time.Now(), Scheduled: true,
+	}); err != nil {
+		t.Fatalf("RecordDeployment: %v", err)
+	}
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || !cur.Scheduled {
+		t.Fatalf("CurrentDeployment.Scheduled = %+v, want true", cur)
+	}
+	if err := s.SetStatus(cur.ID, StatusRetired); err != nil {
+		t.Fatalf("SetStatus: %v", err)
+	}
+	prev, err := s.PreviousDeployment("blog")
+	if err != nil {
+		t.Fatalf("PreviousDeployment: %v", err)
+	}
+	if prev == nil || !prev.Scheduled {
+		t.Fatalf("PreviousDeployment.Scheduled = %+v, want true", prev)
+	}
+
+	if _, err := s.RecordDeployment(Deployment{
+		App: "blog", Image: "img:2", ContainerID: "c2",
+		Status: StatusRunning, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("RecordDeployment (default): %v", err)
+	}
+	cur2, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment (default): %v", err)
+	}
+	if cur2 == nil || cur2.Scheduled {
+		t.Fatalf("CurrentDeployment.Scheduled (default) = %+v, want false", cur2)
+	}
+
+	all, err := s.DeploymentsForApp("blog")
+	if err != nil {
+		t.Fatalf("DeploymentsForApp: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("DeploymentsForApp len = %d, want 2", len(all))
+	}
+	// Newest first: all[0] is the just-recorded default (false), all[1] the
+	// original Scheduled:true row.
+	if all[0].Scheduled {
+		t.Errorf("DeploymentsForApp[0].Scheduled = true, want false")
+	}
+	if !all[1].Scheduled {
+		t.Errorf("DeploymentsForApp[1].Scheduled = false, want true")
+	}
+}
+
+// TestMigrationFromPreScheduledSchema covers Phase 11b Task 1: a pre-11b
+// deployments table (no scheduled column) migrates cleanly on Open, and
+// existing rows default to Scheduled=false.
+func TestMigrationFromPreScheduledSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lwd.db")
+
+	rawDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+
+	oldSchema := `
+	CREATE TABLE deployments (
+		id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		app          TEXT    NOT NULL,
+		image        TEXT    NOT NULL,
+		container_id TEXT    NOT NULL,
+		status       TEXT    NOT NULL,
+		created_at   INTEGER NOT NULL,
+		spec         TEXT    NOT NULL DEFAULT '',
+		compose      TEXT    NOT NULL DEFAULT ''
+	);
+	CREATE INDEX idx_deployments_app ON deployments(app);
+	`
+	if _, err := rawDB.Exec(oldSchema); err != nil {
+		rawDB.Close()
+		t.Fatalf("create old schema: %v", err)
+	}
+
+	if _, err := rawDB.Exec(
+		`INSERT INTO deployments (app, image, container_id, status, created_at, spec, compose) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"legacy", "img:0", "c0", StatusRunning, time.Now().Unix(), "", "",
+	); err != nil {
+		rawDB.Close()
+		t.Fatalf("insert legacy row: %v", err)
+	}
+
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close raw DB: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (migrated): %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	cur, err := s.CurrentDeployment("legacy")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil {
+		t.Fatalf("CurrentDeployment returned nil, want legacy row")
+	}
+	if cur.Scheduled {
+		t.Fatalf("CurrentDeployment.Scheduled = %v, want false for migrated row", cur.Scheduled)
+	}
+}
+
 func TestDeleteNode(t *testing.T) {
 	s := openTemp(t)
 	n := Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", CreatedAt: time.Now()}
