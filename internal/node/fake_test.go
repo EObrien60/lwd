@@ -2,7 +2,9 @@ package node
 
 import (
 	"context"
+	"errors"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -116,4 +118,66 @@ func contains(xs []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestFakeImagePresent(t *testing.T) {
+	f := NewFake()
+	f.Images = map[string]bool{"img:1": true}
+
+	present, err := f.ImagePresent(context.Background(), "img:1")
+	if err != nil {
+		t.Fatalf("ImagePresent: %v", err)
+	}
+	if !present {
+		t.Error("expected img:1 to be present")
+	}
+
+	present, err = f.ImagePresent(context.Background(), "img:absent")
+	if err != nil {
+		t.Fatalf("ImagePresent: %v", err)
+	}
+	if present {
+		t.Error("expected img:absent to be absent")
+	}
+}
+
+func TestFakeSaveLoadImage(t *testing.T) {
+	f := NewFake()
+	ctx := context.Background()
+
+	rc, err := f.SaveImage(ctx, "img:1")
+	if err != nil {
+		t.Fatalf("SaveImage: %v", err)
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read saved tar: %v", err)
+	}
+	if len(b) == 0 {
+		t.Error("expected non-empty tar stream from SaveImage")
+	}
+
+	if err := f.LoadImage(ctx, strings.NewReader("faketar")); err != nil {
+		t.Fatalf("LoadImage: %v", err)
+	}
+	if !f.Loaded {
+		t.Error("expected LoadImage to mark Loaded")
+	}
+}
+
+func TestFakeSaveImageErr(t *testing.T) {
+	f := NewFake()
+	f.SaveErr = errors.New("boom")
+	if _, err := f.SaveImage(context.Background(), "img:1"); err == nil {
+		t.Fatal("expected SaveImage to propagate SaveErr")
+	}
+}
+
+func TestFakeLoadImageErr(t *testing.T) {
+	f := NewFake()
+	f.LoadErr = errors.New("boom")
+	if err := f.LoadImage(context.Background(), strings.NewReader("x")); err == nil {
+		t.Fatal("expected LoadImage to propagate LoadErr")
+	}
 }

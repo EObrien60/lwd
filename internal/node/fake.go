@@ -24,6 +24,17 @@ type Fake struct {
 	EnsureErr error
 	HealthErr error
 	RunErr    error
+	SaveErr   error
+	LoadErr   error
+
+	// Images is the set of image refs considered present on this fake node.
+	Images map[string]bool
+
+	// Loaded is set true by a successful LoadImage call.
+	Loaded bool
+	// LastLoaded captures the bytes passed to the most recent successful
+	// LoadImage call, so tests can assert on the transferred content.
+	LastLoaded []byte
 
 	// HealthState and DockerHealth are returned by ContainerHealth for any
 	// container ID. HealthState defaults to "running" for created containers
@@ -167,6 +178,42 @@ func (f *Fake) ConnectContainerToNetwork(ctx context.Context, containerID, netwo
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("ConnectContainerToNetwork:" + containerID + ":" + network)
+	return nil
+}
+
+// ImagePresent reports whether ref is in the Images set.
+func (f *Fake) ImagePresent(ctx context.Context, ref string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("ImagePresent:" + ref)
+	return f.Images[ref], nil
+}
+
+// SaveImage returns a canned tar-like stream unless SaveErr is set.
+func (f *Fake) SaveImage(ctx context.Context, ref string) (io.ReadCloser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("SaveImage:" + ref)
+	if f.SaveErr != nil {
+		return nil, f.SaveErr
+	}
+	return io.NopCloser(strings.NewReader("faketar")), nil
+}
+
+// LoadImage drains r and marks Loaded, unless LoadErr is set.
+func (f *Fake) LoadImage(ctx context.Context, r io.Reader) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("LoadImage")
+	if f.LoadErr != nil {
+		return f.LoadErr
+	}
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	f.LastLoaded = b
+	f.Loaded = true
 	return nil
 }
 
