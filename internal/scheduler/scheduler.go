@@ -34,8 +34,11 @@ type Requirements struct {
 // error if no reachable, schedulable node exists in the pool, or if none of
 // those nodes have enough capacity to satisfy req. A cordoned node
 // (Schedulable: false) is excluded exactly like an unreachable one — it is
-// simply not a candidate, so it shares the same "no reachable nodes" error
-// rather than a separate message.
+// simply not a candidate, so both cases share the single "no schedulable
+// node in pool" empty-candidate error (a node that is unreachable OR
+// cordoned is "not schedulable"). The separate "has capacity" error covers
+// the distinct case where reachable, schedulable candidates exist but none
+// has enough room.
 func Place(candidates []NodeInfo, pool string, req Requirements) (string, error) {
 	if pool == "" {
 		pool = "default"
@@ -48,7 +51,7 @@ func Place(candidates []NodeInfo, pool string, req Requirements) (string, error)
 		}
 	}
 	if len(inPool) == 0 {
-		return "", fmt.Errorf("no reachable nodes in pool %q", pool)
+		return "", fmt.Errorf("no schedulable node in pool %q", pool)
 	}
 
 	var fitting []NodeInfo

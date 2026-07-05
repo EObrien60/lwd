@@ -129,8 +129,8 @@ func TestPlaceNoReachableNodes(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "no reachable nodes in pool") {
-		t.Fatalf("expected 'no reachable nodes in pool' error, got: %v", err)
+	if !strings.Contains(err.Error(), "no schedulable node in pool") {
+		t.Fatalf("expected 'no schedulable node in pool' error, got: %v", err)
 	}
 }
 
@@ -151,7 +151,7 @@ func TestPlaceNoneFit(t *testing.T) {
 // TestPlaceExcludesCordoned covers Phase 11b Task 2: a cordoned node
 // (Schedulable: false) must never receive a new placement, even when it is
 // otherwise the most-free candidate in the pool. If it is the only candidate
-// in the pool, Place must report an error (the same "no reachable nodes in
+// in the pool, Place must report an error (the same "no schedulable node in
 // pool" message used for unreachable nodes — a cordoned node is simply not a
 // candidate) rather than picking it.
 func TestPlaceExcludesCordoned(t *testing.T) {
@@ -175,10 +175,10 @@ func TestPlaceExcludesCordoned(t *testing.T) {
 		t.Fatal("expected error when the only candidate is cordoned, got nil")
 	}
 	// A cordoned node is simply not a candidate, same as an unreachable one:
-	// the empty-candidate-set error message stays "no reachable nodes in pool
-	// %q" rather than growing a separate cordoned-specific message.
-	if !strings.Contains(err.Error(), "no reachable nodes in pool") {
-		t.Fatalf("expected 'no reachable nodes in pool' error, got: %v", err)
+	// both share the single "no schedulable node in pool %q" empty-candidate
+	// error (a node that is unreachable OR cordoned is "not schedulable").
+	if !strings.Contains(err.Error(), "no schedulable node in pool") {
+		t.Fatalf("expected 'no schedulable node in pool' error, got: %v", err)
 	}
 }
 
