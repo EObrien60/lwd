@@ -35,14 +35,17 @@ const defaultReconcileInterval = 15 * time.Second
 
 // ReconcileInterval returns the delay between passes of the continuous
 // reconciler loop (LWD_RECONCILE_INTERVAL, parsed with time.ParseDuration; an
-// empty or unparseable value falls back to the 15s default).
+// empty, unparseable, or non-positive value falls back to the 15s default).
+// The non-positive guard matters: this value is fed straight into
+// time.NewTicker, which panics on a zero or negative duration, so a
+// misconfigured "0"/"0s"/"-5s" must never reach it.
 func ReconcileInterval() time.Duration {
 	v := os.Getenv("LWD_RECONCILE_INTERVAL")
 	if v == "" {
 		return defaultReconcileInterval
 	}
 	d, err := time.ParseDuration(v)
-	if err != nil {
+	if err != nil || d <= 0 {
 		return defaultReconcileInterval
 	}
 	return d

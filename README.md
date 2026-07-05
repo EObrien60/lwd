@@ -488,17 +488,25 @@ successful `apply`/`rollback` (so a bad deploy gets a fast first look rather
 than waiting out the interval). Each pass recovers its own panics and logs
 its own errors — a bad reconcile never takes down the daemon.
 
-**What actually gets healed: single-service surfaces only** (`image` or
-`[git]`-built apps, with or without `[[services]]`) — the same population
-`lwd rollback` operates on. Each pass checks the current deployment's
-container; if it's gone/exited/otherwise dead, the reconciler heals it by
-running the exact blue-green flow `apply` itself uses (recreate — a git app's
-already-built image tag is reused, never rebuilt), then re-points the route
-and records a fresh deployment row, exactly as if you'd run `lwd rollback` or
-`redeploy` by hand. Repeated failures back off exponentially (15s, 30s, 1m,
-...) and give up after `LWD_HEAL_MAX_ATTEMPTS` consecutive attempts (default
-`5`), at which point the app is reported `failed` and left alone rather than
-retried forever.
+**What actually gets healed: single-service surfaces that have CRASHED,
+EXITED, or otherwise gone missing** (`image` or `[git]`-built apps, with or
+without `[[services]]`) — the same population `lwd rollback` operates on.
+Each pass checks the current deployment's container; if it's not `running`
+at all (gone/exited/crashed), the reconciler heals it by running the exact
+blue-green flow `apply` itself uses (recreate — a git app's already-built
+image tag is reused, never rebuilt), then re-points the route and records a
+fresh deployment row, exactly as if you'd run `lwd rollback` or `redeploy` by
+hand. Repeated failures back off exponentially (15s, 30s, 1m, ...) and give
+up after `LWD_HEAL_MAX_ATTEMPTS` consecutive attempts (default `5`), at which
+point the app is reported `failed` and left alone rather than retried
+forever.
+
+A container that is **running but reports Docker `HEALTHCHECK`-unhealthy is
+NOT detected or healed by this loop** — it's reported `healthy` in the
+snapshot, same as an actually-healthy container. Layered self-healing based
+on a running container's `HEALTHCHECK` status is out of scope for this
+milestone; today it only recreates surfaces that Docker itself reports as
+crashed, exited, or gone.
 
 **What does *not* get healed:**
 

@@ -102,16 +102,36 @@ func (r *Reconciler) reconcileApp(ctx context.Context, app string) *AppHealth {
 }
 
 // tryHeal attempts to self-heal app's dead surface (cur, its current
-// deployment row), gated by a per-app attempt count and exponential backoff:
-// once config.HealMaxAttempts consecutive attempts have failed, it gives up
+// deployment row as last observed by reconcileApp, WITHOUT r.mu held), gated
+// by a per-app attempt count and exponential backoff: once
+// config.HealMaxAttempts consecutive attempts have failed, it gives up
 // (SurfaceFailed) without trying again; between attempts, a caller that comes
 // back before the backoff window elapses is told to wait (SurfaceDegraded)
 // rather than retrying immediately. It takes r.mu for its whole body since a
 // heal actually redeploys (via healSurfaceLocked, which itself assumes r.mu
 // is already held) and must not interleave with a concurrent Apply.
+//
+// Because cur was read lock-free, the first thing it does after acquiring
+// r.mu is re-fetch the current deployment and bail (nil, no AppHealth entry)
+// if it no longer matches cur — see the comment inline below for why.
 func (r *Reconciler) tryHeal(ctx context.Context, app string, cur *store.Deployment) *AppHealth {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// Re-validate under the lock: reconcileApp observed `cur` dead without
+	// holding r.mu, and a manual Apply/Rollback/Remove (all serialize on
+	// r.mu) may have superseded it in the meantime. Healing from a stale
+	// snapshot would resurrect a just-removed app or revert a newer deploy.
+	// If the current deployment is gone (removed/retired) or is a different
+	// row, a manual action won — skip; the next pass re-observes reality.
+	fresh, err := r.store.CurrentDeployment(app)
+	if err != nil {
+		return &AppHealth{App: app, State: SurfaceDegraded, LastError: "recheck current deployment: " + err.Error(), UpdatedAt: time.Now()}
+	}
+	if fresh == nil || fresh.ID != cur.ID {
+		return nil
+	}
+	cur = fresh
 
 	hs := r.heal[app]
 	if hs == nil {

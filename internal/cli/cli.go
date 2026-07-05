@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"lwd/internal/api"
 	"lwd/internal/build"
@@ -169,7 +170,12 @@ func runDaemon() int {
 		}
 	case <-ctx.Done():
 		fmt.Println("lwd daemon shutting down")
-		if err := httpSrv.Shutdown(context.Background()); err != nil {
+		// Bounded, not context.Background(): an in-flight `logs?follow`
+		// stream is long-lived by design, and an unbounded Shutdown would
+		// wait on it forever instead of letting the process exit.
+		sctx, scancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer scancel()
+		if err := httpSrv.Shutdown(sctx); err != nil {
 			fmt.Fprintln(os.Stderr, "shutdown:", err)
 			return 1
 		}

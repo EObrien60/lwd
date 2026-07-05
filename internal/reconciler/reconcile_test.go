@@ -478,6 +478,125 @@ func TestReconcileConcurrentWithApply(t *testing.T) {
 	}
 }
 
+// TestTryHealSkipsSupersededDeploy covers the FIX 1 TOCTOU guard: tryHeal is
+// handed a *store.Deployment snapshot (cur) that reconcileApp read WITHOUT
+// r.mu held. If a manual Apply lands in the window between that read and
+// tryHeal's lock — landing a v2 deployment while tryHeal is still holding a
+// stale v1 snapshot — tryHeal must re-check under the lock and skip rather
+// than healing (redeploying) the superseded v1, which would silently undo
+// the v2 the operator just shipped.
+func TestTryHealSkipsSupersededDeploy(t *testing.T) {
+	r, f, _, s := newTestReconciler(t)
+	ctx := context.Background()
+	app := testApp()
+	app.Health.Timeout = shortTimeout
+
+	if _, err := r.Apply(ctx, app); err != nil {
+		t.Fatalf("initial Apply (v1): %v", err)
+	}
+	v1cur, err := s.CurrentDeployment(app.Name)
+	if err != nil || v1cur == nil {
+		t.Fatalf("CurrentDeployment after v1 Apply: %v, %+v", err, v1cur)
+	}
+
+	// A manual Apply(v2) supersedes v1 — simulating it landing in the window
+	// between reconcileApp's lock-free read of v1cur and tryHeal's r.mu.Lock.
+	app2 := testApp()
+	app2.Image = "img:2"
+	if _, err := r.Apply(ctx, app2); err != nil {
+		t.Fatalf("second Apply (v2): %v", err)
+	}
+	v2cur, err := s.CurrentDeployment(app.Name)
+	if err != nil || v2cur == nil {
+		t.Fatalf("CurrentDeployment after v2 Apply: %v, %+v", err, v2cur)
+	}
+	if v2cur.ID == v1cur.ID {
+		t.Fatalf("want v2 to be a new deployment row, got same ID %d", v2cur.ID)
+	}
+
+	preRun := countPrefix(f.Calls, "RunContainer:")
+
+	// Call tryHeal directly with the stale v1cur snapshot, exactly as
+	// reconcileApp would if it had observed v1's container dead before the
+	// v2 Apply landed. tryHeal takes r.mu itself (for its whole body), so it
+	// must NOT already be held here — that would deadlock.
+	ah := r.tryHeal(ctx, app.Name, v1cur)
+
+	if ah != nil {
+		t.Errorf("tryHeal(stale v1cur) = %+v, want nil (superseded heal skipped)", ah)
+	}
+
+	postRun := countPrefix(f.Calls, "RunContainer:")
+	if postRun != preRun {
+		t.Errorf("want no RunContainer call from a superseded heal, pre=%d post=%d calls=%v", preRun, postRun, f.Calls)
+	}
+
+	after, err := s.CurrentDeployment(app.Name)
+	if err != nil {
+		t.Fatalf("CurrentDeployment after tryHeal: %v", err)
+	}
+	if after == nil || after.ID != v2cur.ID || after.Image != "img:2" {
+		t.Errorf("want current deployment unchanged from v2 %+v, got %+v", v2cur, after)
+	}
+}
+
+// TestReconcileDoesNotResurrectRemovedApp covers the FIX 1 TOCTOU guard from
+// the Remove side: if an app's surface dies and, before the reconciler gets
+// to it, the app is removed (`lwd rm`) — retiring its current deployment row
+// entirely — a subsequent Reconcile pass must not resurrect it by running a
+// brand-new container for a deployment that no longer exists.
+func TestReconcileDoesNotResurrectRemovedApp(t *testing.T) {
+	r, f, fr, s := newTestReconciler(t)
+	ctx := context.Background()
+	app := testApp()
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	dep, err := r.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("initial Apply: %v", err)
+	}
+
+	reach := newFakeReach()
+	r.SetReachability(reach)
+
+	// Simulate the current container having died (see
+	// TestReconcileHealsDeadSurface for why RemoveContainer, not
+	// HealthState, is used).
+	if err := f.RemoveContainer(ctx, dep.ContainerID); err != nil {
+		t.Fatalf("RemoveContainer (simulate death): %v", err)
+	}
+
+	// The app is removed before the reconciler observes/heals the dead
+	// container — retiring its current deployment row.
+	if err := r.Remove(ctx, app.Name); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	preRun := countPrefix(f.Calls, "RunContainer:")
+
+	if err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	postRun := countPrefix(f.Calls, "RunContainer:")
+	if postRun != preRun {
+		t.Errorf("want no RunContainer call resurrecting a removed app, pre=%d post=%d calls=%v", preRun, postRun, f.Calls)
+	}
+
+	cur, err := s.CurrentDeployment(app.Name)
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur != nil {
+		t.Errorf("want no current deployment after Remove+Reconcile (not resurrected), got %+v", cur)
+	}
+
+	if _, ok := fr.Routes[app.Domain]; ok {
+		t.Errorf("want no live route for removed app %q after Reconcile, got %+v", app.Domain, fr.Routes[app.Domain])
+	}
+}
+
 func findAppHealth(t *testing.T, h Health, app string) AppHealth {
 	t.Helper()
 	for _, ah := range h.Apps {

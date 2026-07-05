@@ -10,14 +10,18 @@ import (
 type SurfaceState string
 
 const (
-	// SurfaceHealthy means the app's surface is up and passing its health
-	// check (or has no declared health check and is simply running).
+	// SurfaceHealthy means the surface container is running (P10 heals only
+	// crashed/exited/missing surfaces; a running-but-Docker-unhealthy
+	// container is reported healthy and not recreated — see surfaceIsDead).
 	SurfaceHealthy SurfaceState = "healthy"
 	// SurfaceDegraded means the surface has been observed unhealthy but a
 	// heal attempt has not yet been (or is not currently being) made.
 	SurfaceDegraded SurfaceState = "degraded"
 	// SurfaceHealing means the reconciler is actively attempting to
-	// self-heal a dead/unhealthy surface.
+	// self-heal a dead/unhealthy surface. Reserved: not currently emitted,
+	// since tryHeal runs a heal synchronously and returns only a terminal
+	// healthy/degraded/failed AppHealth — no pass ever observes a heal
+	// mid-flight to report this state.
 	SurfaceHealing SurfaceState = "healing"
 	// SurfaceFailed means self-healing was attempted and exhausted
 	// (HealMaxAttempts reached) without the surface becoming healthy again.
