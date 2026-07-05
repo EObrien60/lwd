@@ -220,7 +220,7 @@ func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Depl
 	// Resolve the target node BEFORE touching anything (router, network,
 	// image, the currently-running deployment): an unknown/unreachable node
 	// fails the deploy closed, same as a secret resolve failure below.
-	n, meshAddr, isLocal, err := r.resolver.ResolveMeta(app.Node)
+	n, meshAddr, dockerHost, isLocal, err := r.resolver.ResolveMeta(app.Node)
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -269,7 +269,7 @@ func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Depl
 	// Backing services (if declared) are ensured before the surface starts,
 	// same as the git path: they're pinned infrastructure the surface may
 	// depend on at startup (e.g. a database URL pointing at it by name).
-	network, composeContent, err := r.ensureBacking(ctx, n, app, env)
+	network, composeContent, err := r.ensureBacking(ctx, n, app, env, dockerHost)
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -298,7 +298,7 @@ func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deploy
 
 	// Resolve the target node BEFORE touching anything, same rationale as
 	// applyImage.
-	n, meshAddr, isLocal, err := r.resolver.ResolveMeta(app.Node)
+	n, meshAddr, dockerHost, isLocal, err := r.resolver.ResolveMeta(app.Node)
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -334,7 +334,7 @@ func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deploy
 	// Backing first: the source clone and build are the slowest and most
 	// failure-prone steps, so bring up any declared pinned services (and fail
 	// fast if that doesn't work) before spending time on them.
-	network, composeContent, err := r.ensureBacking(ctx, n, app, env)
+	network, composeContent, err := r.ensureBacking(ctx, n, app, env, dockerHost)
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -449,7 +449,7 @@ func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App) (*store.Dep
 		return nil, fmt.Errorf("marshal spec snapshot: %w", err)
 	}
 
-	n, meshAddr, isLocal, err := r.resolver.ResolveMeta(app.Node)
+	n, meshAddr, dockerHost, isLocal, err := r.resolver.ResolveMeta(app.Node)
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -481,7 +481,7 @@ func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App) (*store.Dep
 	}
 	env := mergeEnv(app.Env, secretVals)
 
-	network, composeContent, err := r.ensureBacking(ctx, n, app, env)
+	network, composeContent, err := r.ensureBacking(ctx, n, app, env, dockerHost)
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -551,7 +551,15 @@ func shortSHA(sha string) string {
 // ONLY as the transient process env passed to `docker compose up` (UpSpec.Env
 // below), which is how compose actually resolves each ${NAME} reference at
 // up-time. env is never written to disk or to the store.
-func (r *Reconciler) ensureBacking(ctx context.Context, n node.Node, app *spec.App, env map[string]string) (network string, composeContent string, err error) {
+// dockerHost is the target node's DOCKER_HOST value from the same
+// ResolveMeta call that produced n ("" for the local node). When non-empty,
+// it is added to the process env `docker compose up` runs with, so a backing
+// project for an app placed on a remote node is created on that node's own
+// Docker daemon instead of the controller's local one — n's EnsureNetwork
+// call above already targets the remote node directly, but the Composer
+// shells out to the `docker compose` CLI plugin, which only respects
+// DOCKER_HOST from its own process environment, not from n.
+func (r *Reconciler) ensureBacking(ctx context.Context, n node.Node, app *spec.App, env map[string]string, dockerHost string) (network string, composeContent string, err error) {
 	if len(app.Services) == 0 {
 		return "", "", nil
 	}
@@ -575,7 +583,16 @@ func (r *Reconciler) ensureBacking(ctx context.Context, n node.Node, app *spec.A
 		return "", "", fmt.Errorf("close temp backing compose file: %w", err)
 	}
 
-	if err := r.compose.Up(ctx, compose.UpSpec{Project: "lwd-" + app.Name, File: tmp.Name(), Env: env}); err != nil {
+	composeEnv := env
+	if dockerHost != "" {
+		composeEnv = make(map[string]string, len(env)+1)
+		for k, v := range env {
+			composeEnv[k] = v
+		}
+		composeEnv["DOCKER_HOST"] = dockerHost
+	}
+
+	if err := r.compose.Up(ctx, compose.UpSpec{Project: "lwd-" + app.Name, File: tmp.Name(), Env: composeEnv}); err != nil {
 		return "", "", fmt.Errorf("backing compose up: %w", err)
 	}
 
@@ -978,8 +995,11 @@ func (r *Reconciler) removeCompose(ctx context.Context, appName string, cur *sto
 		return fmt.Errorf("close temp compose file: %w", err)
 	}
 
+	// A Phase-4 compose app's own remote-node DOCKER_HOST targeting is a
+	// separate, pre-existing gap (its Up call in applyCompose has the same
+	// limitation) — out of scope for this fix, so no env is passed here.
 	project := "lwd-" + appName
-	if err := r.compose.Down(ctx, project, tmp.Name()); err != nil {
+	if err := r.compose.Down(ctx, project, tmp.Name(), nil); err != nil {
 		return fmt.Errorf("compose down: %w", err)
 	}
 
@@ -1012,7 +1032,10 @@ func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cu
 		}
 	}
 
-	n, err := r.resolver.Resolve(nodeName)
+	// ResolveMeta (not plain Resolve): a PINNED backing project's teardown
+	// below needs the node's DOCKER_HOST too, to target the same remote
+	// daemon its Up originally ran against.
+	n, _, dockerHost, _, err := r.resolver.ResolveMeta(nodeName)
 	if err != nil {
 		return fmt.Errorf("resolve node %q: %w", nodeName, err)
 	}
@@ -1028,7 +1051,7 @@ func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cu
 	}
 
 	if cur != nil && cur.Compose != "" {
-		if err := r.downBacking(ctx, appName, cur.Compose); err != nil {
+		if err := r.downBacking(ctx, appName, cur.Compose, dockerHost); err != nil {
 			return err
 		}
 	}
@@ -1048,7 +1071,12 @@ func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cu
 // `docker compose down`, writing its stored rendered compose content
 // (composeContent) to a temp file since Down takes a file path. Named
 // volumes are not pruned by `down` without `-v`, so data persists.
-func (r *Reconciler) downBacking(ctx context.Context, appName, composeContent string) error {
+//
+// dockerHost is the app's node's DOCKER_HOST value ("" for the local node),
+// passed through so a remote node's backing project is torn down against its
+// own Docker daemon — the same one ensureBacking originally brought it up
+// on — rather than the controller's.
+func (r *Reconciler) downBacking(ctx context.Context, appName, composeContent, dockerHost string) error {
 	tmp, err := os.CreateTemp("", "lwd-backing-rm-*.yml")
 	if err != nil {
 		return fmt.Errorf("create temp backing compose file: %w", err)
@@ -1062,8 +1090,13 @@ func (r *Reconciler) downBacking(ctx context.Context, appName, composeContent st
 		return fmt.Errorf("close temp backing compose file: %w", err)
 	}
 
+	var env map[string]string
+	if dockerHost != "" {
+		env = map[string]string{"DOCKER_HOST": dockerHost}
+	}
+
 	project := "lwd-" + appName
-	if err := r.compose.Down(ctx, project, tmp.Name()); err != nil {
+	if err := r.compose.Down(ctx, project, tmp.Name(), env); err != nil {
 		return fmt.Errorf("backing compose down: %w", err)
 	}
 	return nil

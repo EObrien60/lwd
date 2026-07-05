@@ -12,19 +12,24 @@ import (
 type Resolver interface {
 	Resolve(nodeName string) (Node, error)
 	// ResolveMeta is Resolve plus placement metadata the reconciler needs to
-	// route a remote surface: isLocal reports whether nodeName resolved to
-	// the local node ("" or "local"), and meshAddr is the resolved node's
-	// WireGuard mesh address (always "" for the local node; a registered
-	// remote node's mesh_addr otherwise).
-	ResolveMeta(nodeName string) (n Node, meshAddr string, isLocal bool, err error)
+	// route a remote surface (and target remote backing services): isLocal
+	// reports whether nodeName resolved to the local node ("" or "local"),
+	// meshAddr is the resolved node's WireGuard mesh address (always "" for
+	// the local node; a registered remote node's mesh_addr otherwise), and
+	// dockerHost is the `DOCKER_HOST` value that points the `docker compose`
+	// CLI at that node's daemon (always "" for the local node — the CLI then
+	// inherits the ambient environment unmodified; "ssh://<sshHost>" for a
+	// registered remote node).
+	ResolveMeta(nodeName string) (n Node, meshAddr string, dockerHost string, isLocal bool, err error)
 }
 
-// remoteEntry is a cached remote Node alongside the mesh address its
-// registry row carried, so a repeat Resolve/ResolveMeta for the same name
-// doesn't need to re-run lookup.
+// remoteEntry is a cached remote Node alongside the mesh address and docker
+// host its registry row carried, so a repeat Resolve/ResolveMeta for the same
+// name doesn't need to re-run lookup.
 type remoteEntry struct {
-	node     Node
-	meshAddr string
+	node       Node
+	meshAddr   string
+	dockerHost string
 }
 
 // RegistryResolver is the production Resolver: "" and "local" resolve to a
@@ -58,38 +63,40 @@ func NewRegistryResolver(local Node, lookup func(name string) (sshHost, meshAddr
 // docker-over-ssh Node via NewRemoteSSH before returning it. An unregistered
 // name (lookup ok=false) produces an "unknown node" error.
 func (rr *RegistryResolver) Resolve(nodeName string) (Node, error) {
-	n, _, _, err := rr.ResolveMeta(nodeName)
+	n, _, _, _, err := rr.ResolveMeta(nodeName)
 	return n, err
 }
 
-// ResolveMeta is Resolve plus the resolved node's mesh address and whether
-// it is the local node. See Resolver.ResolveMeta.
-func (rr *RegistryResolver) ResolveMeta(nodeName string) (Node, string, bool, error) {
+// ResolveMeta is Resolve plus the resolved node's mesh address, its
+// DOCKER_HOST target, and whether it is the local node. See
+// Resolver.ResolveMeta.
+func (rr *RegistryResolver) ResolveMeta(nodeName string) (Node, string, string, bool, error) {
 	if nodeName == "" || nodeName == "local" {
-		return rr.local, "", true, nil
+		return rr.local, "", "", true, nil
 	}
 
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
 
 	if e, ok := rr.remotes[nodeName]; ok {
-		return e.node, e.meshAddr, false, nil
+		return e.node, e.meshAddr, e.dockerHost, false, nil
 	}
 
 	sshHost, meshAddr, ok, err := rr.lookup(nodeName)
 	if err != nil {
-		return nil, "", false, fmt.Errorf("look up node %q: %w", nodeName, err)
+		return nil, "", "", false, fmt.Errorf("look up node %q: %w", nodeName, err)
 	}
 	if !ok {
-		return nil, "", false, fmt.Errorf("unknown node %q", nodeName)
+		return nil, "", "", false, fmt.Errorf("unknown node %q", nodeName)
 	}
 
 	n, err := NewRemoteSSH(sshHost)
 	if err != nil {
-		return nil, "", false, fmt.Errorf("connect to node %q (ssh://%s): %w", nodeName, sshHost, err)
+		return nil, "", "", false, fmt.Errorf("connect to node %q (ssh://%s): %w", nodeName, sshHost, err)
 	}
-	rr.remotes[nodeName] = remoteEntry{node: n, meshAddr: meshAddr}
-	return n, meshAddr, false, nil
+	dockerHost := "ssh://" + sshHost
+	rr.remotes[nodeName] = remoteEntry{node: n, meshAddr: meshAddr, dockerHost: dockerHost}
+	return n, meshAddr, dockerHost, false, nil
 }
 
 // Invalidate evicts the cached remote node for name, if any, so a subsequent
@@ -122,22 +129,26 @@ func (fr FakeResolver) Resolve(nodeName string) (Node, error) {
 
 // ResolveMeta is Resolve plus placement metadata: isLocal is true iff
 // nodeName is "" or "local"; for any other (non-local) name mapped to a
-// *Fake, meshAddr is that Fake's MeshAddr field — letting reconciler tests
-// exercise remote-surface routing without a real registry, by simply setting
-// MeshAddr on the *node.Fake they map a non-local name to.
-func (fr FakeResolver) ResolveMeta(nodeName string) (Node, string, bool, error) {
+// *Fake, meshAddr is that Fake's MeshAddr field and dockerHost is that
+// Fake's DockerHost field — letting reconciler tests exercise remote-surface
+// routing and remote-backing DOCKER_HOST targeting without a real registry,
+// by simply setting MeshAddr/DockerHost on the *node.Fake they map a
+// non-local name to.
+func (fr FakeResolver) ResolveMeta(nodeName string) (Node, string, string, bool, error) {
 	n, err := fr.Resolve(nodeName)
 	if err != nil {
-		return nil, "", false, err
+		return nil, "", "", false, err
 	}
 	isLocal := nodeName == "" || nodeName == "local"
 	meshAddr := ""
+	dockerHost := ""
 	if !isLocal {
 		if fk, ok := n.(*Fake); ok {
 			meshAddr = fk.MeshAddr
+			dockerHost = fk.DockerHost
 		}
 	}
-	return n, meshAddr, isLocal, nil
+	return n, meshAddr, dockerHost, isLocal, nil
 }
 
 // Compile-time assertions that RegistryResolver and FakeResolver implement

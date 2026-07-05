@@ -40,6 +40,11 @@ type Fake struct {
 	// FakeResolver.ResolveMeta for a non-local name mapped to this Fake.
 	MeshAddr string
 
+	// DockerHost is this fake node's simulated DOCKER_HOST target (e.g.
+	// "ssh://deploy@web1"), read by FakeResolver.ResolveMeta for a non-local
+	// name mapped to this Fake.
+	DockerHost string
+
 	// Loaded is set true by a successful LoadImage call.
 	Loaded bool
 	// LastLoaded captures the bytes passed to the most recent successful

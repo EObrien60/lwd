@@ -18,6 +18,11 @@ type Fake struct {
 	// UpErr, if set, is returned by Up.
 	UpErr error
 
+	// LastDown captures the project/file/env passed to the most recent Down
+	// call, so tests can assert on it (e.g. DOCKER_HOST for a remote
+	// backing teardown).
+	LastDown DownSpec
+
 	// DownErr, if set, is returned by Down.
 	DownErr error
 
@@ -48,11 +53,12 @@ func (f *Fake) Up(ctx context.Context, spec UpSpec) error {
 	return f.UpErr
 }
 
-// Down records the call and returns DownErr.
-func (f *Fake) Down(ctx context.Context, project, file string) error {
+// Down records the call and spec, and returns DownErr.
+func (f *Fake) Down(ctx context.Context, project, file string, env map[string]string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("Down:" + project)
+	f.LastDown = DownSpec{Project: project, File: file, Env: env}
 	return f.DownErr
 }
 

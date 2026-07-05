@@ -1506,6 +1506,89 @@ func TestRemoteSurfaceRoutesToMeshAddr(t *testing.T) {
 	}
 }
 
+// TestBackingRunsOnRemoteNode covers the Phase 9a-Task 6 fix: an app placed
+// on a remote node (app.Node = "web1") that declares [[services]] must have
+// its backing compose project brought up (and, on Remove, torn down) against
+// that node's own Docker daemon — via DOCKER_HOST=ssh://<sshHost> in the
+// process env `docker compose` runs with — never the controller's local
+// Docker. Before this fix, ensureBacking/downBacking passed only the app's
+// resolved env/secrets, so DOCKER_HOST was never set and the backing project
+// (and a stray lwd-<app> network) landed on the controller instead of the
+// remote node. A local app's backing must see no DOCKER_HOST at all.
+func TestBackingRunsOnRemoteNode(t *testing.T) {
+	local := node.NewFake()
+	remote := node.NewFake() // web1
+	remote.MeshAddr = "100.64.0.2"
+	remote.DockerHost = "ssh://deploy@web1"
+	remote.Images = map[string]bool{"img:1": true} // skip the image-transfer path; backing routing is what's under test
+	fr := router.NewFakeRouter()
+	cf := compose.NewFake()
+	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	resolver := node.FakeResolver{"local": local, "web1": remote}
+	r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, cf, source.NewFake(), build.NewFake())
+
+	app := testApp()
+	app.Node = "web1"
+	app.Services = []spec.Service{{Name: "db", Image: "postgres:16"}}
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	if _, err := r.Apply(context.Background(), app); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if !contains(cf.Calls, "Up:lwd-blog") {
+		t.Fatalf("want backing compose Up for project lwd-blog, calls: %v", cf.Calls)
+	}
+	if cf.LastUp.Env["DOCKER_HOST"] != "ssh://deploy@web1" {
+		t.Errorf("LastUp.Env[DOCKER_HOST] = %q, want ssh://deploy@web1", cf.LastUp.Env["DOCKER_HOST"])
+	}
+	// The backing network is ensured on the remote node itself, not local.
+	if !contains(remote.Calls, "EnsureNetwork:lwd-blog") {
+		t.Errorf("want the backing network ensured on the remote node, calls: %v", remote.Calls)
+	}
+	for _, c := range local.Calls {
+		if c == "EnsureNetwork:lwd-blog" {
+			t.Errorf("want no stray backing network ensured on the local/controller node, calls: %v", local.Calls)
+		}
+	}
+
+	if err := r.Remove(context.Background(), app.Name); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if !contains(cf.Calls, "Down:lwd-blog") {
+		t.Fatalf("want backing compose Down for project lwd-blog, calls: %v", cf.Calls)
+	}
+	if cf.LastDown.Env["DOCKER_HOST"] != "ssh://deploy@web1" {
+		t.Errorf("LastDown.Env[DOCKER_HOST] = %q, want ssh://deploy@web1", cf.LastDown.Env["DOCKER_HOST"])
+	}
+
+	// A local app's backing must see no DOCKER_HOST at all.
+	localApp := testApp()
+	localApp.Name = "locblog"
+	localApp.Domain = "locblog.example.com"
+	localApp.Services = []spec.Service{{Name: "db", Image: "postgres:16"}}
+	localApp.Health.Timeout = shortTimeout
+
+	if _, err := r.Apply(context.Background(), localApp); err != nil {
+		t.Fatalf("Apply (local): %v", err)
+	}
+	if _, ok := cf.LastUp.Env["DOCKER_HOST"]; ok {
+		t.Errorf("want no DOCKER_HOST for a local app's backing Up, Env: %v", cf.LastUp.Env)
+	}
+
+	if err := r.Remove(context.Background(), localApp.Name); err != nil {
+		t.Fatalf("Remove (local): %v", err)
+	}
+	if cf.LastDown.Env != nil {
+		t.Errorf("want no env (no DOCKER_HOST) for a local app's backing Down, Env: %v", cf.LastDown.Env)
+	}
+}
+
 func contains(xs []string, want string) bool {
 	for _, x := range xs {
 		if x == want {

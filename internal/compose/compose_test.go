@@ -83,7 +83,8 @@ func TestFakeServiceContainerErr(t *testing.T) {
 func TestFakeDown(t *testing.T) {
 	f := NewFake()
 
-	if err := f.Down(context.Background(), "lwd-myapp", "/apps/myapp/compose.yaml"); err != nil {
+	downEnv := map[string]string{"DOCKER_HOST": "ssh://deploy@web1"}
+	if err := f.Down(context.Background(), "lwd-myapp", "/apps/myapp/compose.yaml", downEnv); err != nil {
 		t.Fatalf("Down: unexpected error: %v", err)
 	}
 
@@ -96,13 +97,17 @@ func TestFakeDown(t *testing.T) {
 	if !found {
 		t.Fatalf("Calls = %v, want to contain %q", f.Calls, "Down:lwd-myapp")
 	}
+	wantDown := DownSpec{Project: "lwd-myapp", File: "/apps/myapp/compose.yaml", Env: downEnv}
+	if !reflect.DeepEqual(f.LastDown, wantDown) {
+		t.Fatalf("LastDown = %+v, want %+v", f.LastDown, wantDown)
+	}
 }
 
 func TestFakeDownErr(t *testing.T) {
 	f := NewFake()
 	f.DownErr = errors.New("down failed")
 
-	err := f.Down(context.Background(), "lwd-myapp", "compose.yaml")
+	err := f.Down(context.Background(), "lwd-myapp", "compose.yaml", nil)
 	if !errors.Is(err, f.DownErr) {
 		t.Fatalf("Down err = %v, want %v", err, f.DownErr)
 	}

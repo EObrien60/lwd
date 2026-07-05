@@ -21,12 +21,12 @@ func TestRegistryResolverLocalEmptyAndNamed(t *testing.T) {
 			t.Errorf("Resolve(%q) = %v, want the local node", name, n)
 		}
 
-		n, meshAddr, isLocal, err := rr.ResolveMeta(name)
+		n, meshAddr, dockerHost, isLocal, err := rr.ResolveMeta(name)
 		if err != nil {
 			t.Fatalf("ResolveMeta(%q): %v", name, err)
 		}
-		if n != local || meshAddr != "" || !isLocal {
-			t.Errorf("ResolveMeta(%q) = (%v, %q, %v), want (local, \"\", true)", name, n, meshAddr, isLocal)
+		if n != local || meshAddr != "" || dockerHost != "" || !isLocal {
+			t.Errorf("ResolveMeta(%q) = (%v, %q, %q, %v), want (local, \"\", \"\", true)", name, n, meshAddr, dockerHost, isLocal)
 		}
 	}
 }
@@ -42,7 +42,7 @@ func TestRegistryResolverRemoteIsCached(t *testing.T) {
 		return "deploy@web1", "100.64.0.2", true, nil
 	})
 
-	n1, meshAddr, isLocal, err := rr.ResolveMeta("web1")
+	n1, meshAddr, dockerHost, isLocal, err := rr.ResolveMeta("web1")
 	if err != nil {
 		t.Fatalf("ResolveMeta: %v", err)
 	}
@@ -54,6 +54,9 @@ func TestRegistryResolverRemoteIsCached(t *testing.T) {
 	}
 	if meshAddr != "100.64.0.2" {
 		t.Errorf("meshAddr = %q, want 100.64.0.2", meshAddr)
+	}
+	if dockerHost != "ssh://deploy@web1" {
+		t.Errorf("dockerHost = %q, want ssh://deploy@web1", dockerHost)
 	}
 	if calls != 1 {
 		t.Fatalf("lookup calls = %d, want 1", calls)
@@ -71,13 +74,13 @@ func TestRegistryResolverRemoteIsCached(t *testing.T) {
 	}
 
 	// ResolveMeta should also hit the cache (and still report the cached
-	// mesh address) rather than calling lookup again.
-	n3, meshAddr2, isLocal2, err := rr.ResolveMeta("web1")
+	// mesh address and docker host) rather than calling lookup again.
+	n3, meshAddr2, dockerHost2, isLocal2, err := rr.ResolveMeta("web1")
 	if err != nil {
 		t.Fatalf("ResolveMeta (second time): %v", err)
 	}
-	if n3 != n1 || meshAddr2 != "100.64.0.2" || isLocal2 {
-		t.Errorf("ResolveMeta (cached) = (%v, %q, %v), want (%v, 100.64.0.2, false)", n3, meshAddr2, isLocal2, n1)
+	if n3 != n1 || meshAddr2 != "100.64.0.2" || dockerHost2 != "ssh://deploy@web1" || isLocal2 {
+		t.Errorf("ResolveMeta (cached) = (%v, %q, %q, %v), want (%v, 100.64.0.2, ssh://deploy@web1, false)", n3, meshAddr2, dockerHost2, isLocal2, n1)
 	}
 	if calls != 1 {
 		t.Errorf("lookup calls = %d, want still 1 (cached, lookup not called again)", calls)
@@ -180,19 +183,20 @@ func TestFakeResolverResolveMeta(t *testing.T) {
 	local := NewFake()
 	web1 := NewFake()
 	web1.MeshAddr = "100.64.0.2"
+	web1.DockerHost = "ssh://deploy@web1"
 	fr := FakeResolver{"local": local, "web1": web1}
 
-	n, meshAddr, isLocal, err := fr.ResolveMeta("local")
-	if err != nil || n != local || meshAddr != "" || !isLocal {
-		t.Fatalf("ResolveMeta(local) = (%v, %q, %v, %v), want (local, \"\", true, nil)", n, meshAddr, isLocal, err)
+	n, meshAddr, dockerHost, isLocal, err := fr.ResolveMeta("local")
+	if err != nil || n != local || meshAddr != "" || dockerHost != "" || !isLocal {
+		t.Fatalf("ResolveMeta(local) = (%v, %q, %q, %v, %v), want (local, \"\", \"\", true, nil)", n, meshAddr, dockerHost, isLocal, err)
 	}
 
-	n, meshAddr, isLocal, err = fr.ResolveMeta("web1")
-	if err != nil || n != web1 || meshAddr != "100.64.0.2" || isLocal {
-		t.Fatalf("ResolveMeta(web1) = (%v, %q, %v, %v), want (web1, 100.64.0.2, false, nil)", n, meshAddr, isLocal, err)
+	n, meshAddr, dockerHost, isLocal, err = fr.ResolveMeta("web1")
+	if err != nil || n != web1 || meshAddr != "100.64.0.2" || dockerHost != "ssh://deploy@web1" || isLocal {
+		t.Fatalf("ResolveMeta(web1) = (%v, %q, %q, %v, %v), want (web1, 100.64.0.2, ssh://deploy@web1, false, nil)", n, meshAddr, dockerHost, isLocal, err)
 	}
 
-	if _, _, _, err := fr.ResolveMeta("missing"); err == nil {
+	if _, _, _, _, err := fr.ResolveMeta("missing"); err == nil {
 		t.Fatal("want an error for an unmapped node name")
 	}
 }
