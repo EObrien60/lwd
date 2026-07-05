@@ -11,6 +11,7 @@ import (
 
 	"lwd/internal/api"
 	"lwd/internal/client"
+	"lwd/internal/reconciler"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -31,6 +32,7 @@ type DaemonClient interface {
 	Nodes(ctx context.Context) ([]client.NodeStatus, error)
 	AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL string) error
 	RemoveNode(ctx context.Context, name string) error
+	Health(ctx context.Context) (reconciler.Health, error)
 }
 
 // The real daemon client must satisfy DaemonClient. This assertion fails the
@@ -74,6 +76,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/nodes", s.handleNodes)
 	mux.HandleFunc("POST /api/nodes", s.handleNodeAdd)
 	mux.HandleFunc("DELETE /api/nodes/{name}", s.handleNodeRemove)
+
+	mux.HandleFunc("GET /api/health", s.handleHealth)
 
 	// Embedded static assets (placeholder UI; Task 5 replaces the contents
 	// of internal/web/assets/ with the crafted design). "/", "/login", and

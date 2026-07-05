@@ -34,6 +34,10 @@
         <button type="button" @click="openNodes()" :class="{ 'crumb__current': view === 'nodes' }">
           Nodes
         </button>
+        <span class="crumb__sep">/</span>
+        <button type="button" @click="openHealth()" :class="{ 'crumb__current': view === 'health' }">
+          Health
+        </button>
         <template x-if="view === 'detail'">
           <span style="display:contents">
             <span class="crumb__sep">/</span>
@@ -444,6 +448,118 @@
           </div>
         </form>
       </section>
+    </main>
+
+    <!-- ================================================================ -->
+    <!-- Health                                                            -->
+    <!-- ================================================================ -->
+    <main class="stage" x-show="view === 'health'" x-cloak>
+
+      <div class="banner" x-show="healthError" x-cloak x-transition>
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10 6.5v4M10 13.2h.01" stroke-linecap="round"/><circle cx="10" cy="10" r="7.5"/></svg>
+        <span x-text="healthError"></span>
+      </div>
+
+      <div class="stage-head">
+        <div>
+          <h1>Health</h1>
+          <p>What the continuous reconciler observes and self-heals — nodes, edge, and every app's surface — refreshed every few seconds.</p>
+        </div>
+        <div class="readout" x-show="!healthLoading && health">
+          <div><b x-text="health ? health.apps.filter(a => a.state === 'healthy').length : 0"></b><span>healthy</span></div>
+          <div><b x-text="health ? health.apps.filter(a => a.state !== 'healthy').length : 0"></b><span>attention</span></div>
+        </div>
+      </div>
+
+      <!-- loading -->
+      <div class="grid" x-show="healthLoading" x-cloak>
+        <template x-for="i in 3" :key="i">
+          <div class="skeleton" style="height:64px;"></div>
+        </template>
+      </div>
+
+      <template x-if="!healthLoading">
+        <div>
+          <div class="subhead" style="margin-top:0; padding-top:0; border-top:none;">Nodes</div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr><th>Name</th><th>Transport</th><th>Reachable</th><th>Updated</th></tr>
+              </thead>
+              <tbody>
+                <template x-for="n in (health ? health.nodes : [])" :key="n.name">
+                  <tr>
+                    <td class="mono" x-text="n.name"></td>
+                    <td><span class="tag" x-text="n.transport || '—'"></span></td>
+                    <td>
+                      <span class="pill" :class="n.reachable ? 'pill-healthy' : 'pill-failed'">
+                        <span class="dot" :class="n.reachable ? 'dot-healthy' : 'dot-failed'"></span>
+                        <span x-text="n.reachable ? 'reachable' : 'unreachable'"></span>
+                      </span>
+                    </td>
+                    <td class="mono" :title="fullTime(n.updated_at)" x-text="timeAgo(n.updated_at)"></td>
+                  </tr>
+                </template>
+                <tr x-show="!health || health.nodes.length === 0">
+                  <td colspan="4" style="color:var(--ink-3);">Node reachability isn't being observed yet.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="subhead">Edge</div>
+          <div class="table-wrap">
+            <table class="table">
+              <tbody>
+                <tr>
+                  <td class="mono">caddy</td>
+                  <td>
+                    <span class="pill" :class="health && health.edge.reachable ? 'pill-healthy' : 'pill-failed'">
+                      <span class="dot" :class="health && health.edge.reachable ? 'dot-healthy' : 'dot-failed'"></span>
+                      <span x-text="health && health.edge.reachable ? 'reachable' : 'unreachable'"></span>
+                    </span>
+                  </td>
+                  <td class="mono" style="text-align:right;" :title="health ? fullTime(health.edge.updated_at) : ''" x-text="health ? timeAgo(health.edge.updated_at) : '—'"></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="subhead">Apps</div>
+          <template x-if="!health || health.apps.length === 0">
+            <div class="state" style="padding: 30px 20px;">
+              <strong>No self-healed surfaces to report</strong>
+              <p>Only single-container (non-compose) apps are self-healed; this fills in once one exists.</p>
+            </div>
+          </template>
+          <div class="table-wrap" x-show="health && health.apps.length > 0">
+            <table class="table">
+              <thead>
+                <tr><th>App</th><th>State</th><th>Heal attempts</th><th>Last error</th><th>Updated</th></tr>
+              </thead>
+              <tbody>
+                <template x-for="a in (health ? health.apps : [])" :key="a.app">
+                  <tr>
+                    <td class="mono" x-text="a.app"></td>
+                    <td>
+                      <span class="pill" :class="'pill-' + healthKind(a.state)">
+                        <span class="dot" :class="'dot-' + healthKind(a.state)"></span>
+                        <span x-text="a.state"></span>
+                      </span>
+                    </td>
+                    <td>
+                      <span class="tag" x-show="a.heal_attempts > 0" x-text="a.heal_attempts"></span>
+                      <span x-show="!a.heal_attempts" style="color:var(--ink-3);">—</span>
+                    </td>
+                    <td class="mono" style="max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" :title="a.last_error" x-text="a.last_error || '—'"></td>
+                    <td class="mono" :title="fullTime(a.updated_at)" x-text="timeAgo(a.updated_at)"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </template>
     </main>
 
     <!-- ================================================================ -->

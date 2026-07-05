@@ -10,7 +10,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"lwd/internal/api"
 	"lwd/internal/build"
@@ -51,6 +54,8 @@ func Run(args []string) int {
 		return runSecret(args[1:])
 	case "node":
 		return runNode(args[1:])
+	case "health":
+		return runHealth(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
 		return 2
@@ -122,7 +127,23 @@ func runDaemon() int {
 	// resolver is passed as the api.NodeCacheInvalidator too: POST/DELETE
 	// /nodes call resolver.Invalidate so a node add/update/remove never
 	// leaves a stale cached docker-over-ssh client behind.
-	srv := api.New(reconciler.New(resolver, r, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI()), s, n, r, secStore, resolver)
+	rec := reconciler.New(resolver, r, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI())
+	srv := api.New(rec, s, n, r, secStore, resolver)
+
+	// Phase 10 continuous reconciler loop: rec.reach lets it observe node
+	// reachability (*node.RegistryResolver satisfies reconciler.Reachability
+	// directly), and nudge lets a successful manual Apply/Rollback wake it
+	// early instead of waiting out the ticker.
+	rec.SetReachability(resolver)
+	nudge := make(chan struct{}, 1)
+	rec.SetNudge(nudge)
+
+	// ctx is canceled on SIGINT/SIGTERM: it both stops the reconcile loop
+	// below and signals the graceful HTTP shutdown further down.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go reconciler.RunLoop(ctx, rec, config.ReconcileInterval(), nudge)
 
 	sock := config.SocketPath()
 	_ = os.Remove(sock) // clean stale socket
@@ -137,9 +158,27 @@ func runDaemon() int {
 	}
 	fmt.Println("lwd daemon listening on", sock)
 	httpSrv := &http.Server{Handler: srv.Handler()}
-	if err := httpSrv.Serve(ln); err != nil {
-		fmt.Fprintln(os.Stderr, "serve:", err)
-		return 1
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- httpSrv.Serve(ln) }()
+
+	select {
+	case err := <-serveErr:
+		if err != nil && err != http.ErrServerClosed {
+			fmt.Fprintln(os.Stderr, "serve:", err)
+			return 1
+		}
+	case <-ctx.Done():
+		fmt.Println("lwd daemon shutting down")
+		// Bounded, not context.Background(): an in-flight `logs?follow`
+		// stream is long-lived by design, and an unbounded Shutdown would
+		// wait on it forever instead of letting the process exit.
+		sctx, scancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer scancel()
+		if err := httpSrv.Shutdown(sctx); err != nil {
+			fmt.Fprintln(os.Stderr, "shutdown:", err)
+			return 1
+		}
 	}
 	return 0
 }
@@ -433,6 +472,44 @@ func runNodeLs() int {
 			reachable = "yes"
 		}
 		fmt.Printf("%-20s %-30s %-15s %-30s %-10s %s\n", n.Name, n.SSHHost, n.MeshAddr, n.AgentURL, n.Transport, reachable)
+	}
+	return 0
+}
+
+// runHealth prints the daemon's current reconciler health snapshot: node
+// reachability, edge (Caddy) reachability, and per-app self-heal state. args
+// is accepted (and ignored) for consistency with the other run* commands;
+// `lwd health` takes no flags or positional arguments.
+func runHealth(args []string) int {
+	h, err := newClient().Health(context.Background())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "health:", err)
+		return 1
+	}
+
+	fmt.Println("NODES")
+	fmt.Printf("%-20s %-10s %s\n", "NAME", "TRANSPORT", "REACHABLE")
+	for _, n := range h.Nodes {
+		reachable := "no"
+		if n.Reachable {
+			reachable = "yes"
+		}
+		fmt.Printf("%-20s %-10s %s\n", n.Name, n.Transport, reachable)
+	}
+
+	fmt.Println()
+	fmt.Println("EDGE")
+	edgeReachable := "no"
+	if h.Edge.Reachable {
+		edgeReachable = "yes"
+	}
+	fmt.Printf("caddy reachable: %s\n", edgeReachable)
+
+	fmt.Println()
+	fmt.Println("APPS")
+	fmt.Printf("%-20s %-10s %-14s %s\n", "APP", "STATE", "HEAL ATTEMPTS", "LAST ERROR")
+	for _, a := range h.Apps {
+		fmt.Printf("%-20s %-10s %-14d %s\n", a.App, a.State, a.HealAttempts, a.LastError)
 	}
 	return 0
 }

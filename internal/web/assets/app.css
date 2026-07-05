@@ -21,6 +21,12 @@
   --signal: #ffb454;
   --signal-dim: #b97e33;
   --signal-ink: #2b1a05;
+  /* derived from --signal itself (not redefined per theme below, unlike
+     --signal-dim): a low-alpha tint sized to sit alongside --ok-dim/
+     --bad-dim/--idle-dim as a pill background, since --signal-dim is
+     already spoken for elsewhere (button/border hover states) at a
+     brightness too high for a pill's quiet fill. */
+  --signal-pill-bg: color-mix(in srgb, var(--signal) 20%, transparent);
 
   /* semantic status */
   --ok: #5fd98a;
@@ -357,9 +363,13 @@ button { cursor: pointer; }
   text-transform: uppercase;
   border: 1px solid transparent;
 }
-.pill-running { background: var(--ok-dim); color: var(--ok); }
+.pill-running, .pill-healthy { background: var(--ok-dim); color: var(--ok); }
 .pill-failed { background: var(--bad-dim); color: var(--bad); }
 .pill-retired { background: var(--idle-dim); color: var(--idle); }
+/* degraded/healing (Health panel's SurfaceState vocabulary): the amber
+   signal lamp — "the operator should look, not panic" — distinct from the
+   idle-grey "nothing to see" of retired and the red "look now" of failed. */
+.pill-degraded, .pill-healing { background: var(--signal-pill-bg); color: var(--signal); }
 
 .dot {
   width: 8px;
@@ -368,13 +378,22 @@ button { cursor: pointer; }
   flex: none;
   background: var(--idle);
 }
-.dot-running { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); animation: pulse 2.2s ease-in-out infinite; }
+.dot-running, .dot-healthy { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); animation: pulse 2.2s ease-in-out infinite; }
 .dot-failed { background: var(--bad); box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 22%, transparent); }
 .dot-retired { background: var(--idle); }
+/* degraded sits still (waiting on backoff); healing pulses faster than the
+   healthy dot — visibly "working" rather than merely "alive". */
+.dot-degraded { background: var(--signal); box-shadow: 0 0 0 3px color-mix(in srgb, var(--signal) 22%, transparent); }
+.dot-healing { background: var(--signal); box-shadow: 0 0 0 3px color-mix(in srgb, var(--signal) 26%, transparent); animation: pulse-fast 0.9s ease-in-out infinite; }
 
 @keyframes pulse {
   0%, 100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
   50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--ok) 10%, transparent); }
+}
+
+@keyframes pulse-fast {
+  0%, 100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--signal) 26%, transparent); }
+  50% { box-shadow: 0 0 0 7px color-mix(in srgb, var(--signal) 12%, transparent); }
 }
 
 /* ---------------------------------------------------------------------- */

@@ -119,11 +119,26 @@ Everything on plain Linux. WireGuard mesh. No custom kernel/init/fs, no service 
   `node` argument on `lwd_apply`/`lwd_deploy_git`. Node capacity/health
   reporting is deferred to P11. See `README.md`'s
   [The lwd-agent transport](../README.md#the-lwd-agent-transport) section.
-- **P10 — next — Continuous reconciler:** apply-time → control loop; self-heal
-  crashed replicas/containers; observe node/edge health.
-- **P11 — Scheduler + capacity + pools:** nodes report capacity; apps declare
+- **P10 — Continuous reconciler — DONE (merged):** apply-time-only → an
+  always-on control loop (`reconciler.RunLoop`, started off the request path
+  at daemon startup: one pass immediately, then one per
+  `LWD_RECONCILE_INTERVAL` tick, plus a non-blocking nudge right after every
+  `apply`/`rollback`). Self-heals dead **surfaces** only (`image`/`[git]`
+  apps, with or without `[[services]]`) by recreating them through the
+  existing blue-green path (git apps reuse their built image tag, never
+  rebuild) — exponential backoff between attempts, giving up after
+  `LWD_HEAL_MAX_ATTEMPTS` (`SurfaceFailed`); `compose=` apps are deliberately
+  out of scope (their lifecycle belongs to `docker compose`, not lwd's
+  surface model). Node and edge (Caddy) reachability are observed and
+  reported in the same health snapshot but never acted on — no reschedule
+  yet, that's P11. Surfaced via `GET /health` → `client.Health` → `lwd
+  health` (CLI) and `lwd-web`'s **Health** panel. See `README.md`'s
+  [Self-healing & health](../README.md#self-healing--health) section.
+- **P11 — next — Scheduler + capacity + pools:** nodes report capacity; apps declare
   requirements; placement across nodes/pools; `node inspect/capacity/drain/evacuate`,
-  `pool create`. **Surface failover reschedules here** on node loss.
+  `pool create`. **Surface failover reschedules here** on node loss (cross-node
+  reschedule of a surface whose node has gone away — P10 only self-heals a
+  surface in place on its existing node).
 - **P12 — Surface replicas + LB:** `lwd scale api N`; Caddy load-balances across healthy
   replicas; blue/green across the replica set. Human scaling only (no autoscaler).
 - **P13 — Multi-edge routing:** N Caddy edges + DNS round-robin; edge-failure resilience.

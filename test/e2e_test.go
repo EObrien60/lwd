@@ -1501,6 +1501,121 @@ func cleanupLWDResources(t *testing.T, appLabels ...string) {
 	}
 }
 
+// selfHealAppLabel and selfHealDomain are the app name and domain used by
+// TestEndToEndSelfHeal.
+const selfHealAppLabel = "e2e-selfheal"
+const selfHealDomain = "selfheal.localhost"
+
+// TestEndToEndSelfHeal drives Phase 10's continuous reconciler through the
+// full self-heal path — deploy, surface dies, Reconcile heals it — entirely
+// against fakes (node.Fake, router.FakeRouter, a real store.Store): no Docker
+// daemon involved anywhere, so unlike every other test in this file it is NOT
+// gated by LWD_DOCKER_TEST and always runs as part of `go test ./...`.
+//
+// It mirrors internal/reconciler's own TestReconcileHealsDeadSurface (the
+// unit-level proof the heal path works) but from the outside: it builds the
+// reconciler exactly as cli.runDaemon does (reconciler.New with a real
+// store.Store) and asserts on the same store/router/node surface an operator
+// (or the web Health panel, or `lwd health`) would observe, rather than
+// reaching into the Reconciler's internals.
+func TestEndToEndSelfHeal(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	fn := node.NewFake()
+	fr := router.NewFakeRouter()
+	fr.ProbeStatus = http.StatusOK
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	secStore := secrets.NewStore(cipher, s)
+
+	rec := reconciler.New(node.FakeResolver{"local": fn}, fr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
+
+	app := &spec.App{
+		Name:   selfHealAppLabel,
+		Image:  "whoami:fake",
+		Domain: selfHealDomain,
+		Port:   8080,
+		Node:   "local",
+	}
+	app.Health.Timeout = 150 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dep, err := rec.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("initial Apply: %v", err)
+	}
+	if dep.Status != store.StatusRunning {
+		t.Fatalf("initial deployment status = %q, want %q", dep.Status, store.StatusRunning)
+	}
+	if dep.ContainerID == "" {
+		t.Fatalf("initial deployment has no ContainerID")
+	}
+
+	// Simulate the surface dying: remove its container from the fake node
+	// entirely, so a subsequent ContainerHealth reports it absent — the same
+	// "dead" signal reconciler.surfaceIsDead treats a removed/exited real
+	// container as (see node.Fake.ContainerHealth: HealthState defaults to
+	// "running" only for containers still tracked in its items map).
+	if err := fn.RemoveContainer(ctx, dep.ContainerID); err != nil {
+		t.Fatalf("RemoveContainer (simulate surface death): %v", err)
+	}
+
+	if err := rec.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// A brand-new surface must now be current, distinct from the dead one.
+	cur, err := s.CurrentDeployment(app.Name)
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil {
+		t.Fatalf("want a current deployment after self-heal, got none")
+	}
+	if cur.ContainerID == "" || cur.ContainerID == dep.ContainerID {
+		t.Errorf("want a new surface container after self-heal, got ContainerID=%q (original was %q)", cur.ContainerID, dep.ContainerID)
+	}
+	if cur.Status != store.StatusRunning {
+		t.Errorf("healed deployment status = %q, want %q", cur.Status, store.StatusRunning)
+	}
+
+	// The router's live route must point at the healed surface, not the dead
+	// one.
+	route, ok := fr.Routes[app.Domain]
+	if !ok {
+		t.Fatalf("want a live route for %q after self-heal", app.Domain)
+	}
+	if route.Upstream == "" {
+		t.Errorf("want a live route upstream set after self-heal, got %+v", route)
+	}
+
+	// The health snapshot (what GET /health, `lwd health`, and the web Health
+	// panel all read) must report the app healthy again post-heal.
+	snap := rec.HealthSnapshot()
+	var found bool
+	for _, ah := range snap.Apps {
+		if ah.App == app.Name {
+			found = true
+			if ah.State != reconciler.SurfaceHealthy {
+				t.Errorf("app health state = %q, want %q", ah.State, reconciler.SurfaceHealthy)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("want %q present in health snapshot Apps, got %+v", app.Name, snap.Apps)
+	}
+}
+
 // splitLines splits docker CLI output into non-empty trimmed lines.
 func splitLines(s string) []string {
 	var out []string

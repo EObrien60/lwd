@@ -11,6 +11,7 @@ import (
 	"net/http"
 
 	"lwd/internal/api"
+	"lwd/internal/reconciler"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -260,6 +261,25 @@ func (c *Client) Nodes(ctx context.Context) ([]NodeStatus, error) {
 		return nil, err
 	}
 	return nodes, nil
+}
+
+// Health returns the daemon's current reconciler health snapshot: per-node
+// reachability, the shared edge (router), and per-app surface health.
+func (c *Client) Health(ctx context.Context) (reconciler.Health, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/health"), nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return reconciler.Health{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return reconciler.Health{}, decodeErr(resp)
+	}
+	var h reconciler.Health
+	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
+		return reconciler.Health{}, err
+	}
+	return h, nil
 }
 
 // RemoveNode deregisters a node from the daemon's registry.

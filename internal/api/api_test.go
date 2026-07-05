@@ -810,6 +810,131 @@ func TestNodeListNilResolver(t *testing.T) {
 
 // TestNodeListIncludesReachability covers Phase 9b Task 6: GET /nodes reports
 // each node's transport and reachability, as decided by the resolver.
+// fakeReachability is a minimal reconciler.Reachability double for
+// TestHealthEndpoint: it reports every name as reachable over the given
+// transport, which is all the test needs to populate a non-empty node health
+// snapshot.
+type fakeReachability struct {
+	transport string
+}
+
+func (f fakeReachability) Reachable(ctx context.Context, name string) (string, bool) {
+	return f.transport, true
+}
+
+// TestHealthEndpoint covers Phase 10 Task 6: GET /health serves the
+// reconciler's current Health snapshot as JSON. It builds a Server directly
+// (rather than via newTestServer) so the test keeps a reference to the
+// underlying *reconciler.Reconciler, wires up reachability and a healthy
+// router, deploys one app, and runs Reconcile once — the same way the
+// daemon's background loop would before any client ever calls GET /health —
+// so the snapshot has a deterministic, non-empty shape to assert on.
+func TestHealthEndpoint(t *testing.T) {
+	f := node.NewFake()
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	rt := router.NewFakeRouter()
+	rt.HealthyResult = true
+	secStore := testSecretResolver(t, s, dir)
+	rec := reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
+	rec.SetReachability(fakeReachability{transport: "local"})
+	srv := New(rec, s, f, rt, secStore, nil)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	body, _ := json.Marshal(spec.App{Name: "blog", Image: "img:1", Port: 8080, Node: "local"})
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /apply: %v", err)
+	}
+	resp.Body.Close()
+
+	if err := rec.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	resp, err = http.Get(ts.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, b)
+	}
+	var health reconciler.Health
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !health.Edge.Reachable {
+		t.Errorf("Edge.Reachable = false, want true (router.Healthy returned true)")
+	}
+	var local *reconciler.NodeHealth
+	for i := range health.Nodes {
+		if health.Nodes[i].Name == "local" {
+			local = &health.Nodes[i]
+		}
+	}
+	if local == nil {
+		t.Fatalf("want 'local' present in Nodes, got %+v", health.Nodes)
+	}
+	if !local.Reachable || local.Transport != "local" {
+		t.Errorf("local node = %+v, want Reachable=true Transport=local", *local)
+	}
+	if len(health.Apps) != 1 || health.Apps[0].App != "blog" {
+		t.Fatalf("Apps = %+v, want one entry for blog", health.Apps)
+	}
+}
+
+// TestHealthEndpointEmptySnapshotNormalizesSlices covers the steady-state
+// case TestHealthEndpoint's happy path doesn't reach: a Health snapshot
+// before Reconcile has ever populated Nodes/Apps (or, per
+// reconciler.probeNodes' own doc comment, permanently for a daemon with no
+// Reachability configured / no image-or-git apps deployed) has both fields
+// nil, not empty. GET /health must still serve `"nodes":[]`/`"apps":[]`, not
+// `"nodes":null`/`"apps":null`, matching the non-nil-slice convention every
+// other list-shaped daemon endpoint (GET /apps, GET /nodes) already follows.
+func TestHealthEndpointEmptySnapshotNormalizesSlices(t *testing.T) {
+	f := node.NewFake()
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	rt := router.NewFakeRouter()
+	secStore := testSecretResolver(t, s, dir)
+	rec := reconciler.New(node.FakeResolver{"local": f}, rt, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
+	// Deliberately no SetReachability call and no deployed apps: the
+	// reconciler's zero-value Health has Nodes == nil and Apps == nil.
+	srv := New(rec, s, f, rt, secStore, nil)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if want := `"nodes":[]`; !strings.Contains(string(body), want) {
+		t.Errorf("body = %s, want it to contain %s", body, want)
+	}
+	if want := `"apps":[]`; !strings.Contains(string(body), want) {
+		t.Errorf("body = %s, want it to contain %s", body, want)
+	}
+}
+
 func TestNodeListIncludesReachability(t *testing.T) {
 	ts, inv := newTestServerWithInvalidator(t)
 

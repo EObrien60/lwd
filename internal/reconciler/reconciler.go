@@ -78,6 +78,25 @@ type Reconciler struct {
 	src      source.Git
 	bld      build.Builder
 	mu       sync.Mutex
+
+	// healthMu guards only health, populated by the Phase 10 continuous
+	// reconciler loop and read via HealthSnapshot. heal is guarded by r.mu
+	// instead (it's only ever touched by code paths that already hold it).
+	// reach and nudge are set once at startup via their setters below.
+	healthMu sync.RWMutex
+	health   Health
+	reach    Reachability
+	nudge    chan<- struct{}
+	heal     map[string]*healState
+}
+
+// healState tracks one app's in-progress self-heal attempts: how many
+// consecutive attempts have been made, and the earliest time the next
+// attempt is allowed to run (a backoff gate). Unexported: internal
+// bookkeeping for the loop added in a later Phase 10 task.
+type healState struct {
+	attempts     int
+	nextEligible time.Time
 }
 
 // New returns a Reconciler bound to a node.Resolver (used to place each
@@ -88,7 +107,68 @@ type Reconciler struct {
 // `docker compose`, a Git source used to clone git-built apps, and a Builder
 // used to `docker build` them.
 func New(resolver node.Resolver, r router.Router, s *store.Store, sec SecretResolver, comp compose.Composer, src source.Git, bld build.Builder) *Reconciler {
-	return &Reconciler{resolver: resolver, router: r, store: s, secrets: sec, compose: comp, src: src, bld: bld}
+	return &Reconciler{resolver: resolver, router: r, store: s, secrets: sec, compose: comp, src: src, bld: bld, heal: map[string]*healState{}}
+}
+
+// SetReachability supplies the Reachability implementation (typically a
+// *node.RegistryResolver) the continuous reconciler loop uses to observe
+// node health. Exists as a setter, rather than a New parameter, so New's
+// many existing call sites don't need to change.
+func (r *Reconciler) SetReachability(rr Reachability) {
+	r.reach = rr
+}
+
+// SetNudge supplies a channel the reconciler sends on (non-blocking) to wake
+// a waiting continuous-reconciler loop early — e.g. right after an Apply —
+// rather than it sitting idle until the next timer tick. Exists as a setter
+// for the same reason as SetReachability.
+func (r *Reconciler) SetNudge(ch chan<- struct{}) {
+	r.nudge = ch
+}
+
+// HealthSnapshot returns a deep copy of the reconciler's current health
+// view: a caller mutating the returned Health (or its Nodes/Apps elements)
+// cannot affect the reconciler's internal state.
+func (r *Reconciler) HealthSnapshot() Health {
+	r.healthMu.RLock()
+	defer r.healthMu.RUnlock()
+	return copyHealth(r.health)
+}
+
+// setHealth stores a deep copy of h as the reconciler's current health view.
+func (r *Reconciler) setHealth(h Health) {
+	r.healthMu.Lock()
+	defer r.healthMu.Unlock()
+	r.health = copyHealth(h)
+}
+
+// copyHealth returns a deep copy of h: fresh Nodes/Apps slices (with their
+// elements copied by value — none of them contain reference types), so
+// neither the source nor the returned copy alias the other's backing array.
+func copyHealth(h Health) Health {
+	out := Health{Edge: h.Edge}
+	if h.Nodes != nil {
+		out.Nodes = make([]NodeHealth, len(h.Nodes))
+		copy(out.Nodes, h.Nodes)
+	}
+	if h.Apps != nil {
+		out.Apps = make([]AppHealth, len(h.Apps))
+		copy(out.Apps, h.Apps)
+	}
+	return out
+}
+
+// signalNudge sends a non-blocking wake-up on r.nudge, if one has been set
+// via SetNudge. It never blocks: if the channel is unbuffered/full (a wake-up
+// is already pending), the send is silently skipped.
+func (r *Reconciler) signalNudge() {
+	if r.nudge == nil {
+		return
+	}
+	select {
+	case r.nudge <- struct{}{}:
+	default:
+	}
 }
 
 // localNode resolves the local node through the same resolver used for
@@ -212,13 +292,24 @@ func (r *Reconciler) Apply(ctx context.Context, app *spec.App) (*store.Deploymen
 		return nil, fmt.Errorf("invalid spec: %w", err)
 	}
 
-	if app.Git != nil {
-		return r.applyGit(ctx, app)
+	var dep *store.Deployment
+	var err error
+	switch {
+	case app.Git != nil:
+		dep, err = r.applyGit(ctx, app)
+	case app.Compose != "":
+		dep, err = r.applyCompose(ctx, app)
+	default:
+		dep, err = r.applyImage(ctx, app)
 	}
-	if app.Compose != "" {
-		return r.applyCompose(ctx, app)
+	// Wake a waiting continuous-reconciler loop (Phase 10) right after a
+	// successful manual deploy, rather than leaving it idle until the next
+	// ticker tick. Non-blocking: signalNudge is a no-op if no loop has been
+	// wired up via SetNudge (e.g. in tests) or a wake-up is already pending.
+	if err == nil {
+		r.signalNudge()
 	}
-	return r.applyImage(ctx, app)
+	return dep, err
 }
 
 // applyImage deploys a plain single-service image app via zero-downtime
@@ -441,7 +532,14 @@ func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deploy
 func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App) (*store.Deployment, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.rollbackGitLocked(ctx, app)
+}
 
+// rollbackGitLocked is rollbackGit's body, extracted so the Phase 10 heal
+// path (healSurfaceLocked) can redeploy a git app's recorded spec+built tag
+// while ALREADY holding r.mu — calling rollbackGit itself would deadlock.
+// Callers must hold r.mu.
+func (r *Reconciler) rollbackGitLocked(ctx context.Context, app *spec.App) (*store.Deployment, error) {
 	// Validate the declared shape (git url, build, domain, port, services...)
 	// against a copy with Image cleared: spec.Validate rejects a git app that
 	// declares Image (that combination is meaningless for user-authored
@@ -524,6 +622,42 @@ func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App) (*store.Dep
 	}
 
 	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr)
+}
+
+// healSurfaceLocked recreates a dead surface from cur, the app's current
+// recorded deployment row: it reconstructs the spec.App that produced it from
+// cur.Spec (the JSON snapshot captured at deploy time), pins Image back to
+// cur.Image, and redeploys through the existing blue-green path — reusing the
+// already-built/already-present image, never re-cloning or rebuilding a git
+// app. This is the Phase 10 control loop's self-heal primitive: called while
+// the loop ALREADY holds r.mu (it observed cur as dead via surfaceIsDead
+// under the same lock), so — unlike Rollback and Apply — it must NOT lock
+// r.mu itself; doing so would deadlock.
+func (r *Reconciler) healSurfaceLocked(ctx context.Context, cur *store.Deployment) (*store.Deployment, error) {
+	var restored spec.App
+	if cur.Spec == "" {
+		return nil, fmt.Errorf("no spec snapshot to heal %q", cur.App)
+	}
+	if err := json.Unmarshal([]byte(cur.Spec), &restored); err != nil {
+		return nil, fmt.Errorf("unmarshal spec snapshot for %q: %w", cur.App, err)
+	}
+	restored.Image = cur.Image
+	if restored.Git != nil {
+		return r.rollbackGitLocked(ctx, &restored) // reuses built tag, no clone/build
+	}
+	if err := restored.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid spec snapshot for %q: %w", cur.App, err)
+	}
+	return r.applyImage(ctx, &restored) // applyImage assumes r.mu held; image already present
+}
+
+// surfaceIsDead classifies a node.ContainerHealth observation (state, err) as
+// needing a heal: any error observing health, or any non-"running" state,
+// counts as dead. A container that has disappeared entirely may surface as
+// either an error or an empty/non-running state depending on the node.Node
+// implementation; both are treated the same way here.
+func surfaceIsDead(state string, err error) bool {
+	return err != nil || state != "running"
 }
 
 // mergeEnv merges an app's plain declared env with its resolved secret
@@ -733,7 +867,22 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, ap
 		return nil, fmt.Errorf("record deployment: %w", err)
 	}
 	dep.ID = id
+
+	// Every successful surface deploy — manual Apply, Rollback, or a Phase 10
+	// self-heal — clears the app's heal backoff: whatever was making it
+	// unhealthy (if anything) has now demonstrably been resolved by a fresh,
+	// health-gated container.
+	r.resetHeal(app.Name)
+
 	return &dep, nil
+}
+
+// resetHeal clears app's in-progress self-heal bookkeeping (attempt count and
+// backoff gate), if any. Called on every successful surface deploy so a
+// healthy redeploy doesn't carry forward a stale backoff from before it was
+// fixed. Callers must hold r.mu.
+func (r *Reconciler) resetHeal(app string) {
+	delete(r.heal, app)
 }
 
 // recordFailedSurface tears down a failed blue-green candidate: it removes
@@ -1205,7 +1354,15 @@ func (r *Reconciler) Rollback(ctx context.Context, app string) (*store.Deploymen
 	restored.Image = prev.Image
 
 	if restored.Git != nil {
-		return r.rollbackGit(ctx, &restored)
+		// rollbackGit bypasses Apply entirely (it redeploys the previous
+		// built tag directly), so it needs its own nudge on success; the
+		// Compose/image path below falls through to Apply, which already
+		// nudges on its own success return.
+		dep, err := r.rollbackGit(ctx, &restored)
+		if err == nil {
+			r.signalNudge()
+		}
+		return dep, err
 	}
 
 	if restored.Compose != "" {
