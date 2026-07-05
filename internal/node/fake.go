@@ -27,8 +27,18 @@ type Fake struct {
 	SaveErr   error
 	LoadErr   error
 
+	// ImagePresentErr, if set, is returned by ImagePresent instead of
+	// consulting Images — used to test the hard-fail path of
+	// reconciler.ensureImageOnNode (an inspect failure, as opposed to a
+	// clean "not present" answer).
+	ImagePresentErr error
+
 	// Images is the set of image refs considered present on this fake node.
 	Images map[string]bool
+
+	// MeshAddr is this fake node's simulated WireGuard mesh address, read by
+	// FakeResolver.ResolveMeta for a non-local name mapped to this Fake.
+	MeshAddr string
 
 	// Loaded is set true by a successful LoadImage call.
 	Loaded bool
@@ -85,14 +95,21 @@ func (f *Fake) RunContainer(ctx context.Context, spec RunSpec) (Container, error
 	}
 	f.seq++
 	var hostPort int
+	var primaryRequested bool
 	for _, pm := range spec.Publish {
 		if pm.ContainerPort == spec.Port {
 			hostPort = pm.HostPort
+			primaryRequested = true
 			break
 		}
 	}
-	if hostPort == 0 && len(spec.Publish) > 0 {
+	if !primaryRequested && len(spec.Publish) > 0 {
 		hostPort = spec.Publish[0].HostPort
+	}
+	if hostPort == 0 && len(spec.Publish) > 0 {
+		// Simulate Docker assigning an ephemeral host port for a
+		// HostPort:0 publish request (used for remote surfaces).
+		hostPort = 30000 + f.seq
 	}
 	var ip string
 	if spec.Network != "" {
@@ -181,13 +198,25 @@ func (f *Fake) ConnectContainerToNetwork(ctx context.Context, containerID, netwo
 	return nil
 }
 
-// ImagePresent reports whether ref is in the Images set.
+// ImagePresent reports whether ref is in the Images set, or returns
+// ImagePresentErr if set (simulating an inspect failure distinct from a
+// clean "not present" answer).
 func (f *Fake) ImagePresent(ctx context.Context, ref string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("ImagePresent:" + ref)
+	if f.ImagePresentErr != nil {
+		return false, f.ImagePresentErr
+	}
 	return f.Images[ref], nil
 }
+
+// fakeImageTarPrefix marks the canned stream SaveImage returns as carrying a
+// specific ref, so a subsequent LoadImage on another Fake (simulating the
+// transfer path) can mark that same ref present — mirroring how a real
+// `docker save`/`docker load` round-trip carries the image identity in the
+// tar itself.
+const fakeImageTarPrefix = "faketar:"
 
 // SaveImage returns a canned tar-like stream unless SaveErr is set.
 func (f *Fake) SaveImage(ctx context.Context, ref string) (io.ReadCloser, error) {
@@ -197,10 +226,13 @@ func (f *Fake) SaveImage(ctx context.Context, ref string) (io.ReadCloser, error)
 	if f.SaveErr != nil {
 		return nil, f.SaveErr
 	}
-	return io.NopCloser(strings.NewReader("faketar")), nil
+	return io.NopCloser(strings.NewReader(fakeImageTarPrefix + ref)), nil
 }
 
-// LoadImage drains r and marks Loaded, unless LoadErr is set.
+// LoadImage drains r and marks Loaded, unless LoadErr is set. If r carries a
+// fakeImageTarPrefix-tagged ref (as produced by another Fake's SaveImage),
+// that ref is added to Images, so a subsequent ImagePresent on the loaded ref
+// reports true — completing the simulated save|load transfer round-trip.
 func (f *Fake) LoadImage(ctx context.Context, r io.Reader) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -214,6 +246,12 @@ func (f *Fake) LoadImage(ctx context.Context, r io.Reader) error {
 	}
 	f.LastLoaded = b
 	f.Loaded = true
+	if ref, ok := strings.CutPrefix(string(b), fakeImageTarPrefix); ok {
+		if f.Images == nil {
+			f.Images = map[string]bool{}
+		}
+		f.Images[ref] = true
+	}
 	return nil
 }
 

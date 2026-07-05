@@ -12,7 +12,12 @@ import (
 
 // PortMapping is one host<->container TCP port publication.
 type PortMapping struct {
-	HostPort      int
+	// HostIP is the address the host port binds to. Empty means the
+	// implementation's default (Local: 0.0.0.0 for 80/443, 127.0.0.1
+	// otherwise). A remote surface publish sets this to the node's
+	// WireGuard mesh address so the central Caddy can reach it.
+	HostIP        string
+	HostPort      int // 0 lets the platform assign an ephemeral port
 	ContainerPort int
 }
 

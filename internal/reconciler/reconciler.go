@@ -97,6 +97,69 @@ func (r *Reconciler) localNode() (node.Node, error) {
 	return r.resolver.Resolve("local")
 }
 
+// ensureImageOnNode makes ref available on target, which may be a remote
+// (docker-over-ssh) node that does not share the controller's local image
+// store. It is used in place of a plain target.EnsureImage for any node that
+// ResolveMeta reports as non-local:
+//
+//  1. If target already reports ref present, nothing to do.
+//  2. Otherwise, try target.EnsureImage (a registry pull run ON the target
+//     node itself) — this covers the common case of a public/private image
+//     ref the target can fetch on its own, with no data ever flowing through
+//     the controller. Its error, if any, is deliberately ignored here: a
+//     locally-built or otherwise unregistered ref is expected to fail this
+//     step, and the only thing that matters is whether the image ended up
+//     present.
+//  3. If ref is still absent, it isn't pullable by the target directly (e.g.
+//     a controller-local `lwd-build/...` tag): move it via `docker save` on
+//     the controller's own local node piped into `docker load` on target.
+//
+// An ImagePresent failure (as opposed to a clean "not present" answer) is a
+// hard failure at any step — it means the target's Docker is unreachable or
+// misbehaving, not that the image needs fetching, so no pull or transfer is
+// attempted.
+func (r *Reconciler) ensureImageOnNode(ctx context.Context, target node.Node, ref string) error {
+	present, err := target.ImagePresent(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("check image present: %w", err)
+	}
+	if present {
+		return nil
+	}
+
+	_ = target.EnsureImage(ctx, ref)
+
+	present, err = target.ImagePresent(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("check image present after pull: %w", err)
+	}
+	if present {
+		return nil
+	}
+
+	local, err := r.localNode()
+	if err != nil {
+		return fmt.Errorf("resolve local node for image transfer: %w", err)
+	}
+	rc, err := local.SaveImage(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("save image %s: %w", ref, err)
+	}
+	defer rc.Close()
+	if err := target.LoadImage(ctx, rc); err != nil {
+		return fmt.Errorf("load image %s on target node: %w", ref, err)
+	}
+
+	present, err = target.ImagePresent(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("check image present after transfer: %w", err)
+	}
+	if !present {
+		return fmt.Errorf("image %s still absent on target node after save/load transfer", ref)
+	}
+	return nil
+}
+
 // containerName returns the name of the surface container for one blue-green
 // attempt. Deploy ids are unique and increasing (store.NextDeployID), so
 // successive deploys of the same app never collide even while the old
@@ -157,7 +220,7 @@ func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Depl
 	// Resolve the target node BEFORE touching anything (router, network,
 	// image, the currently-running deployment): an unknown/unreachable node
 	// fails the deploy closed, same as a secret resolve failure below.
-	n, err := r.resolver.Resolve(app.Node)
+	n, meshAddr, isLocal, err := r.resolver.ResolveMeta(app.Node)
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -175,8 +238,14 @@ func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Depl
 	if err := n.EnsureNetwork(ctx, lwdNetwork); err != nil {
 		return nil, fmt.Errorf("ensure network: %w", err)
 	}
-	if err := n.EnsureImage(ctx, app.Image); err != nil {
-		return nil, fmt.Errorf("ensure image: %w", err)
+	if isLocal {
+		if err := n.EnsureImage(ctx, app.Image); err != nil {
+			return nil, fmt.Errorf("ensure image: %w", err)
+		}
+	} else {
+		if err := r.ensureImageOnNode(ctx, n, app.Image); err != nil {
+			return nil, fmt.Errorf("ensure image: %w", err)
+		}
 	}
 
 	// Resolve declared secrets BEFORE starting anything. This must fail
@@ -212,7 +281,7 @@ func (r *Reconciler) applyImage(ctx context.Context, app *spec.App) (*store.Depl
 		return nil, fmt.Errorf("ensure backing: %w", err)
 	}
 
-	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON)
+	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr)
 }
 
 // applyGit deploys a git-built app: clone the declared ref with the box's
@@ -229,7 +298,7 @@ func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deploy
 
 	// Resolve the target node BEFORE touching anything, same rationale as
 	// applyImage.
-	n, err := r.resolver.Resolve(app.Node)
+	n, meshAddr, isLocal, err := r.resolver.ResolveMeta(app.Node)
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -327,7 +396,25 @@ func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deploy
 		}
 	}
 
-	return r.deployBlueGreenSurface(ctx, n, app, tag, env, network, composeContent, specJSON)
+	// The build above always runs on the controller (this method's node.Node,
+	// bld, is always local); a build stays local even when the app is placed
+	// on a remote node. Move the freshly built tag to the target node before
+	// running it there.
+	if !isLocal {
+		if err := r.ensureImageOnNode(ctx, n, tag); err != nil {
+			_, _ = r.store.RecordDeployment(store.Deployment{
+				App:       app.Name,
+				Image:     tag,
+				Status:    store.StatusFailed,
+				CreatedAt: time.Now(),
+				Spec:      string(specJSON),
+				Compose:   composeContent,
+			})
+			return nil, fmt.Errorf("ensure image on node %q: %w", app.Node, err)
+		}
+	}
+
+	return r.deployBlueGreenSurface(ctx, n, app, tag, env, network, composeContent, specJSON, isLocal, meshAddr)
 }
 
 // rollbackGit redeploys app (a git-built app's spec snapshot, with Image
@@ -362,7 +449,7 @@ func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App) (*store.Dep
 		return nil, fmt.Errorf("marshal spec snapshot: %w", err)
 	}
 
-	n, err := r.resolver.Resolve(app.Node)
+	n, meshAddr, isLocal, err := r.resolver.ResolveMeta(app.Node)
 	if err != nil {
 		_, _ = r.store.RecordDeployment(store.Deployment{
 			App:       app.Name,
@@ -406,7 +493,24 @@ func (r *Reconciler) rollbackGit(ctx context.Context, app *spec.App) (*store.Dep
 		return nil, fmt.Errorf("ensure backing: %w", err)
 	}
 
-	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON)
+	// The restored image tag was built (or transferred) on the controller by
+	// the original deploy; if this rollback targets a non-local node, make
+	// sure that tag is present there too before running it.
+	if !isLocal {
+		if err := r.ensureImageOnNode(ctx, n, app.Image); err != nil {
+			_, _ = r.store.RecordDeployment(store.Deployment{
+				App:       app.Name,
+				Image:     app.Image,
+				Status:    store.StatusFailed,
+				CreatedAt: time.Now(),
+				Spec:      string(specJSON),
+				Compose:   composeContent,
+			})
+			return nil, fmt.Errorf("ensure image on node %q: %w", app.Node, err)
+		}
+	}
+
+	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr)
 }
 
 // mergeEnv merges an app's plain declared env with its resolved secret
@@ -488,7 +592,16 @@ func (r *Reconciler) ensureBacking(ctx context.Context, n node.Node, app *spec.A
 // left completely untouched (blue-green's isolation guarantee). Callers must
 // hold r.mu, have already validated the spec, ensured the router/lwd network,
 // resolved secrets into env, and ensured backing services.
-func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, app *spec.App, image string, env map[string]string, backingNetwork, composeContent string, specJSON []byte) (*store.Deployment, error) {
+//
+// isLocal and meshAddr (from the same ResolveMeta call that produced n)
+// decide how the surface is exposed to the central Caddy: a local surface
+// publishes no host port at all — Caddy reaches it by container name on the
+// shared lwd network, exactly as before Phase 9a. A remote surface instead
+// publishes an ephemeral host port bound to the node's mesh address (the
+// only address Caddy, running on the controller, can reach across nodes),
+// and Caddy's upstream becomes that meshAddr:port instead of the container
+// name.
+func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, app *spec.App, image string, env map[string]string, backingNetwork, composeContent string, specJSON []byte, isLocal bool, meshAddr string) (*store.Deployment, error) {
 	deployID, err := r.store.NextDeployID()
 	if err != nil {
 		return nil, fmt.Errorf("next deploy id: %w", err)
@@ -496,7 +609,7 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, ap
 	name := containerName(app, deployID)
 	stageHost := stagingHost(deployID)
 
-	c, err := n.RunContainer(ctx, node.RunSpec{
+	runSpec := node.RunSpec{
 		Name:  name,
 		Image: image,
 		Env:   env,
@@ -507,9 +620,28 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, ap
 		},
 		Port:    app.Port,
 		Network: lwdNetwork,
-	})
+	}
+	if !isLocal {
+		// HostPort 0 asks the node to assign an ephemeral port; the actual
+		// bound port comes back on Container.HostPort below.
+		runSpec.Publish = []node.PortMapping{{HostIP: meshAddr, HostPort: 0, ContainerPort: app.Port}}
+	}
+
+	c, err := n.RunContainer(ctx, runSpec)
 	if err != nil {
 		return nil, fmt.Errorf("run container: %w", err)
+	}
+
+	// upstream/upstreamPort are what Caddy is told to reverse_proxy to, for
+	// both the staging probe below and the live route on success: the
+	// container's name+declared port for a local surface (Caddy resolves the
+	// name on the shared network), or the node's mesh address + the
+	// container's freshly published host port for a remote one.
+	upstream := name
+	upstreamPort := app.Port
+	if !isLocal {
+		upstream = meshAddr
+		upstreamPort = c.HostPort
 	}
 
 	if backingNetwork != "" {
@@ -519,7 +651,7 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, ap
 		}
 	}
 
-	if err := r.router.SetStaging(ctx, stageHost, name, app.Port); err != nil {
+	if err := r.router.SetStaging(ctx, stageHost, upstream, upstreamPort); err != nil {
 		_ = n.RemoveContainer(ctx, c.ID)
 		return nil, fmt.Errorf("set staging route: %w", err)
 	}
@@ -536,8 +668,8 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, ap
 
 	if err := r.router.SetRoute(ctx, router.Route{
 		Domain:      app.Domain,
-		Upstream:    name,
-		Port:        app.Port,
+		Upstream:    upstream,
+		Port:        upstreamPort,
 		TLSInternal: router.UseInternalTLS(app.Domain),
 	}); err != nil {
 		// The flip itself failed: undo the staging state and the new

@@ -122,21 +122,28 @@ func (l *Local) RunContainer(ctx context.Context, spec RunSpec) (Container, erro
 	if len(spec.Publish) > 0 {
 		portBindings := nat.PortMap{}
 		for _, pm := range spec.Publish {
-			hostIP := "127.0.0.1"
-			if pm.HostPort == 80 || pm.HostPort == 443 {
-				hostIP = "0.0.0.0"
+			hostIP := pm.HostIP
+			if hostIP == "" {
+				hostIP = "127.0.0.1"
+				if pm.HostPort == 80 || pm.HostPort == 443 {
+					hostIP = "0.0.0.0"
+				}
 			}
 			cp := nat.Port(strconv.Itoa(pm.ContainerPort) + "/tcp")
 			cfg.ExposedPorts[cp] = struct{}{}
+			hostPortStr := ""
+			if pm.HostPort != 0 {
+				hostPortStr = strconv.Itoa(pm.HostPort)
+			}
 			portBindings[cp] = append(portBindings[cp], nat.PortBinding{
 				HostIP:   hostIP,
-				HostPort: strconv.Itoa(pm.HostPort),
+				HostPort: hostPortStr,
 			})
 			if pm.ContainerPort == spec.Port {
 				primaryHostPort = pm.HostPort
 			}
 		}
-		if primaryHostPort == 0 {
+		if primaryHostPort == 0 && spec.Publish[0].ContainerPort != spec.Port {
 			primaryHostPort = spec.Publish[0].HostPort
 		}
 		hostCfg.PortBindings = portBindings
@@ -172,6 +179,19 @@ func (l *Local) RunContainer(ctx context.Context, spec RunSpec) (Container, erro
 				if ep.IPAddress != "" {
 					ip = ep.IPAddress
 					break
+				}
+			}
+		}
+
+		// Read back the actual published host port for the primary port,
+		// rather than trusting the requested value: a HostPort of 0 asks
+		// Docker to assign an ephemeral port, and the daemon is always the
+		// authority on what actually got bound.
+		if spec.Port != 0 {
+			cp := nat.Port(strconv.Itoa(spec.Port) + "/tcp")
+			if bindings, ok := inspect.NetworkSettings.Ports[cp]; ok && len(bindings) > 0 {
+				if hp, perr := strconv.Atoi(bindings[0].HostPort); perr == nil {
+					primaryHostPort = hp
 				}
 			}
 		}

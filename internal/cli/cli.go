@@ -105,15 +105,15 @@ func runDaemon() int {
 	// declares via a Resolver: "" and "local" always resolve to n, the
 	// daemon's own local Docker; any other name is looked up in the store's
 	// nodes registry (populated by `lwd node add`).
-	resolver := node.NewRegistryResolver(n, func(name string) (string, bool, error) {
+	resolver := node.NewRegistryResolver(n, func(name string) (string, string, bool, error) {
 		rec, err := s.GetNode(name)
 		if err != nil {
-			return "", false, err
+			return "", "", false, err
 		}
 		if rec == nil {
-			return "", false, nil
+			return "", "", false, nil
 		}
-		return rec.SSHHost, true, nil
+		return rec.SSHHost, rec.MeshAddr, true, nil
 	})
 
 	srv := api.New(reconciler.New(resolver, r, s, secStore, compose.NewCLI(), source.NewCLI(), build.NewCLI()), s, n, r, secStore)

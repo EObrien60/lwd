@@ -1296,6 +1296,216 @@ func TestRemoveGitDownsBacking(t *testing.T) {
 	}
 }
 
+// TestEnsureImageTransfersWhenAbsent covers the Phase 9a-Task 4 image
+// transfer path used before running a surface on a non-local node:
+// ensureImageOnNode should transfer (save on the local node, load on the
+// target) only when the image is absent AND a registry pull on the target
+// doesn't produce it; it must not transfer when the target already has it,
+// and it must hard-fail (no transfer, no run) when ImagePresent itself
+// errors on the target.
+func TestEnsureImageTransfersWhenAbsent(t *testing.T) {
+	t.Run("absent after pull triggers save|load transfer", func(t *testing.T) {
+		local := node.NewFake()
+		remote := node.NewFake()
+		fr := router.NewFakeRouter()
+		s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		resolver := node.FakeResolver{"local": local, "web1": remote}
+		r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+		app := testApp() // Image: "img:1"
+		app.Node = "web1"
+		app.Health.Timeout = shortTimeout
+		fr.ProbeStatus = 200
+
+		// remote.Images has no entry for "img:1", and Fake.EnsureImage never
+		// marks an image present (it only records the call), so the
+		// "registry pull on the target" step leaves it absent and the
+		// transfer path must run.
+		dep, err := r.Apply(context.Background(), app)
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if dep.Status != store.StatusRunning {
+			t.Errorf("status = %q, want running", dep.Status)
+		}
+		if !contains(local.Calls, "SaveImage:img:1") {
+			t.Errorf("want SaveImage on the local node, calls: %v", local.Calls)
+		}
+		if !contains(remote.Calls, "LoadImage") {
+			t.Errorf("want LoadImage on the target node, calls: %v", remote.Calls)
+		}
+		if !remote.Images["img:1"] {
+			t.Errorf("want img:1 present on the target node after transfer")
+		}
+	})
+
+	t.Run("already present on target skips transfer", func(t *testing.T) {
+		local := node.NewFake()
+		remote := node.NewFake()
+		remote.Images = map[string]bool{"img:1": true}
+		fr := router.NewFakeRouter()
+		s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		resolver := node.FakeResolver{"local": local, "web1": remote}
+		r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+		app := testApp()
+		app.Node = "web1"
+		app.Health.Timeout = shortTimeout
+		fr.ProbeStatus = 200
+
+		dep, err := r.Apply(context.Background(), app)
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if dep.Status != store.StatusRunning {
+			t.Errorf("status = %q, want running", dep.Status)
+		}
+		for _, c := range local.Calls {
+			if strings.HasPrefix(c, "SaveImage:") {
+				t.Errorf("want no SaveImage call when already present on target, calls: %v", local.Calls)
+			}
+		}
+		if contains(remote.Calls, "LoadImage") {
+			t.Errorf("want no LoadImage call when already present on target, calls: %v", remote.Calls)
+		}
+	})
+
+	t.Run("ImagePresent error fails deploy closed, no transfer, no run", func(t *testing.T) {
+		local := node.NewFake()
+		remote := node.NewFake()
+		remote.ImagePresentErr = fmt.Errorf("docker unreachable")
+		fr := router.NewFakeRouter()
+		s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		resolver := node.FakeResolver{"local": local, "web1": remote}
+		r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+		app := testApp()
+		app.Node = "web1"
+		app.Health.Timeout = shortTimeout
+		fr.ProbeStatus = 200
+
+		if _, err := r.Apply(context.Background(), app); err == nil {
+			t.Fatal("want Apply to fail when ImagePresent errors on the target")
+		}
+		for _, c := range remote.Calls {
+			if strings.HasPrefix(c, "RunContainer:") {
+				t.Errorf("want no RunContainer call when image presence can't be determined, calls: %v", remote.Calls)
+			}
+		}
+		if contains(remote.Calls, "LoadImage") {
+			t.Errorf("want no LoadImage call, calls: %v", remote.Calls)
+		}
+		for _, c := range local.Calls {
+			if strings.HasPrefix(c, "SaveImage:") {
+				t.Errorf("want no SaveImage call, calls: %v", local.Calls)
+			}
+		}
+	})
+}
+
+// TestRemoteSurfaceRoutesToMeshAddr covers the Phase 9a-Task 4 mesh-address
+// routing: a surface placed on a registered remote node must publish an
+// ephemeral host port bound to that node's mesh address, and the live Caddy
+// route must point at meshAddr:<published port> — never at the container
+// name, which Caddy (running on the controller) cannot resolve on another
+// node's Docker network. A local surface must be completely unaffected: no
+// published port, and the route still targets the container name.
+func TestRemoteSurfaceRoutesToMeshAddr(t *testing.T) {
+	n0 := node.NewFake() // local
+	n1 := node.NewFake() // web1
+	n1.MeshAddr = "100.64.0.2"
+	n1.Images = map[string]bool{"img:1": true} // skip the transfer path; routing is what's under test
+	fr := router.NewFakeRouter()
+	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	resolver := node.FakeResolver{"local": n0, "web1": n1}
+	r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+	app := testApp()
+	app.Node = "web1"
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	dep, err := r.Apply(context.Background(), app)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if dep.Status != store.StatusRunning {
+		t.Errorf("status = %q, want running", dep.Status)
+	}
+
+	if len(n1.LastRunSpec.Publish) != 1 {
+		t.Fatalf("want exactly one published port for a remote surface, got %+v", n1.LastRunSpec.Publish)
+	}
+	pub := n1.LastRunSpec.Publish[0]
+	if pub.HostIP != "100.64.0.2" {
+		t.Errorf("published HostIP = %q, want the node's mesh address", pub.HostIP)
+	}
+	if pub.ContainerPort != app.Port {
+		t.Errorf("published ContainerPort = %d, want %d", pub.ContainerPort, app.Port)
+	}
+
+	containers, err := n1.ListContainers(context.Background(), map[string]string{"lwd.app": app.Name})
+	if err != nil || len(containers) != 1 {
+		t.Fatalf("ListContainers on web1: %v, %+v", err, containers)
+	}
+	wantPort := containers[0].HostPort
+	if wantPort == 0 {
+		t.Fatal("want a non-zero published host port assigned")
+	}
+
+	route, ok := fr.Routes[app.Domain]
+	if !ok {
+		t.Fatalf("want a live route for %s", app.Domain)
+	}
+	if route.Upstream != "100.64.0.2" {
+		t.Errorf("route.Upstream = %q, want the node's mesh address", route.Upstream)
+	}
+	if route.Port != wantPort {
+		t.Errorf("route.Port = %d, want the published host port %d", route.Port, wantPort)
+	}
+
+	// A local app is completely unaffected: no publish, and the route still
+	// targets the container name.
+	localApp := testApp()
+	localApp.Name = "localblog"
+	localApp.Domain = "localblog.example.com"
+	localApp.Health.Timeout = shortTimeout
+
+	localDep, err := r.Apply(context.Background(), localApp)
+	if err != nil {
+		t.Fatalf("Apply (local): %v", err)
+	}
+	if len(n0.LastRunSpec.Publish) != 0 {
+		t.Errorf("want no published ports for a local surface, got %+v", n0.LastRunSpec.Publish)
+	}
+	localRoute, ok := fr.Routes[localApp.Domain]
+	if !ok {
+		t.Fatalf("want a live route for %s", localApp.Domain)
+	}
+	if localRoute.Upstream != containerName(localApp, localDep.ID) {
+		t.Errorf("route.Upstream = %q, want the surface container name", localRoute.Upstream)
+	}
+	if localRoute.Port != localApp.Port {
+		t.Errorf("route.Port = %d, want the app's declared port %d", localRoute.Port, localApp.Port)
+	}
+}
+
 func contains(xs []string, want string) bool {
 	for _, x := range xs {
 		if x == want {
