@@ -64,9 +64,9 @@ type Router interface {
 	SetRoute(ctx context.Context, r Route) error
 	// RemoveRoute removes the active route for domain, if any.
 	RemoveRoute(ctx context.Context, domain string) error
-	// SetStaging exposes upstream:port at host for out-of-band health probing
+	// SetStaging exposes upstreams at host for out-of-band health probing
 	// before it becomes the active route (used by blue-green staging).
-	SetStaging(ctx context.Context, host, upstream string, port int) error
+	SetStaging(ctx context.Context, host string, upstreams []Upstream) error
 	// RemoveStaging removes a staging route for host, if any.
 	RemoveStaging(ctx context.Context, host string) error
 	// ProbeThroughCaddy issues an HTTP GET through Caddy's public listener
@@ -268,16 +268,16 @@ func (c *CaddyRouter) RemoveRoute(ctx context.Context, domain string) error {
 	return nil
 }
 
-// SetStaging exposes upstream:port at host so it can be probed through Caddy
+// SetStaging exposes upstreams at host so they can be probed through Caddy
 // ahead of cutover, and reloads Caddy. The in-memory staging map is only
 // updated if the reload succeeds; on failure c.staging is left exactly as it
 // was before the call.
-func (c *CaddyRouter) SetStaging(ctx context.Context, host, upstream string, port int) error {
+func (c *CaddyRouter) SetStaging(ctx context.Context, host string, upstreams []Upstream) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	staging := copyRoutes(c.staging)
-	staging[host] = Route{Domain: host, Upstream: upstream, Port: port, TLSInternal: true}
+	staging[host] = Route{Domain: host, Upstreams: upstreams, TLSInternal: true}
 
 	if err := c.applyConfig(ctx, c.routes, staging); err != nil {
 		return err

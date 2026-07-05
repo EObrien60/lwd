@@ -171,8 +171,8 @@ func TestApplyStagesProbesFlips(t *testing.T) {
 	if !ok {
 		t.Fatalf("Routes[blog.example.com] not set, routes: %+v", fr.Routes)
 	}
-	if route.Upstream != dep.ContainerID && route.Upstream != "lwd-blog-1" {
-		t.Errorf("route.Upstream = %q, want the new container name", route.Upstream)
+	if len(route.Upstreams) != 1 || (route.Upstreams[0].Host != dep.ContainerID && route.Upstreams[0].Host != "lwd-blog-1") {
+		t.Errorf("route.Upstreams = %+v, want the new container name", route.Upstreams)
 	}
 	if fr.Staging["stage-1.lwd.internal"] {
 		t.Errorf("staging route should have been removed after cutover")
@@ -339,7 +339,7 @@ func TestApplyBlueGreenRetiresOld(t *testing.T) {
 		t.Errorf("expected old container removed, calls: %v", f.Calls)
 	}
 	route, ok := fr.Routes["blog.example.com"]
-	if !ok || route.Upstream != "lwd-blog-2" {
+	if !ok || len(route.Upstreams) != 1 || route.Upstreams[0].Host != "lwd-blog-2" {
 		t.Errorf("route should point at the second container, got %+v", route)
 	}
 }
@@ -390,11 +390,11 @@ func TestApplyRedeployHealthFailKeepsOldServing(t *testing.T) {
 	if !ok {
 		t.Fatalf("Routes[blog.example.com] must remain set after failed redeploy, routes: %+v", fr.Routes)
 	}
-	if routeAfter.Upstream != routeBefore.Upstream {
-		t.Errorf("route.Upstream changed on failed redeploy: before=%q after=%q", routeBefore.Upstream, routeAfter.Upstream)
+	if len(routeAfter.Upstreams) != len(routeBefore.Upstreams) || routeAfter.Upstreams[0] != routeBefore.Upstreams[0] {
+		t.Errorf("route.Upstreams changed on failed redeploy: before=%+v after=%+v", routeBefore.Upstreams, routeAfter.Upstreams)
 	}
-	if routeAfter.Upstream != "lwd-blog-1" {
-		t.Errorf("route.Upstream = %q, want still pointing at v1's container name", routeAfter.Upstream)
+	if len(routeAfter.Upstreams) != 1 || routeAfter.Upstreams[0].Host != "lwd-blog-1" {
+		t.Errorf("route.Upstreams = %+v, want still pointing at v1's container name", routeAfter.Upstreams)
 	}
 }
 
@@ -617,8 +617,8 @@ func TestRollbackRedeploysPrevious(t *testing.T) {
 	if !ok {
 		t.Fatalf("Routes[blog.example.com] not set after rollback")
 	}
-	if route.Upstream != back.ContainerID && route.Upstream != containerName(app, 3) {
-		t.Errorf("route.Upstream = %q, want it to point at the rolled-back container", route.Upstream)
+	if len(route.Upstreams) != 1 || (route.Upstreams[0].Host != back.ContainerID && route.Upstreams[0].Host != containerName(app, 3)) {
+		t.Errorf("route.Upstreams = %+v, want it to point at the rolled-back container", route.Upstreams)
 	}
 
 	cur, err := s.CurrentDeployment("blog")
@@ -750,8 +750,8 @@ func TestApplyComposeUpConnectsRoutesVerifies(t *testing.T) {
 	if !ok {
 		t.Fatalf("Routes[webapp.example.com] not set, routes: %+v", fr.Routes)
 	}
-	if route.Upstream != "lwd-webapp-web-1" {
-		t.Errorf("route.Upstream = %q, want lwd-webapp-web-1", route.Upstream)
+	if len(route.Upstreams) != 1 || route.Upstreams[0].Host != "lwd-webapp-web-1" {
+		t.Errorf("route.Upstreams = %+v, want lwd-webapp-web-1", route.Upstreams)
 	}
 
 	if cf.LastUp.Env["A"] != "1" {
@@ -1690,11 +1690,11 @@ func TestRemoteSurfaceRoutesToMeshAddr(t *testing.T) {
 	if !ok {
 		t.Fatalf("want a live route for %s", app.Domain)
 	}
-	if route.Upstream != "100.64.0.2" {
-		t.Errorf("route.Upstream = %q, want the node's mesh address", route.Upstream)
+	if len(route.Upstreams) != 1 || route.Upstreams[0].Host != "100.64.0.2" {
+		t.Errorf("route.Upstreams = %+v, want the node's mesh address", route.Upstreams)
 	}
-	if route.Port != wantPort {
-		t.Errorf("route.Port = %d, want the published host port %d", route.Port, wantPort)
+	if len(route.Upstreams) != 1 || route.Upstreams[0].Port != wantPort {
+		t.Errorf("route.Upstreams port = %+v, want the published host port %d", route.Upstreams, wantPort)
 	}
 
 	// A local app is completely unaffected: no publish, and the route still
@@ -1715,11 +1715,11 @@ func TestRemoteSurfaceRoutesToMeshAddr(t *testing.T) {
 	if !ok {
 		t.Fatalf("want a live route for %s", localApp.Domain)
 	}
-	if localRoute.Upstream != containerName(localApp, localDep.ID) {
-		t.Errorf("route.Upstream = %q, want the surface container name", localRoute.Upstream)
+	if len(localRoute.Upstreams) != 1 || localRoute.Upstreams[0].Host != containerName(localApp, localDep.ID) {
+		t.Errorf("route.Upstreams = %+v, want the surface container name", localRoute.Upstreams)
 	}
-	if localRoute.Port != localApp.Port {
-		t.Errorf("route.Port = %d, want the app's declared port %d", localRoute.Port, localApp.Port)
+	if len(localRoute.Upstreams) != 1 || localRoute.Upstreams[0].Port != localApp.Port {
+		t.Errorf("route.Upstreams port = %+v, want the app's declared port %d", localRoute.Upstreams, localApp.Port)
 	}
 }
 

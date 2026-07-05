@@ -69,11 +69,11 @@ func TestBuildInitialRoutesMatchesCurrentDeployment(t *testing.T) {
 	if r.Domain != "blog.example.com" {
 		t.Errorf("Domain = %q, want blog.example.com", r.Domain)
 	}
-	if r.Upstream != "lwd-blog-1" {
-		t.Errorf("Upstream = %q, want lwd-blog-1", r.Upstream)
+	if len(r.Upstreams) != 1 || r.Upstreams[0].Host != "lwd-blog-1" {
+		t.Errorf("Upstreams = %+v, want [{lwd-blog-1 8080}]", r.Upstreams)
 	}
-	if r.Port != 8080 {
-		t.Errorf("Port = %d, want 8080", r.Port)
+	if len(r.Upstreams) != 1 || r.Upstreams[0].Port != 8080 {
+		t.Errorf("Port = %+v, want 8080", r.Upstreams)
 	}
 }
 

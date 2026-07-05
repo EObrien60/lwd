@@ -932,7 +932,7 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, ap
 		}
 	}
 
-	if err := r.router.SetStaging(ctx, stageHost, upstream, upstreamPort); err != nil {
+	if err := r.router.SetStaging(ctx, stageHost, []router.Upstream{{Host: upstream, Port: upstreamPort}}); err != nil {
 		_ = n.RemoveContainer(ctx, c.ID)
 		return nil, fmt.Errorf("set staging route: %w", err)
 	}
@@ -949,8 +949,7 @@ func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, ap
 
 	if err := r.router.SetRoute(ctx, router.Route{
 		Domain:      app.Domain,
-		Upstream:    upstream,
-		Port:        upstreamPort,
+		Upstreams:   []router.Upstream{{Host: upstream, Port: upstreamPort}},
 		TLSInternal: router.UseInternalTLS(app.Domain),
 	}); err != nil {
 		// The flip itself failed: undo the staging state and the new
@@ -1104,8 +1103,7 @@ func (r *Reconciler) applyCompose(ctx context.Context, app *spec.App) (*store.De
 	// flips to the freshly (re)created service before it's been proven ready.
 	if err := r.router.SetRoute(ctx, router.Route{
 		Domain:      app.Domain,
-		Upstream:    name,
-		Port:        app.Port,
+		Upstreams:   []router.Upstream{{Host: name, Port: app.Port}},
 		TLSInternal: router.UseInternalTLS(app.Domain),
 	}); err != nil {
 		r.recordComposeFailed(app, id, specJSON, string(content))

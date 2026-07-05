@@ -1596,7 +1596,7 @@ func TestEndToEndSelfHeal(t *testing.T) {
 	if !ok {
 		t.Fatalf("want a live route for %q after self-heal", app.Domain)
 	}
-	if route.Upstream == "" {
+	if len(route.Upstreams) == 0 || route.Upstreams[0].Host == "" {
 		t.Errorf("want a live route upstream set after self-heal, got %+v", route)
 	}
 
@@ -1770,7 +1770,7 @@ func TestEndToEndScheduling(t *testing.T) {
 	if !ok {
 		t.Fatalf("want a live route for %q", app.Domain)
 	}
-	if route.Upstream == "" {
+	if len(route.Upstreams) == 0 || route.Upstreams[0].Host == "" {
 		t.Errorf("want a live route upstream set, got %+v", route)
 	}
 }
@@ -1980,7 +1980,7 @@ func TestEndToEndNodeDrain(t *testing.T) {
 	if !ok {
 		t.Fatalf("want a live route for %q", app.Domain)
 	}
-	if route.Upstream == "" {
+	if len(route.Upstreams) == 0 || route.Upstreams[0].Host == "" {
 		t.Errorf("want a live route upstream set, got %+v", route)
 	}
 }

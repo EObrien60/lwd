@@ -233,8 +233,7 @@ func buildInitialRoutes(ctx context.Context, n node.Node, s *store.Store) ([]rou
 
 		routes[a.Domain] = router.Route{
 			Domain:      a.Domain,
-			Upstream:    c.Name,
-			Port:        a.Port,
+			Upstreams:   []router.Upstream{{Host: c.Name, Port: a.Port}},
 			TLSInternal: router.UseInternalTLS(a.Domain),
 		}
 	}
