@@ -79,6 +79,14 @@ type App struct {
 	Secrets []string          `toml:"secrets"`
 	Health  Health            `toml:"health"`
 
+	// Replicas is the number of surface replicas to run for this app (Phase
+	// 12). Parse defaults an unset (0) value to 1, so a bare struct literal
+	// built without going through Parse must set this explicitly to pass
+	// Validate. Load-balanced across replicas via the router (N=1 degrades
+	// to today's single-container behavior byte-for-byte). Not supported for
+	// compose apps.
+	Replicas int `toml:"replicas"`
+
 	// Requirements declares resource needs used by the scheduler to pick a
 	// node/pool when Node is unset. Nil means no requirements declared.
 	Requirements *Requirements `toml:"requirements"`
@@ -184,6 +192,9 @@ func Parse(data []byte) (*App, error) {
 	}
 	if a.Health.Timeout == 0 {
 		a.Health.Timeout = 30 * time.Second
+	}
+	if a.Replicas == 0 {
+		a.Replicas = 1
 	}
 	return &a, nil
 }
@@ -322,6 +333,24 @@ func (a *App) Validate() error {
 		if a.Port == 0 {
 			return fmt.Errorf("port is required")
 		}
+	}
+
+	// Replicas validation applies to all app types, checked after the
+	// shape-specific block above so a compose app that's already invalid for
+	// another reason (missing service/domain/port, remote node, ...) reports
+	// that error rather than a replicas one. Parse defaults an unset (0)
+	// Replicas to 1 before Validate normally sees it, but a hand-built App
+	// (bypassing Parse — e.g. a JSON-decoded API request) can still reach
+	// Validate with Replicas == 0, so 0 is rejected here just like any other
+	// value below the floor.
+	if a.Replicas < 1 {
+		return fmt.Errorf("replicas must be >= 1")
+	}
+	if a.Replicas > 50 {
+		return fmt.Errorf("replicas must be <= 50")
+	}
+	if a.Replicas > 1 && a.Compose != "" {
+		return fmt.Errorf("replicas not supported for compose apps")
 	}
 
 	// Services validation (allowed on image and git apps, not on compose)

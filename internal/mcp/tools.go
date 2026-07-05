@@ -333,9 +333,10 @@ func (s *Server) registerLwdDeployGit(srv *sdk.Server) {
 		}
 
 		app := &spec.App{
-			Name:   in.Name,
-			Domain: in.Domain,
-			Port:   in.Port,
+			Name:     in.Name,
+			Domain:   in.Domain,
+			Port:     in.Port,
+			Replicas: 1,
 			Git: &spec.Git{
 				URL: in.URL,
 				Ref: ref,

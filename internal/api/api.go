@@ -121,6 +121,13 @@ func (srv *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	// JSON bodies aren't run through spec.Parse (which defaults an unset
+	// Replicas to 1 for TOML-authored apps) — apply the same default here so
+	// a request that omits "replicas" gets today's single-container
+	// behavior instead of failing Validate's Replicas>=1 check.
+	if app.Replicas == 0 {
+		app.Replicas = 1
+	}
 	if err := app.Validate(); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return

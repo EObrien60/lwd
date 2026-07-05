@@ -83,7 +83,7 @@ func TestValidateRejectsUnsupportedFeatures(t *testing.T) {
 }
 
 func TestValidateAcceptsGoodSpec(t *testing.T) {
-	a := &App{Name: "x", Image: "y", Port: 80, Node: "local"}
+	a := &App{Name: "x", Image: "y", Port: 80, Node: "local", Replicas: 1}
 	if err := a.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
@@ -100,11 +100,12 @@ func TestValidateRejectsBadName(t *testing.T) {
 
 func TestValidateComposeApp(t *testing.T) {
 	a := &App{
-		Name:    "webapp",
-		Compose: "docker-compose.yml",
-		Service: "web",
-		Domain:  "x.example.com",
-		Port:    8080,
+		Name:     "webapp",
+		Compose:  "docker-compose.yml",
+		Service:  "web",
+		Domain:   "x.example.com",
+		Port:     8080,
+		Replicas: 1,
 	}
 	if err := a.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
@@ -182,12 +183,13 @@ func TestComposeRejectsRemoteNode(t *testing.T) {
 func TestComposeAcceptsLocalNode(t *testing.T) {
 	for _, node := range []string{"", "local"} {
 		a := &App{
-			Name:    "webapp",
-			Compose: "docker-compose.yml",
-			Service: "web",
-			Domain:  "x.example.com",
-			Port:    8080,
-			Node:    node,
+			Name:     "webapp",
+			Compose:  "docker-compose.yml",
+			Service:  "web",
+			Domain:   "x.example.com",
+			Port:     8080,
+			Node:     node,
+			Replicas: 1,
 		}
 		if err := a.Validate(); err != nil {
 			t.Fatalf("Validate (node=%q): %v", node, err)
@@ -275,11 +277,12 @@ port = 8080
 
 func TestGitAppValid(t *testing.T) {
 	a := &App{
-		Name:   "myapp",
-		Git:    &Git{URL: "https://github.com/me/myapp"},
-		Build:  &Build{Dockerfile: "Dockerfile"},
-		Domain: "myapp.example.com",
-		Port:   8080,
+		Name:     "myapp",
+		Git:      &Git{URL: "https://github.com/me/myapp"},
+		Build:    &Build{Dockerfile: "Dockerfile"},
+		Domain:   "myapp.example.com",
+		Port:     8080,
+		Replicas: 1,
 	}
 	if err := a.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
@@ -421,9 +424,10 @@ func TestComposeRejectsServices(t *testing.T) {
 
 func TestImageAppWithService(t *testing.T) {
 	a := &App{
-		Name:  "myapp",
-		Image: "myimage:latest",
-		Port:  8080,
+		Name:     "myapp",
+		Image:    "myimage:latest",
+		Port:     8080,
+		Replicas: 1,
 		Services: []Service{
 			{Name: "db", Image: "postgres:16"},
 		},
@@ -525,7 +529,7 @@ func TestValidateRejectsBadSecretName(t *testing.T) {
 	})
 
 	t.Run("normal secret name is accepted", func(t *testing.T) {
-		a := &App{Name: "myapp", Image: "y", Port: 80, Secrets: []string{"DATABASE_URL"}}
+		a := &App{Name: "myapp", Image: "y", Port: 80, Replicas: 1, Secrets: []string{"DATABASE_URL"}}
 		if err := a.Validate(); err != nil {
 			t.Fatalf("Validate: %v", err)
 		}
@@ -579,11 +583,12 @@ command = "redis-server --appendonly yes"
 
 func gitApp(overrides func(*App)) *App {
 	a := &App{
-		Name:   "myapp",
-		Git:    &Git{URL: "https://github.com/me/myapp", Ref: "main"},
-		Build:  &Build{Dockerfile: "Dockerfile"},
-		Domain: "myapp.example.com",
-		Port:   8080,
+		Name:     "myapp",
+		Git:      &Git{URL: "https://github.com/me/myapp", Ref: "main"},
+		Build:    &Build{Dockerfile: "Dockerfile"},
+		Domain:   "myapp.example.com",
+		Port:     8080,
+		Replicas: 1,
 	}
 	if overrides != nil {
 		overrides(a)
@@ -800,7 +805,7 @@ func TestValidateBadRequirements(t *testing.T) {
 		}
 	})
 	t.Run("valid requirements accepted", func(t *testing.T) {
-		a := &App{Name: "x", Image: "y", Port: 80, Requirements: &Requirements{CPU: 1.5, Memory: "1G"}}
+		a := &App{Name: "x", Image: "y", Port: 80, Replicas: 1, Requirements: &Requirements{CPU: 1.5, Memory: "1G"}}
 		if err := a.Validate(); err != nil {
 			t.Fatalf("Validate: unexpected error: %v", err)
 		}
@@ -808,12 +813,80 @@ func TestValidateBadRequirements(t *testing.T) {
 }
 
 func TestValidateBadPool(t *testing.T) {
-	a := &App{Name: "x", Image: "y", Port: 80, Pool: "bad pool!"}
+	a := &App{Name: "x", Image: "y", Port: 80, Pool: "bad pool!", Replicas: 1}
 	if err := a.Validate(); err == nil {
 		t.Fatal("want error for invalid pool name")
 	}
-	a2 := &App{Name: "x", Image: "y", Port: 80, Pool: "web-1"}
+	a2 := &App{Name: "x", Image: "y", Port: 80, Pool: "web-1", Replicas: 1}
 	if err := a2.Validate(); err != nil {
 		t.Fatalf("Validate: unexpected error for valid pool: %v", err)
+	}
+}
+
+// TestParseDefaultsReplicasToOne covers Phase 12 Task 2: an lwd.toml that
+// doesn't declare replicas defaults to 1 (today's single-container
+// behavior).
+func TestParseDefaultsReplicasToOne(t *testing.T) {
+	a, err := Parse([]byte(singleService))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.Replicas != 1 {
+		t.Errorf("Replicas = %d, want 1 (default)", a.Replicas)
+	}
+}
+
+// TestParseReplicas covers Phase 12 Task 2: an explicit replicas value is
+// parsed through unchanged.
+func TestParseReplicas(t *testing.T) {
+	toml := `
+name = "blog"
+image = "ghcr.io/me/blog:latest"
+domain = "blog.example.com"
+port = 8080
+replicas = 3
+`
+	a, err := Parse([]byte(toml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.Replicas != 3 {
+		t.Errorf("Replicas = %d, want 3", a.Replicas)
+	}
+}
+
+// TestValidateReplicasMin covers Phase 12 Task 2: Replicas below 1 (including
+// the zero value, reachable when Validate runs on an App that skipped
+// Parse's defaulting) is rejected.
+func TestValidateReplicasMin(t *testing.T) {
+	a := &App{Name: "x", Image: "y", Port: 80, Replicas: 0}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for replicas < 1")
+	}
+}
+
+// TestValidateReplicasMax covers Phase 12 Task 2: Replicas above the 50 cap
+// is rejected.
+func TestValidateReplicasMax(t *testing.T) {
+	a := &App{Name: "x", Image: "y", Port: 80, Replicas: 51}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for replicas > 50")
+	}
+}
+
+// TestValidateReplicasCompose covers Phase 12 Task 2: replicas > 1 is not
+// supported for compose apps (compose's Up/routing path doesn't have a
+// replica-set notion).
+func TestValidateReplicasCompose(t *testing.T) {
+	a := &App{
+		Name:     "webapp",
+		Compose:  "docker-compose.yml",
+		Service:  "web",
+		Domain:   "x.example.com",
+		Port:     8080,
+		Replicas: 2,
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for replicas > 1 with compose")
 	}
 }

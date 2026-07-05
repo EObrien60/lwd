@@ -136,11 +136,12 @@ func TestEndToEndBlueGreenRollback(t *testing.T) {
 	}
 
 	app := &spec.App{
-		Name:   appLabel,
-		Image:  "traefik/whoami:latest",
-		Domain: domain,
-		Port:   80, // whoami listens on :80; Caddy reaches it at <container>:80 on the lwd network
-		Node:   "local",
+		Name:     appLabel,
+		Image:    "traefik/whoami:latest",
+		Domain:   domain,
+		Port:     80, // whoami listens on :80; Caddy reaches it at <container>:80 on the lwd network
+		Node:     "local",
+		Replicas: 1,
 	}
 	app.Health.Path = "/"
 	app.Health.Timeout = 30 * time.Second
@@ -290,12 +291,13 @@ func TestEndToEndSecretInjection(t *testing.T) {
 	}
 
 	app := &spec.App{
-		Name:    secretAppLabel,
-		Image:   "traefik/whoami:latest",
-		Domain:  secretDomain,
-		Port:    80,
-		Node:    "local",
-		Secrets: []string{"LWD_TEST_SECRET"},
+		Name:     secretAppLabel,
+		Image:    "traefik/whoami:latest",
+		Domain:   secretDomain,
+		Port:     80,
+		Node:     "local",
+		Replicas: 1,
+		Secrets:  []string{"LWD_TEST_SECRET"},
 	}
 	app.Health.Path = "/"
 	app.Health.Timeout = 30 * time.Second
@@ -323,12 +325,13 @@ func TestEndToEndSecretInjection(t *testing.T) {
 
 	// --- Scenario 2: fail-closed on an unset secret ---
 	failApp := &spec.App{
-		Name:    failClosedAppLabel,
-		Image:   "traefik/whoami:latest",
-		Domain:  failClosedDomain,
-		Port:    80,
-		Node:    "local",
-		Secrets: []string{"UNSET_SECRET"},
+		Name:     failClosedAppLabel,
+		Image:    "traefik/whoami:latest",
+		Domain:   failClosedDomain,
+		Port:     80,
+		Node:     "local",
+		Replicas: 1,
+		Secrets:  []string{"UNSET_SECRET"},
 	}
 	failApp.Health.Path = "/"
 	failApp.Health.Timeout = 30 * time.Second
@@ -426,12 +429,13 @@ func TestEndToEndComposeApp(t *testing.T) {
 	}
 
 	app := &spec.App{
-		Name:    composeAppLabel,
-		Compose: composeFile,
-		Service: "web",
-		Domain:  composeDomain,
-		Port:    80, // whoami listens on :80
-		Node:    "local",
+		Name:     composeAppLabel,
+		Compose:  composeFile,
+		Service:  "web",
+		Domain:   composeDomain,
+		Port:     80, // whoami listens on :80
+		Node:     "local",
+		Replicas: 1,
 	}
 	app.Health.Path = "/"
 	app.Health.Timeout = 30 * time.Second
@@ -553,12 +557,13 @@ func TestEndToEndGitDeploy(t *testing.T) {
 	}
 
 	app := &spec.App{
-		Name:   gitAppLabel,
-		Git:    &spec.Git{URL: "file://" + repoDir, Ref: branch},
-		Build:  &spec.Build{Dockerfile: "Dockerfile"},
-		Domain: gitDomain,
-		Port:   80, // whoami listens on :80
-		Node:   "local",
+		Name:     gitAppLabel,
+		Git:      &spec.Git{URL: "file://" + repoDir, Ref: branch},
+		Build:    &spec.Build{Dockerfile: "Dockerfile"},
+		Domain:   gitDomain,
+		Port:     80, // whoami listens on :80
+		Node:     "local",
+		Replicas: 1,
 		Services: []spec.Service{
 			{Name: "cache", Image: "redis:7-alpine"},
 		},
@@ -843,11 +848,12 @@ func TestEndToEndRemoteNode(t *testing.T) {
 
 	// --- Deploy pinned to the registered "remote" node ---
 	remoteApp := &spec.App{
-		Name:   remoteNodeAppLabel,
-		Image:  "traefik/whoami:latest",
-		Domain: remoteNodeDomain,
-		Port:   80,
-		Node:   remoteNodeName,
+		Name:     remoteNodeAppLabel,
+		Image:    "traefik/whoami:latest",
+		Domain:   remoteNodeDomain,
+		Port:     80,
+		Node:     remoteNodeName,
+		Replicas: 1,
 	}
 	remoteApp.Health.Path = "/"
 	remoteApp.Health.Timeout = 30 * time.Second
@@ -884,11 +890,12 @@ func TestEndToEndRemoteNode(t *testing.T) {
 
 	// --- A LOCAL app deployed in the same run still works unchanged ---
 	localApp := &spec.App{
-		Name:   remoteNodeLocalAppLabel,
-		Image:  "traefik/whoami:latest",
-		Domain: remoteNodeLocalDomain,
-		Port:   80,
-		Node:   "local",
+		Name:     remoteNodeLocalAppLabel,
+		Image:    "traefik/whoami:latest",
+		Domain:   remoteNodeLocalDomain,
+		Port:     80,
+		Node:     "local",
+		Replicas: 1,
 	}
 	localApp.Health.Path = "/"
 	localApp.Health.Timeout = 30 * time.Second
@@ -1163,11 +1170,12 @@ func TestEndToEndAgentNodeDeploy(t *testing.T) {
 	}
 
 	app := &spec.App{
-		Name:   agentDeployAppLabel,
-		Image:  "traefik/whoami:latest",
-		Domain: agentDeployDomain,
-		Port:   80,
-		Node:   agentDeployNodeName,
+		Name:     agentDeployAppLabel,
+		Image:    "traefik/whoami:latest",
+		Domain:   agentDeployDomain,
+		Port:     80,
+		Node:     agentDeployNodeName,
+		Replicas: 1,
 	}
 	app.Health.Path = "/"
 	app.Health.Timeout = 30 * time.Second
@@ -1540,11 +1548,12 @@ func TestEndToEndSelfHeal(t *testing.T) {
 	rec := reconciler.New(node.FakeResolver{"local": fn}, fr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
 
 	app := &spec.App{
-		Name:   selfHealAppLabel,
-		Image:  "whoami:fake",
-		Domain: selfHealDomain,
-		Port:   8080,
-		Node:   "local",
+		Name:     selfHealAppLabel,
+		Image:    "whoami:fake",
+		Domain:   selfHealDomain,
+		Port:     8080,
+		Node:     "local",
+		Replicas: 1,
 	}
 	app.Health.Timeout = 150 * time.Millisecond
 
@@ -1704,10 +1713,11 @@ func TestEndToEndScheduling(t *testing.T) {
 	rec.SetReachability(reach)
 
 	app := &spec.App{
-		Name:   schedAppLabel,
-		Image:  "whoami:fake",
-		Domain: schedDomain,
-		Port:   8080,
+		Name:     schedAppLabel,
+		Image:    "whoami:fake",
+		Domain:   schedDomain,
+		Port:     8080,
+		Replicas: 1,
 		// Node is deliberately left unset: this is the scheduling case under
 		// test. Pool is also unset, meaning "default" — the pool both
 		// registered nodes (and the implicit local node) live in.
@@ -1867,10 +1877,11 @@ func TestEndToEndNodeDrain(t *testing.T) {
 	rec.SetReachability(reach)
 
 	app := &spec.App{
-		Name:   drainAppLabel,
-		Image:  "whoami:fake",
-		Domain: drainDomain,
-		Port:   8080,
+		Name:     drainAppLabel,
+		Image:    "whoami:fake",
+		Domain:   drainDomain,
+		Port:     8080,
+		Replicas: 1,
 		// Node/Pool left unset: the scheduler places it.
 	}
 	app.Health.Timeout = 150 * time.Millisecond
@@ -2059,10 +2070,11 @@ func TestEndToEndNodeLossFailover(t *testing.T) {
 
 	// Unpinned: the scheduler places it on nodeA (most free memory).
 	scheduledApp := &spec.App{
-		Name:   failoverAppLabel,
-		Image:  "whoami:fake",
-		Domain: failoverDomain,
-		Port:   8080,
+		Name:     failoverAppLabel,
+		Image:    "whoami:fake",
+		Domain:   failoverDomain,
+		Port:     8080,
+		Replicas: 1,
 	}
 	scheduledApp.Health.Timeout = 150 * time.Millisecond
 	if _, err := rec.Apply(ctx, scheduledApp); err != nil {
@@ -2083,11 +2095,12 @@ func TestEndToEndNodeLossFailover(t *testing.T) {
 	// Pinned explicitly to nodeA: must never move, no matter what happens to
 	// nodeA.
 	pinnedApp := &spec.App{
-		Name:   failoverPinnedAppLabel,
-		Image:  "whoami:fake",
-		Domain: failoverPinnedDomain,
-		Port:   8080,
-		Node:   failoverNodeAName,
+		Name:     failoverPinnedAppLabel,
+		Image:    "whoami:fake",
+		Domain:   failoverPinnedDomain,
+		Port:     8080,
+		Node:     failoverNodeAName,
+		Replicas: 1,
 	}
 	pinnedApp.Health.Timeout = 150 * time.Millisecond
 	pinnedDep, err := rec.Apply(ctx, pinnedApp)

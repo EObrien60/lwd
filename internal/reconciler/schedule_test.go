@@ -34,7 +34,7 @@ func newSchedulingReconciler(t *testing.T, extra ...string) (*Reconciler, node.F
 // ("") so it is subject to scheduling, unlike testApp() (which pins
 // Node:"local").
 func unpinnedApp(name string) *spec.App {
-	return &spec.App{Name: name, Image: "img:1", Domain: name + ".example.com", Port: 8080}
+	return &spec.App{Name: name, Image: "img:1", Domain: name + ".example.com", Port: 8080, Replicas: 1}
 }
 
 // specNode unmarshals a deployment's JSON Spec snapshot and returns its Node

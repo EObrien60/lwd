@@ -99,7 +99,7 @@ func newTestReconcilerFull(t *testing.T, sec SecretResolver) (*Reconciler, *node
 }
 
 func testApp() *spec.App {
-	return &spec.App{Name: "blog", Image: "img:1", Domain: "blog.example.com", Port: 8080, Node: "local"}
+	return &spec.App{Name: "blog", Image: "img:1", Domain: "blog.example.com", Port: 8080, Node: "local", Replicas: 1}
 }
 
 // testGitApp returns a valid git-built app spec with no backing services: a
@@ -107,12 +107,13 @@ func testApp() *spec.App {
 // design (docs/superpowers/specs/2026-07-04-lwd-phase6-git-deploy-design.md).
 func testGitApp() *spec.App {
 	return &spec.App{
-		Name:   "gitapp",
-		Domain: "gitapp.example.com",
-		Port:   8080,
-		Node:   "local",
-		Git:    &spec.Git{URL: "https://example.com/repo.git", Ref: "main"},
-		Build:  &spec.Build{Dockerfile: "Dockerfile"},
+		Name:     "gitapp",
+		Domain:   "gitapp.example.com",
+		Port:     8080,
+		Node:     "local",
+		Replicas: 1,
+		Git:      &spec.Git{URL: "https://example.com/repo.git", Ref: "main"},
+		Build:    &spec.Build{Dockerfile: "Dockerfile"},
 	}
 }
 
@@ -126,12 +127,13 @@ func testComposeApp(t *testing.T, content string) *spec.App {
 		t.Fatalf("write compose file: %v", err)
 	}
 	return &spec.App{
-		Name:    "webapp",
-		Compose: path,
-		Service: "web",
-		Domain:  "webapp.example.com",
-		Port:    8080,
-		Node:    "local",
+		Name:     "webapp",
+		Compose:  path,
+		Service:  "web",
+		Domain:   "webapp.example.com",
+		Port:     8080,
+		Node:     "local",
+		Replicas: 1,
 	}
 }
 
