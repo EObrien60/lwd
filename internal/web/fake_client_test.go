@@ -5,6 +5,7 @@ import (
 	"io"
 
 	"lwd/internal/api"
+	"lwd/internal/client"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
@@ -37,6 +38,21 @@ type fakeDaemon struct {
 
 	logsData string
 	logsErr  error
+
+	nodes    []client.NodeStatus
+	nodesErr error
+
+	addedNodes []nodeAddCall
+	addNodeErr error
+
+	removedNodes  []string
+	removeNodeErr error
+}
+
+// nodeAddCall captures the arguments of one AddNode call, so tests can assert
+// on them (including agent_url) without a real daemon.
+type nodeAddCall struct {
+	Name, SSHHost, MeshAddr, AgentURL string
 }
 
 func newFakeDaemon() *fakeDaemon {
@@ -128,5 +144,28 @@ func (f *fakeDaemon) DeleteSecret(ctx context.Context, app, key string) error {
 	if f.secrets[app] != nil {
 		delete(f.secrets[app], key)
 	}
+	return nil
+}
+
+func (f *fakeDaemon) Nodes(ctx context.Context) ([]client.NodeStatus, error) {
+	if f.nodesErr != nil {
+		return nil, f.nodesErr
+	}
+	return f.nodes, nil
+}
+
+func (f *fakeDaemon) AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL string) error {
+	if f.addNodeErr != nil {
+		return f.addNodeErr
+	}
+	f.addedNodes = append(f.addedNodes, nodeAddCall{Name: name, SSHHost: sshHost, MeshAddr: meshAddr, AgentURL: agentURL})
+	return nil
+}
+
+func (f *fakeDaemon) RemoveNode(ctx context.Context, name string) error {
+	if f.removeNodeErr != nil {
+		return f.removeNodeErr
+	}
+	f.removedNodes = append(f.removedNodes, name)
 	return nil
 }

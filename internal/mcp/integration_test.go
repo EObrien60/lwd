@@ -73,6 +73,9 @@ var expectedToolNames = []string{
 	"lwd_secret_set",
 	"lwd_secret_list",
 	"lwd_secret_delete",
+	"lwd_node_list",
+	"lwd_node_add",
+	"lwd_node_remove",
 }
 
 // TestIntegrationMCPClientDaemon drives lwd-mcp's real MCP server (Server,
