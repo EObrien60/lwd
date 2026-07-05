@@ -13,7 +13,7 @@ import (
 // lwd network for a local surface (Caddy resolves it by Docker DNS), or a
 // remote node's WireGuard mesh IP for a surface placed via node= (Caddy,
 // running on the controller, reaches it over the mesh instead — see
-// internal/reconciler's deployBlueGreenSurface).
+// internal/reconciler's deployReplicaSet).
 type Upstream struct {
 	Host string
 	Port int

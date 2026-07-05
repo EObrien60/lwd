@@ -130,7 +130,7 @@ func TestRescheduleMovesToAnotherNode(t *testing.T) {
 	}
 
 	// The old container must be removed from web1 (the excluded node) — NOT
-	// web2 (the new node deployBlueGreenSurface actually ran against).
+	// web2 (the new node deployReplicaSet actually ran against).
 	if !contains(web1.Calls, "RemoveContainer:"+cur.ContainerID) {
 		t.Errorf("want old container %q removed from web1, calls: %v", cur.ContainerID, web1.Calls)
 	}

@@ -257,7 +257,7 @@ func (r *Reconciler) tryHeal(ctx context.Context, app string, cur *store.Deploym
 		return &AppHealth{App: app, State: SurfaceFailed, LastError: err.Error(), HealAttempts: hs.attempts, UpdatedAt: now}
 	}
 
-	// Success: deployBlueGreenSurface already called resetHeal(app), so hs is
+	// Success: deployReplicaSet already called resetHeal(app), so hs is
 	// gone from r.heal now; report healthy with a reset attempt count.
 	return &AppHealth{App: app, State: SurfaceHealthy, HealAttempts: 0, UpdatedAt: now}
 }
@@ -279,7 +279,7 @@ func healBackoff(attempts int) time.Duration {
 // is called from reconcileApp — which does not already hold r.mu — after
 // observing a surface as healthy, so it locks internally; this is distinct
 // from resetHeal, which assumes the lock is already held (called from within
-// deployBlueGreenSurface/tryHeal).
+// deployReplicaSet/tryHeal).
 func (r *Reconciler) clearHealAttempts(app string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

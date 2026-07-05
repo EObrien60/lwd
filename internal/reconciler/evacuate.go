@@ -27,9 +27,9 @@ import (
 // unchanged and cur is left completely untouched — no capacity elsewhere
 // means nothing to do.
 //
-// Once the new surface is live, deployBlueGreenSurface's OWN "retire the
+// Once the new surface is live, deployReplicaSet's OWN "retire the
 // prior CurrentDeployment" logic has already run — but against the NEW
-// node's client n, since deployBlueGreenSurface always operates against
+// node's client n, since deployReplicaSet always operates against
 // whichever node the deploy targets. At the point that logic runs,
 // store.CurrentDeployment(app.Name) still resolves to cur (the new row
 // hasn't been recorded yet), so it calls n.RemoveContainer(cur.ContainerID)
@@ -40,7 +40,7 @@ import (
 // itself (best-effort — skipped, with a log line, if excludeNode is
 // unreachable, e.g. a node-loss eviction, in which case the container dies
 // along with its node) and retires cur (idempotent: a no-op if
-// deployBlueGreenSurface's own logic already did it, which it will have in
+// deployReplicaSet's own logic already did it, which it will have in
 // the common case).
 //
 // Callers MUST hold r.mu. cur must be the app's current, Scheduled surface
