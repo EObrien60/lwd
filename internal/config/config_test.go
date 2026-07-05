@@ -65,3 +65,40 @@ func TestHealMaxAttemptsInvalid(t *testing.T) {
 		t.Errorf("HealMaxAttempts() = %v, want default 5 for \"x\"", got)
 	}
 }
+
+// TestFailoverGraceDefault covers Phase 11b Task 5's default: an unset
+// LWD_FAILOVER_GRACE falls back to 60s.
+func TestFailoverGraceDefault(t *testing.T) {
+	if got := FailoverGrace(); got != 60*time.Second {
+		t.Errorf("FailoverGrace() = %v, want default 60s", got)
+	}
+}
+
+// TestFailoverGraceEnv covers a valid LWD_FAILOVER_GRACE override.
+func TestFailoverGraceEnv(t *testing.T) {
+	t.Setenv("LWD_FAILOVER_GRACE", "10s")
+	if got := FailoverGrace(); got != 10*time.Second {
+		t.Errorf("FailoverGrace() = %v, want 10s", got)
+	}
+}
+
+// TestFailoverGraceNonPositive covers the same non-positive/unparseable guard
+// as ReconcileInterval: "0s"/"-1s"/garbage must all fall back to the 60s
+// default rather than letting a degenerate grace period (e.g. instant
+// failover on a zero grace) reach the reconcile loop.
+func TestFailoverGraceNonPositive(t *testing.T) {
+	t.Setenv("LWD_FAILOVER_GRACE", "0s")
+	if got := FailoverGrace(); got != 60*time.Second {
+		t.Errorf("FailoverGrace() = %v, want default 60s for \"0s\"", got)
+	}
+
+	t.Setenv("LWD_FAILOVER_GRACE", "-1s")
+	if got := FailoverGrace(); got != 60*time.Second {
+		t.Errorf("FailoverGrace() = %v, want default 60s for \"-1s\"", got)
+	}
+
+	t.Setenv("LWD_FAILOVER_GRACE", "garbage")
+	if got := FailoverGrace(); got != 60*time.Second {
+		t.Errorf("FailoverGrace() = %v, want default 60s for \"garbage\"", got)
+	}
+}

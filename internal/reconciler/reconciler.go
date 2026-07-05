@@ -80,14 +80,24 @@ type Reconciler struct {
 	mu       sync.Mutex
 
 	// healthMu guards only health, populated by the Phase 10 continuous
-	// reconciler loop and read via HealthSnapshot. heal is guarded by r.mu
-	// instead (it's only ever touched by code paths that already hold it).
-	// reach and nudge are set once at startup via their setters below.
+	// reconciler loop and read via HealthSnapshot. heal and unreachableSince
+	// are guarded by r.mu instead (they're only ever touched by code paths
+	// that already hold it). reach and nudge are set once at startup via
+	// their setters below.
 	healthMu sync.RWMutex
 	health   Health
 	reach    Reachability
 	nudge    chan<- struct{}
 	heal     map[string]*healState
+
+	// unreachableSince tracks, per registered node name (never "local"), the
+	// time it was FIRST observed unreachable by the current unbroken streak
+	// of failed probes — Phase 11b Task 5's automatic node-loss failover
+	// gate. failoverLostNodes deletes a node's entry the moment it's
+	// observed reachable again (so a later blip starts a fresh grace
+	// window) or once it's been evacuated (so a successful failover doesn't
+	// re-fire on every subsequent pass). Guarded by r.mu.
+	unreachableSince map[string]time.Time
 }
 
 // healState tracks one app's in-progress self-heal attempts: how many
@@ -107,7 +117,7 @@ type healState struct {
 // `docker compose`, a Git source used to clone git-built apps, and a Builder
 // used to `docker build` them.
 func New(resolver node.Resolver, r router.Router, s *store.Store, sec SecretResolver, comp compose.Composer, src source.Git, bld build.Builder) *Reconciler {
-	return &Reconciler{resolver: resolver, router: r, store: s, secrets: sec, compose: comp, src: src, bld: bld, heal: map[string]*healState{}}
+	return &Reconciler{resolver: resolver, router: r, store: s, secrets: sec, compose: comp, src: src, bld: bld, heal: map[string]*healState{}, unreachableSince: map[string]time.Time{}}
 }
 
 // SetReachability supplies the Reachability implementation (typically a
@@ -680,6 +690,27 @@ func (r *Reconciler) rollbackGitLocked(ctx context.Context, app *spec.App, sched
 	}
 
 	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr, scheduled)
+}
+
+// rollbackImage redeploys app (a restored plain image app's spec snapshot —
+// neither git-built nor compose) directly through the blue-green surface
+// path, preserving scheduled (the placement provenance of the snapshot being
+// restored) exactly the way rollbackGit does for a git app: Rollback's
+// caller passes prev.Scheduled, since app.Node is already the concrete node
+// that snapshot ran on, and Apply's own resolvePlacement can no longer tell
+// a scheduler-placed surface apart from an explicitly pinned one at that
+// point — see applyImageProvenance's doc comment for the same reasoning
+// healSurfaceLocked/rescheduleSurfaceLocked rely on. Unlike applyImage, this
+// takes r.mu itself: Rollback (its only caller for the image branch) does
+// not hold the lock, to avoid deadlocking against Apply.
+func (r *Reconciler) rollbackImage(ctx context.Context, app *spec.App, scheduled bool) (*store.Deployment, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err := app.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid spec: %w", err)
+	}
+	return r.applyImageProvenance(ctx, app, &scheduled)
 }
 
 // healSurfaceLocked recreates a dead surface from cur, the app's current
@@ -1454,9 +1485,25 @@ func (r *Reconciler) Rollback(ctx context.Context, app string) (*store.Deploymen
 			return nil, fmt.Errorf("close temp compose file: %w", err)
 		}
 		restored.Compose = tmp.Name()
+		// A compose app is never Scheduled (compose apps aren't
+		// scheduler-placed — resolvePlacement/applyCompose never consult the
+		// scheduler for one), so Apply's own provenance here is already
+		// correct; no override needed, unlike the plain-image branch below.
+		return r.Apply(ctx, &restored)
 	}
 
-	return r.Apply(ctx, &restored)
+	// A plain image app (neither git-built nor compose): restored.Node is
+	// already the concrete node the snapshot being restored ran on, so
+	// delegating to Apply would let its resolvePlacement misclassify a
+	// scheduler-placed surface as an operator pin (Scheduled=false),
+	// silently losing placement provenance — exactly the bug the git branch
+	// above avoids via rollbackGit(..., prev.Scheduled). rollbackImage closes
+	// that gap for the image path.
+	dep, err := r.rollbackImage(ctx, &restored, prev.Scheduled)
+	if err == nil {
+		r.signalNudge()
+	}
+	return dep, err
 }
 
 // checkHealth gates the blue-green cutover using lwd's layered health policy,
