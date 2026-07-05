@@ -1,8 +1,10 @@
 package node
 
 import (
+	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // Resolver maps a node name — as declared by an app's `node = "..."` field in
@@ -24,44 +26,87 @@ type Resolver interface {
 }
 
 // remoteEntry is a cached remote Node alongside the mesh address and docker
-// host its registry row carried, so a repeat Resolve/ResolveMeta for the same
-// name doesn't need to re-run lookup.
+// host its registry row carried, and which transport ("agent" or "ssh") was
+// selected for it, so a repeat Resolve/ResolveMeta/Reachable for the same
+// name doesn't need to re-run lookup or re-probe.
 type remoteEntry struct {
 	node       Node
 	meshAddr   string
 	dockerHost string
+	transport  string
 }
+
+// agentPingTimeout bounds how long ResolveMeta/Reachable wait for a remote
+// node's agent to answer /healthz before falling back to (or reporting)
+// docker-over-ssh.
+const agentPingTimeout = 3 * time.Second
 
 // RegistryResolver is the production Resolver: "" and "local" resolve to a
 // fixed local Node, and any other name is resolved via lookup — a closure
 // the daemon supplies over its store's nodes registry — so this package
 // never imports internal/store (which would create an import cycle, since
 // store already depends on nothing here but the daemon wires node and store
-// together). A remote Node, once built via NewRemoteSSH, is cached by name:
-// repeated deploys to the same node reuse one Docker client rather than
-// dialing ssh again on every Resolve.
+// together). A remote Node is cached by name once built: repeated deploys to
+// the same node reuse one client (agent HTTP or ssh Docker) rather than
+// re-probing or re-dialing on every Resolve.
+//
+// For a registered node whose lookup row carries an agent_url, ResolveMeta
+// prefers the P9b agent transport (NewAgentNode) over the P9a
+// docker-over-ssh transport (NewRemoteSSH), but only if the agent actually
+// answers its /healthz endpoint; otherwise it falls back to ssh exactly as
+// in P9a. meshAddr and dockerHost are unaffected by this choice — they
+// describe the node's registry row, not which transport executes its
+// container primitives.
 type RegistryResolver struct {
-	local  Node
-	lookup func(name string) (sshHost, meshAddr string, ok bool, err error)
+	local Node
+	token string
+
+	// lookup must return the node's ssh host, mesh address, and agent base
+	// URL (agentURL is "" if the node has none registered) and ok=true if
+	// name is registered, ok=false (no error) if it is not, or a non-nil
+	// error if the lookup itself failed (e.g. a store error) —
+	// Resolve/ResolveMeta/Reachable propagate each of these distinctly.
+	lookup func(name string) (sshHost, meshAddr, agentURL string, ok bool, err error)
+
+	// newAgent and newSSH build the two remote transports; both are
+	// overridden in tests (to return *Fake Nodes) so transport-selection
+	// logic can be exercised without a real network or ssh binary. Their
+	// defaults, set by NewRegistryResolver, are production behavior.
+	newAgent func(baseURL, token string) Node
+	newSSH   func(sshHost string) (Node, error)
 
 	mu      sync.Mutex
 	remotes map[string]remoteEntry
 }
 
-// NewRegistryResolver returns a RegistryResolver. lookup must return the
-// node's ssh host and mesh address and ok=true if name is registered,
-// ok=false (no error) if it is not, or a non-nil error if the lookup itself
-// failed (e.g. a store error) — Resolve/ResolveMeta propagate each of these
+// NewRegistryResolver returns a RegistryResolver. token is the shared agent
+// bearer token (the controller's LWD_AGENT_TOKEN) used to authenticate to
+// every registered node's agent. lookup must return the node's ssh host,
+// mesh address, and agent URL and ok=true if name is registered, ok=false
+// (no error) if it is not, or a non-nil error if the lookup itself failed
+// (e.g. a store error) — Resolve/ResolveMeta propagate each of these
 // distinctly.
-func NewRegistryResolver(local Node, lookup func(name string) (sshHost, meshAddr string, ok bool, err error)) *RegistryResolver {
-	return &RegistryResolver{local: local, lookup: lookup, remotes: map[string]remoteEntry{}}
+func NewRegistryResolver(local Node, token string, lookup func(name string) (sshHost, meshAddr, agentURL string, ok bool, err error)) *RegistryResolver {
+	return &RegistryResolver{
+		local:   local,
+		token:   token,
+		lookup:  lookup,
+		remotes: map[string]remoteEntry{},
+		newAgent: func(baseURL, token string) Node {
+			return NewAgentNode(baseURL, token)
+		},
+		newSSH: func(sshHost string) (Node, error) {
+			return NewRemoteSSH(sshHost)
+		},
+	}
 }
 
 // Resolve returns the local node for "" or "local". For any other name, it
 // returns a cached remote node if one was already built for that name;
-// otherwise it calls lookup once, and on success builds and caches a
-// docker-over-ssh Node via NewRemoteSSH before returning it. An unregistered
-// name (lookup ok=false) produces an "unknown node" error.
+// otherwise it calls lookup once, and on success builds and caches a remote
+// Node (preferring the agent transport, see ResolveMeta) before returning
+// it. An unregistered name (lookup ok=false) produces an "unknown node"
+// error.
 func (rr *RegistryResolver) Resolve(nodeName string) (Node, error) {
 	n, _, _, _, err := rr.ResolveMeta(nodeName)
 	return n, err
@@ -70,6 +115,15 @@ func (rr *RegistryResolver) Resolve(nodeName string) (Node, error) {
 // ResolveMeta is Resolve plus the resolved node's mesh address, its
 // DOCKER_HOST target, and whether it is the local node. See
 // Resolver.ResolveMeta.
+//
+// For a registered (non-local) name, once lookup succeeds: if the row
+// carries an agent_url, ResolveMeta builds an agent Node and pings it with a
+// short timeout; on a successful ping that agent Node is used (transport
+// "agent"). Otherwise — no agent_url, or the ping failed — a
+// docker-over-ssh Node is built via newSSH (transport "ssh"), exactly as in
+// P9a. meshAddr and dockerHost are unchanged by this choice: meshAddr is the
+// looked-up mesh address, and dockerHost is always "ssh://" + sshHost
+// regardless of which transport executes the container primitives.
 func (rr *RegistryResolver) ResolveMeta(nodeName string) (Node, string, string, bool, error) {
 	if nodeName == "" || nodeName == "local" {
 		return rr.local, "", "", true, nil
@@ -82,7 +136,7 @@ func (rr *RegistryResolver) ResolveMeta(nodeName string) (Node, string, string, 
 		return e.node, e.meshAddr, e.dockerHost, false, nil
 	}
 
-	sshHost, meshAddr, ok, err := rr.lookup(nodeName)
+	sshHost, meshAddr, agentURL, ok, err := rr.lookup(nodeName)
 	if err != nil {
 		return nil, "", "", false, fmt.Errorf("look up node %q: %w", nodeName, err)
 	}
@@ -90,25 +144,94 @@ func (rr *RegistryResolver) ResolveMeta(nodeName string) (Node, string, string, 
 		return nil, "", "", false, fmt.Errorf("unknown node %q", nodeName)
 	}
 
-	n, err := NewRemoteSSH(sshHost)
+	dockerHost := "ssh://" + sshHost
+
+	n, transport, err := rr.buildTransport(sshHost, agentURL)
 	if err != nil {
 		return nil, "", "", false, fmt.Errorf("connect to node %q (ssh://%s): %w", nodeName, sshHost, err)
 	}
-	dockerHost := "ssh://" + sshHost
-	rr.remotes[nodeName] = remoteEntry{node: n, meshAddr: meshAddr, dockerHost: dockerHost}
+
+	rr.remotes[nodeName] = remoteEntry{node: n, meshAddr: meshAddr, dockerHost: dockerHost, transport: transport}
 	return n, meshAddr, dockerHost, false, nil
 }
 
+// buildTransport selects and builds the Node for a registered remote node:
+// the agent transport if agentURL is set and its /healthz ping succeeds,
+// otherwise docker-over-ssh via newSSH.
+func (rr *RegistryResolver) buildTransport(sshHost, agentURL string) (Node, string, error) {
+	if agentURL != "" {
+		an := rr.newAgent(agentURL, rr.token)
+		ctx, cancel := context.WithTimeout(context.Background(), agentPingTimeout)
+		pingErr := an.Ping(ctx)
+		cancel()
+		if pingErr == nil {
+			return an, "agent", nil
+		}
+	}
+	n, err := rr.newSSH(sshHost)
+	if err != nil {
+		return nil, "", err
+	}
+	return n, "ssh", nil
+}
+
 // Invalidate evicts the cached remote node for name, if any, so a subsequent
-// Resolve/ResolveMeta re-runs lookup and builds a fresh docker-over-ssh Node
-// instead of returning a stale cached one. Call this whenever a node's
-// registry row changes — added/updated (ssh_host or mesh_addr may have
-// changed) or removed — so a stale ssh client never lingers. A no-op if
-// nodeName has no cached entry (e.g. it was never resolved, or is "local").
+// Resolve/ResolveMeta re-runs lookup and rebuilds (and, if applicable,
+// re-probes the agent for) a fresh Node instead of returning a stale cached
+// one. Call this whenever a node's registry row changes — added/updated
+// (ssh_host, mesh_addr, or agent_url may have changed) or removed — so a
+// stale client never lingers. A no-op if nodeName has no cached entry (e.g.
+// it was never resolved, or is "local").
 func (rr *RegistryResolver) Invalidate(nodeName string) {
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
 	delete(rr.remotes, nodeName)
+}
+
+// Reachable reports which transport would be used (or was cached) for name
+// and whether that transport currently answers a ping — status information
+// for the CLI/web UI, distinct from Resolve/ResolveMeta because it must
+// never fail a deploy: it always returns an answer, never an error.
+//
+// "" and "local" always report ("local", true). For any other name: if a
+// remote Node is already cached for it, that cached node's transport is
+// pinged directly. Otherwise lookup is run fresh (without caching the
+// result) — a lookup error or unregistered name reports ("", false); an
+// agent_url is pinged first (reporting "agent" on success), else (or on a
+// failed agent ping) docker-over-ssh is built and pinged (reporting "ssh"
+// with the ping outcome). A transport that fails to even build (e.g. ssh
+// key setup) is reported as not reachable with the transport it attempted,
+// rather than panicking.
+func (rr *RegistryResolver) Reachable(ctx context.Context, name string) (string, bool) {
+	if name == "" || name == "local" {
+		return "local", true
+	}
+
+	rr.mu.Lock()
+	e, cached := rr.remotes[name]
+	rr.mu.Unlock()
+
+	if cached {
+		return e.transport, e.node.Ping(ctx) == nil
+	}
+
+	sshHost, _, agentURL, ok, err := rr.lookup(name)
+	if err != nil || !ok {
+		return "", false
+	}
+
+	if agentURL != "" {
+		an := rr.newAgent(agentURL, rr.token)
+		if an.Ping(ctx) == nil {
+			return "agent", true
+		}
+	}
+
+	n, err := rr.newSSH(sshHost)
+	if err != nil {
+		return "ssh", false
+	}
+	return "ssh", n.Ping(ctx) == nil
 }
 
 // FakeResolver is a Resolver backed by a plain map, for tests: it returns

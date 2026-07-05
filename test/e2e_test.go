@@ -807,15 +807,15 @@ func TestEndToEndRemoteNode(t *testing.T) {
 	// A real RegistryResolver over the store, exactly like the daemon builds
 	// in cli.runDaemon — the thing actually under test here, not a
 	// node.FakeResolver.
-	resolver := node.NewRegistryResolver(n, func(name string) (string, string, bool, error) {
+	resolver := node.NewRegistryResolver(n, "", func(name string) (string, string, string, bool, error) {
 		rec, err := s.GetNode(name)
 		if err != nil {
-			return "", "", false, err
+			return "", "", "", false, err
 		}
 		if rec == nil {
-			return "", "", false, nil
+			return "", "", "", false, nil
 		}
-		return rec.SSHHost, rec.MeshAddr, true, nil
+		return rec.SSHHost, rec.MeshAddr, rec.AgentURL, true, nil
 	})
 	rec := reconciler.New(resolver, rtr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
 

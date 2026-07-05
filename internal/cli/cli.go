@@ -107,15 +107,16 @@ func runDaemon() int {
 	// declares via a Resolver: "" and "local" always resolve to n, the
 	// daemon's own local Docker; any other name is looked up in the store's
 	// nodes registry (populated by `lwd node add`).
-	resolver := node.NewRegistryResolver(n, func(name string) (string, string, bool, error) {
+	agentToken := os.Getenv("LWD_AGENT_TOKEN")
+	resolver := node.NewRegistryResolver(n, agentToken, func(name string) (string, string, string, bool, error) {
 		rec, err := s.GetNode(name)
 		if err != nil {
-			return "", "", false, err
+			return "", "", "", false, err
 		}
 		if rec == nil {
-			return "", "", false, nil
+			return "", "", "", false, nil
 		}
-		return rec.SSHHost, rec.MeshAddr, true, nil
+		return rec.SSHHost, rec.MeshAddr, rec.AgentURL, true, nil
 	})
 
 	// resolver is passed as the api.NodeCacheInvalidator too: POST/DELETE
