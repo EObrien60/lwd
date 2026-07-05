@@ -15,9 +15,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -100,13 +102,19 @@ func (r *Reconciler) localNode() (node.Node, error) {
 // ensureImageOnNode makes ref available on target, which may be a remote
 // (docker-over-ssh) node that does not share the controller's local image
 // store. It is used in place of a plain target.EnsureImage for any node that
-// ResolveMeta reports as non-local:
+// ResolveMeta reports as non-local, and mirrors Local.EnsureImage's
+// pinned-vs-mutable distinction so a remote app re-pulls a moved tag the
+// same way a local one does:
 //
-//  1. If target already reports ref present, nothing to do.
-//  2. Otherwise, try target.EnsureImage (a registry pull run ON the target
-//     node itself) — this covers the common case of a public/private image
-//     ref the target can fetch on its own, with no data ever flowing through
-//     the controller. Its error, if any, is deliberately ignored here: a
+//  1. If ref is a pinned digest (contains "@sha256:") and target already
+//     reports it present, nothing to do — pinned digests are immutable, so a
+//     present copy is used as-is with no pull attempted.
+//  2. Otherwise (a mutable tag, or a pinned digest not yet present), try
+//     target.EnsureImage (a registry pull run ON the target node itself) —
+//     this covers the common case of a public/private image ref the target
+//     can fetch on its own, with no data ever flowing through the
+//     controller, AND picks up a tag that has moved since it was last
+//     pulled. Its error, if any, is deliberately ignored here: a
 //     locally-built or otherwise unregistered ref is expected to fail this
 //     step, and the only thing that matters is whether the image ended up
 //     present.
@@ -119,17 +127,22 @@ func (r *Reconciler) localNode() (node.Node, error) {
 // misbehaving, not that the image needs fetching, so no pull or transfer is
 // attempted.
 func (r *Reconciler) ensureImageOnNode(ctx context.Context, target node.Node, ref string) error {
-	present, err := target.ImagePresent(ctx, ref)
-	if err != nil {
-		return fmt.Errorf("check image present: %w", err)
-	}
-	if present {
-		return nil
+	if strings.Contains(ref, "@sha256:") {
+		present, err := target.ImagePresent(ctx, ref)
+		if err != nil {
+			return fmt.Errorf("check image present: %w", err)
+		}
+		if present {
+			return nil
+		}
 	}
 
+	// Mutable tag (always re-pulled regardless of presence, so a moved tag
+	// is picked up), or a pinned digest confirmed absent above: attempt a
+	// pull on the target itself before falling back to a save|load transfer.
 	_ = target.EnsureImage(ctx, ref)
 
-	present, err = target.ImagePresent(ctx, ref)
+	present, err := target.ImagePresent(ctx, ref)
 	if err != nil {
 		return fmt.Errorf("check image present after pull: %w", err)
 	}
@@ -1022,6 +1035,15 @@ func (r *Reconciler) removeCompose(ctx context.Context, appName string, cur *sto
 // The node it operates against is resolved from cur's Spec snapshot's Node
 // field (the node the app was actually placed on), defaulting to "local"
 // when cur is nil or carries no snapshot.
+//
+// If that node no longer resolves (e.g. it was deregistered via `lwd node
+// rm` after the app was deployed to it), remote container/backing teardown
+// is impossible — there is nothing left to talk to — but the app must still
+// be removable: the controller-side Caddy route is removed and the
+// deployment row is retired regardless, with only the node-side cleanup
+// skipped (logged, not failed). This mirrors removeCompose's and
+// RemoveRoute's own best-effort rationale below: an app should never be
+// stuck un-removable because of state that outlived its backing node.
 func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cur *store.Deployment) error {
 	var domain string
 	nodeName := "local"
@@ -1037,22 +1059,22 @@ func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cu
 	// daemon its Up originally ran against.
 	n, _, dockerHost, _, err := r.resolver.ResolveMeta(nodeName)
 	if err != nil {
-		return fmt.Errorf("resolve node %q: %w", nodeName, err)
-	}
-
-	containers, err := n.ListContainers(ctx, map[string]string{"lwd.app": appName})
-	if err != nil {
-		return fmt.Errorf("list containers: %w", err)
-	}
-	for _, c := range containers {
-		if err := n.RemoveContainer(ctx, c.ID); err != nil {
-			return fmt.Errorf("remove container %s: %w", c.ID, err)
+		log.Printf("remove %s: node %q no longer resolves (%v); skipping remote container/backing teardown, still removing route and retiring", appName, nodeName, err)
+	} else {
+		containers, err := n.ListContainers(ctx, map[string]string{"lwd.app": appName})
+		if err != nil {
+			return fmt.Errorf("list containers: %w", err)
 		}
-	}
+		for _, c := range containers {
+			if err := n.RemoveContainer(ctx, c.ID); err != nil {
+				return fmt.Errorf("remove container %s: %w", c.ID, err)
+			}
+		}
 
-	if cur != nil && cur.Compose != "" {
-		if err := r.downBacking(ctx, appName, cur.Compose, dockerHost); err != nil {
-			return err
+		if cur != nil && cur.Compose != "" {
+			if err := r.downBacking(ctx, appName, cur.Compose, dockerHost); err != nil {
+				return err
+			}
 		}
 	}
 

@@ -936,6 +936,57 @@ func TestRemoveSingleServiceRemovesContainersAndRoute(t *testing.T) {
 	}
 }
 
+// TestRemoveSingleServiceDegradesWhenNodeGone covers the Phase 9a
+// final-review fix: an app whose stored node no longer resolves (e.g. it was
+// deregistered via `lwd node rm` after the app was deployed to it) must
+// still be removable. Before this fix, ResolveMeta's error hard-failed the
+// whole Remove, leaving the app's Caddy route and deployment row stuck
+// forever pointing at a node that no longer exists. Now: remote container
+// and backing teardown are skipped (nothing left to talk to, and nothing to
+// clean up there anyway since the node is gone), but the controller-side
+// Caddy route is still removed and the deployment row is still retired.
+func TestRemoveSingleServiceDegradesWhenNodeGone(t *testing.T) {
+	local := node.NewFake()
+	remote := node.NewFake()
+	fr := router.NewFakeRouter()
+	s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	resolver := node.FakeResolver{"local": local, "web1": remote}
+	r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+	app := testApp()
+	app.Node = "web1"
+	app.Health.Timeout = shortTimeout
+	fr.ProbeStatus = 200
+
+	if _, err := r.Apply(context.Background(), app); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// Simulate `lwd node rm web1`: it's gone from the registry, so a later
+	// ResolveMeta("web1") fails exactly like it would against the real
+	// RegistryResolver.
+	delete(resolver, "web1")
+
+	if err := r.Remove(context.Background(), "blog"); err != nil {
+		t.Fatalf("Remove: %v, want it to succeed (degraded) even though the node is gone", err)
+	}
+
+	if _, ok := fr.Routes["blog.example.com"]; ok {
+		t.Errorf("want route removed after Remove even with the node gone")
+	}
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur != nil {
+		t.Errorf("want no current deployment (retired) after Remove, got %+v", cur)
+	}
+}
+
 func TestApplyGitClonesBuildsDeploys(t *testing.T) {
 	r, f, fr, _, sf, bf := newTestReconcilerWithGit(t)
 	app := testGitApp()
@@ -1411,6 +1462,119 @@ func TestEnsureImageTransfersWhenAbsent(t *testing.T) {
 			if strings.HasPrefix(c, "SaveImage:") {
 				t.Errorf("want no SaveImage call, calls: %v", local.Calls)
 			}
+		}
+	})
+}
+
+// TestEnsureImageOnNodeMutableTagRefresh covers the Phase 9a final-review
+// fix: ensureImageOnNode must mirror Local.EnsureImage's pinned-vs-mutable
+// semantics on a remote node too. Before this fix it early-returned as soon
+// as target.ImagePresent was true, so a remote app declaring a mutable tag
+// (e.g. "img:latest") never re-pulled a moved tag — only a LOCAL app did,
+// via Local.EnsureImage's own always-pull-when-mutable behavior.
+func TestEnsureImageOnNodeMutableTagRefresh(t *testing.T) {
+	t.Run("mutable tag already present on target still triggers a pull", func(t *testing.T) {
+		local := node.NewFake()
+		remote := node.NewFake()
+		remote.Images = map[string]bool{"img:latest": true}
+		fr := router.NewFakeRouter()
+		s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		resolver := node.FakeResolver{"local": local, "web1": remote}
+		r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+		app := testApp()
+		app.Image = "img:latest"
+		app.Node = "web1"
+		app.Health.Timeout = shortTimeout
+		fr.ProbeStatus = 200
+
+		dep, err := r.Apply(context.Background(), app)
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if dep.Status != store.StatusRunning {
+			t.Errorf("status = %q, want running", dep.Status)
+		}
+		if !contains(remote.Calls, "EnsureImage:img:latest") {
+			t.Errorf("want target.EnsureImage called for a mutable tag even though already present, calls: %v", remote.Calls)
+		}
+	})
+
+	t.Run("pinned digest already present skips pull and transfer", func(t *testing.T) {
+		local := node.NewFake()
+		remote := node.NewFake()
+		const ref = "img@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+		remote.Images = map[string]bool{ref: true}
+		fr := router.NewFakeRouter()
+		s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		resolver := node.FakeResolver{"local": local, "web1": remote}
+		r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+		app := testApp()
+		app.Image = ref
+		app.Node = "web1"
+		app.Health.Timeout = shortTimeout
+		fr.ProbeStatus = 200
+
+		dep, err := r.Apply(context.Background(), app)
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if dep.Status != store.StatusRunning {
+			t.Errorf("status = %q, want running", dep.Status)
+		}
+		if contains(remote.Calls, "EnsureImage:"+ref) {
+			t.Errorf("want no pull for a pinned digest already present, calls: %v", remote.Calls)
+		}
+		for _, c := range local.Calls {
+			if strings.HasPrefix(c, "SaveImage:") {
+				t.Errorf("want no SaveImage call for a pinned digest already present, calls: %v", local.Calls)
+			}
+		}
+	})
+
+	t.Run("absent lwd-build tag transfers via save|load", func(t *testing.T) {
+		local := node.NewFake()
+		remote := node.NewFake()
+		const ref = "lwd-build/gitapp:deadbeefcafe"
+		fr := router.NewFakeRouter()
+		s, err := store.Open(filepath.Join(t.TempDir(), "lwd.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() { s.Close() })
+		resolver := node.FakeResolver{"local": local, "web1": remote}
+		r := New(resolver, fr, s, &fakeResolver{vals: map[string]string{}}, compose.NewFake(), source.NewFake(), build.NewFake())
+
+		app := testApp()
+		app.Image = ref
+		app.Node = "web1"
+		app.Health.Timeout = shortTimeout
+		fr.ProbeStatus = 200
+
+		dep, err := r.Apply(context.Background(), app)
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if dep.Status != store.StatusRunning {
+			t.Errorf("status = %q, want running", dep.Status)
+		}
+		if !contains(local.Calls, "SaveImage:"+ref) {
+			t.Errorf("want SaveImage on the local node for an absent lwd-build tag, calls: %v", local.Calls)
+		}
+		if !contains(remote.Calls, "LoadImage") {
+			t.Errorf("want LoadImage on the target node, calls: %v", remote.Calls)
+		}
+		if !remote.Images[ref] {
+			t.Errorf("want %s present on the target node after transfer", ref)
 		}
 	})
 }

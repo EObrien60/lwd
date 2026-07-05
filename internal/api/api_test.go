@@ -586,3 +586,97 @@ func TestNodeAddValidatesFields(t *testing.T) {
 		t.Fatalf("invalidator called %d times for rejected requests, want 0", calls)
 	}
 }
+
+// TestNodeAddRejectsReservedName covers the Phase 9a final-review fix:
+// "local" is the implicit, always-present local node (node.Resolver treats
+// "" and "local" as the local Docker daemon), so registering a remote node
+// under that name would either be silently inert or shadow the real local
+// node in confusing ways. handleNodeAdd must reject it (and an empty name)
+// with a 400, without touching the store or the cache invalidator.
+func TestNodeAddRejectsReservedName(t *testing.T) {
+	ts, inv := newTestServerWithInvalidator(t)
+
+	cases := []map[string]string{
+		{"name": "local", "ssh_host": "deploy@web1", "mesh_addr": "100.64.0.2"},
+		{"name": "", "ssh_host": "deploy@web1", "mesh_addr": "100.64.0.2"},
+	}
+	for _, c := range cases {
+		body, _ := json.Marshal(c)
+		resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /nodes %+v: %v", c, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("case %+v: status = %d, want 400", c, resp.StatusCode)
+		}
+	}
+
+	resp, err := http.Get(ts.URL + "/nodes")
+	if err != nil {
+		t.Fatalf("GET /nodes: %v", err)
+	}
+	defer resp.Body.Close()
+	var nodes []store.Node
+	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(nodes) != 0 {
+		t.Fatalf("nodes = %+v, want none registered for a rejected name", nodes)
+	}
+
+	inv.mu.Lock()
+	calls := len(inv.Calls)
+	inv.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("invalidator called %d times for rejected requests, want 0", calls)
+	}
+}
+
+// TestNodeAddValidatesMeshAddrShape covers the Phase 9a final-review fix:
+// mesh_addr must look like a plausible IP address or hostname. A valid IP
+// and a valid hostname are both accepted; whitespace-containing garbage and
+// a value carrying a URL scheme are rejected with a 400 (these would never
+// resolve to a working docker-over-ssh host or Caddy upstream).
+func TestNodeAddValidatesMeshAddrShape(t *testing.T) {
+	ts, inv := newTestServerWithInvalidator(t)
+
+	accepted := []map[string]string{
+		{"name": "web1", "ssh_host": "deploy@web1", "mesh_addr": "100.64.0.2"},
+		{"name": "web2", "ssh_host": "deploy@web2", "mesh_addr": "web2.internal"},
+	}
+	for _, c := range accepted {
+		body, _ := json.Marshal(c)
+		resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /nodes %+v: %v", c, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("case %+v: status = %d, want 204", c, resp.StatusCode)
+		}
+	}
+
+	rejected := []map[string]string{
+		{"name": "web3", "ssh_host": "deploy@web3", "mesh_addr": "a b"},
+		{"name": "web4", "ssh_host": "deploy@web4", "mesh_addr": "http://x"},
+	}
+	for _, c := range rejected {
+		body, _ := json.Marshal(c)
+		resp, err := http.Post(ts.URL+"/nodes", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /nodes %+v: %v", c, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("case %+v: status = %d, want 400", c, resp.StatusCode)
+		}
+	}
+
+	inv.mu.Lock()
+	calls := append([]string(nil), inv.Calls...)
+	inv.mu.Unlock()
+	if len(calls) != 2 || calls[0] != "web1" || calls[1] != "web2" {
+		t.Fatalf("invalidator calls = %+v, want [web1 web2] (only the two accepted adds)", calls)
+	}
+}

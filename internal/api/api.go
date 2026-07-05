@@ -5,7 +5,9 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -16,6 +18,13 @@ import (
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
+
+// hostnamePattern matches a plausible bare hostname (a single DNS label or
+// dotted sequence of them — e.g. "web1", "web1.internal", "10.0.0.1" also
+// happens to match but that's fine, IPs are valid mesh addresses too). It
+// deliberately rejects whitespace, a URL scheme, or other garbage that could
+// never be dialed as a docker-over-ssh host.
+var hostnamePattern = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$`)
 
 // NodeCacheInvalidator lets the API evict a resolver's cached remote node
 // entry when a node's registry row changes — added, updated, or removed via
@@ -264,7 +273,13 @@ func (srv *Server) invalidateNode(name string) {
 // registry. All three fields are required — an empty name, ssh_host, or
 // mesh_addr each produce a 400 with a clear error, since a partially
 // specified node can't be resolved into a working docker-over-ssh Node
-// later.
+// later. "local" is rejected too: it is the implicit, always-present local
+// node (node.Resolver treats "" and "local" as the local Docker daemon), so
+// registering a remote node under that name would either be silently inert
+// or shadow the real local node in confusing ways. mesh_addr is checked
+// against a plausible IP-or-hostname shape (net.ParseIP or hostnamePattern)
+// to catch whitespace, a URL scheme, or other garbage early, before it ever
+// reaches a docker-over-ssh dial or a Caddy upstream.
 func (srv *Server) handleNodeAdd(w http.ResponseWriter, r *http.Request) {
 	var req nodeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -275,12 +290,20 @@ func (srv *Server) handleNodeAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("name is required"))
 		return
 	}
+	if req.Name == "local" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("node name %q is reserved for the implicit local node", req.Name))
+		return
+	}
 	if req.SSHHost == "" {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("ssh_host is required"))
 		return
 	}
 	if req.MeshAddr == "" {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("mesh_addr is required"))
+		return
+	}
+	if net.ParseIP(req.MeshAddr) == nil && !hostnamePattern.MatchString(req.MeshAddr) {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("mesh_addr %q is not a valid IP address or hostname", req.MeshAddr))
 		return
 	}
 	n := store.Node{Name: req.Name, SSHHost: req.SSHHost, MeshAddr: req.MeshAddr, CreatedAt: time.Now()}
