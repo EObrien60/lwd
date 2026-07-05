@@ -2,7 +2,9 @@ package reconciler
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	"lwd/internal/compose"
 	"lwd/internal/node"
@@ -437,5 +439,324 @@ func TestEvacuateUnreachableNodeSkipsOldRemoval(t *testing.T) {
 	oldRow := depByID(t, s, "blog", cur.ID)
 	if oldRow == nil || oldRow.Status != store.StatusRetired {
 		t.Errorf("old deployment %+v, want status retired even though node unreachable", oldRow)
+	}
+}
+
+// threeReplicaSpreadApp returns a Replicas:3 unpinned app with a memory
+// requirement small enough to fit every node used by the Phase 12 Task 6
+// per-replica evacuate/failover tests below.
+func threeReplicaSpreadApp(name string) *spec.App {
+	app := unpinnedApp(name)
+	app.Replicas = 3
+	app.Requirements = &spec.Requirements{Memory: "2000"}
+	app.Health.Path = "/healthz"
+	app.Health.Timeout = shortTimeout
+	return app
+}
+
+// setDescendingCapacity gives local/web1/web2[/web3] strictly descending
+// MemAvailable (local highest) so scheduler.Place's most-free-first rule
+// deterministically places replica 0 on local, replica 1 on web1, replica 2
+// on web2, in that exact order — leaving web3 (if present) as the only node
+// with spare, unused capacity for a replaced replica to land on.
+func setDescendingCapacity(localFake *node.Fake, resolver node.FakeResolver, names ...string) {
+	localFake.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 9000}
+	mem := int64(8000)
+	for _, name := range names {
+		resolver[name].(*node.Fake).Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: mem}
+		mem -= 1000
+	}
+}
+
+// TestEvacuateMovesOnlyNodesReplicas covers Phase 12 Task 6's core
+// per-replica evacuate: a 3-replica app spread across local/web1/web2 has
+// its web1 replica (and ONLY that replica) moved to web3 when web1 is
+// evacuated — local and web2's replica containers, entries, and route
+// upstreams are completely untouched, and the deployment row is updated IN
+// PLACE (same id) rather than becoming a brand new generation.
+func TestEvacuateMovesOnlyNodesReplicas(t *testing.T) {
+	r, resolver, localFake, fr, s := newSchedulingReconciler(t, "web1", "web2", "web3")
+	ctx := context.Background()
+	fr.ProbeStatus = 200
+	setDescendingCapacity(localFake, resolver, "web1", "web2", "web3")
+
+	for i, n := range []string{"web1", "web2", "web3"} {
+		if err := s.AddNode(store.Node{Name: n, SSHHost: "deploy@" + n, MeshAddr: fmt.Sprintf("100.64.0.%d", i+2), Pool: "default"}); err != nil {
+			t.Fatalf("AddNode %s: %v", n, err)
+		}
+	}
+
+	app := threeReplicaSpreadApp("blog")
+	dep, err := r.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("initial Apply: %v", err)
+	}
+	if len(dep.Replicas) != 3 {
+		t.Fatalf("setup: want 3 replicas, got %+v", dep.Replicas)
+	}
+	wantNodes := []string{"local", "web1", "web2"}
+	for i, want := range wantNodes {
+		if dep.Replicas[i].Node != want {
+			t.Fatalf("setup: replica %d on %q, want %q (dep=%+v)", i, dep.Replicas[i].Node, want, dep.Replicas)
+		}
+	}
+
+	web1 := resolver["web1"].(*node.Fake)
+	web2 := resolver["web2"].(*node.Fake)
+	web3 := resolver["web3"].(*node.Fake)
+	preLocalRuns := runContainerCalls(localFake)
+	preWeb2Runs := runContainerCalls(web2)
+	preWeb3Runs := runContainerCalls(web3)
+	oldWeb1ContainerID := dep.Replicas[1].ContainerID
+
+	result, err := r.EvacuateNode(ctx, "web1")
+	if err != nil {
+		t.Fatalf("EvacuateNode: %v", err)
+	}
+	if !contains(result.Moved, "blog") {
+		t.Fatalf("Moved = %v, want to contain blog", result.Moved)
+	}
+	if len(result.Failed) != 0 {
+		t.Fatalf("Failed = %+v, want empty", result.Failed)
+	}
+
+	newCur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if newCur == nil || newCur.ID != dep.ID {
+		t.Fatalf("want the SAME deployment row updated in place (id %d), got %+v", dep.ID, newCur)
+	}
+	if len(newCur.Replicas) != 3 {
+		t.Fatalf("Replicas = %+v, want 3", newCur.Replicas)
+	}
+	if newCur.Replicas[0].Node != "local" || newCur.Replicas[0].ContainerID != dep.Replicas[0].ContainerID {
+		t.Errorf("replica 0 (local) must be untouched, got %+v want %+v", newCur.Replicas[0], dep.Replicas[0])
+	}
+	if newCur.Replicas[2].Node != "web2" || newCur.Replicas[2].ContainerID != dep.Replicas[2].ContainerID {
+		t.Errorf("replica 2 (web2) must be untouched, got %+v want %+v", newCur.Replicas[2], dep.Replicas[2])
+	}
+	if newCur.Replicas[1].Node != "web3" {
+		t.Errorf("replica 1 (was web1) moved to %q, want web3", newCur.Replicas[1].Node)
+	}
+
+	if got := runContainerCalls(localFake); got != preLocalRuns {
+		t.Errorf("local (untouched replica) got a new RunContainer call, want none: %v", localFake.Calls)
+	}
+	if got := runContainerCalls(web2); got != preWeb2Runs {
+		t.Errorf("web2 (untouched replica) got a new RunContainer call, want none: %v", web2.Calls)
+	}
+	if got := runContainerCalls(web3); got != preWeb3Runs+1 {
+		t.Errorf("want exactly one new RunContainer call on web3, got delta %d: %v", got-preWeb3Runs, web3.Calls)
+	}
+
+	if got := countCall(web1, "RemoveContainer:"+oldWeb1ContainerID); got != 1 {
+		t.Errorf("RemoveContainer for old web1 container called %d times, want 1: %v", got, web1.Calls)
+	}
+
+	route, ok := fr.Routes[app.Domain]
+	if !ok {
+		t.Fatalf("want a live route for %s", app.Domain)
+	}
+	if len(route.Upstreams) != 3 {
+		t.Fatalf("route.Upstreams = %+v, want 3", route.Upstreams)
+	}
+	found := false
+	for _, u := range route.Upstreams {
+		if u.Host == newCur.Replicas[1].Upstream && u.Port == newCur.Replicas[1].Port {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("route.Upstreams %+v does not contain the moved replica's new upstream %+v", route.Upstreams, newCur.Replicas[1])
+	}
+}
+
+// TestFailoverReschedulesReplicaPreservingSpread covers Phase 12 Task 6's
+// automatic-failover path: node loss for web1 (holding one replica of a
+// 3-way spread set) reschedules ONLY that replica, excluding the surviving
+// replicas' nodes (local, web2) to preserve spread — landing it on web3, the
+// only node not already running this app.
+func TestFailoverReschedulesReplicaPreservingSpread(t *testing.T) {
+	r, resolver, localFake, fr, s := newSchedulingReconciler(t, "web1", "web2", "web3")
+	ctx := context.Background()
+	fr.ProbeStatus = 200
+	setDescendingCapacity(localFake, resolver, "web1", "web2", "web3")
+
+	for i, n := range []string{"web1", "web2", "web3"} {
+		if err := s.AddNode(store.Node{Name: n, SSHHost: "deploy@" + n, MeshAddr: fmt.Sprintf("100.64.0.%d", i+2), Pool: "default"}); err != nil {
+			t.Fatalf("AddNode %s: %v", n, err)
+		}
+	}
+
+	reach := newFakeReach()
+	r.SetReachability(reach)
+
+	app := threeReplicaSpreadApp("blog")
+	dep, err := r.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("initial Apply: %v", err)
+	}
+	if len(dep.Replicas) != 3 || dep.Replicas[1].Node != "web1" {
+		t.Fatalf("setup: want replica 1 on web1, got %+v", dep.Replicas)
+	}
+	web1 := resolver["web1"].(*node.Fake)
+	oldWeb1ContainerID := dep.Replicas[1].ContainerID
+
+	reach.Set("web1", "ssh", false)
+	r.mu.Lock()
+	r.unreachableSince["web1"] = time.Now().Add(-2 * time.Minute)
+	r.mu.Unlock()
+
+	if err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	newCur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if newCur == nil || newCur.ID != dep.ID {
+		t.Fatalf("want deployment row updated in place, got %+v", newCur)
+	}
+	if newCur.Replicas[0].Node != "local" || newCur.Replicas[0].ContainerID != dep.Replicas[0].ContainerID {
+		t.Errorf("replica 0 (local) must be untouched: %+v", newCur.Replicas[0])
+	}
+	if newCur.Replicas[2].Node != "web2" || newCur.Replicas[2].ContainerID != dep.Replicas[2].ContainerID {
+		t.Errorf("replica 2 (web2) must be untouched: %+v", newCur.Replicas[2])
+	}
+	if newCur.Replicas[1].Node != "web3" {
+		t.Errorf("replica 1 (lost node web1) rescheduled to %q, want web3 (excluding survivors local/web2)", newCur.Replicas[1].Node)
+	}
+	if contains(web1.Calls, "RemoveContainer:"+oldWeb1ContainerID) {
+		t.Errorf("old container on unreachable web1 must NOT be removed, calls: %v", web1.Calls)
+	}
+
+	r.mu.Lock()
+	_, stillTracked := r.unreachableSince["web1"]
+	r.mu.Unlock()
+	if stillTracked {
+		t.Errorf("want unreachableSince[\"web1\"] cleared after failover")
+	}
+}
+
+// TestEvacuateSingleReplicaUnchanged covers Phase 12 Task 6's non-regression
+// contract via the public EvacuateNode entry point (TestRescheduleMovesToAnotherNode
+// covers the same contract at the lower rescheduleSurfaceLocked level): a
+// Replicas:1 app's evacuate is still exactly P11b's whole-surface move — a
+// brand new deployment ROW, not the existing row updated in place.
+func TestEvacuateSingleReplicaUnchanged(t *testing.T) {
+	r, resolver, localFake, fr, s := newSchedulingReconciler(t, "web1", "web2")
+	ctx := context.Background()
+	fr.ProbeStatus = 200
+
+	localFake.Cap = node.Capacity{Known: true, CPUCores: 1, MemAvailable: 1}
+	web1 := resolver["web1"].(*node.Fake)
+	web2 := resolver["web2"].(*node.Fake)
+	web1.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 9000}
+	web2.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 3000}
+
+	if err := s.AddNode(store.Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", Pool: "default"}); err != nil {
+		t.Fatalf("AddNode web1: %v", err)
+	}
+	if err := s.AddNode(store.Node{Name: "web2", SSHHost: "deploy@web2", MeshAddr: "100.64.0.3", Pool: "default"}); err != nil {
+		t.Fatalf("AddNode web2: %v", err)
+	}
+
+	app := unpinnedApp("blog") // Replicas: 1
+	app.Requirements = &spec.Requirements{Memory: "2000"}
+	app.Health.Path = "/healthz"
+	app.Health.Timeout = shortTimeout
+
+	dep, err := r.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("initial Apply: %v", err)
+	}
+	if len(dep.Replicas) != 1 || dep.Replicas[0].Node != "web1" {
+		t.Fatalf("setup: want single replica on web1, got %+v", dep.Replicas)
+	}
+
+	result, err := r.EvacuateNode(ctx, "web1")
+	if err != nil {
+		t.Fatalf("EvacuateNode: %v", err)
+	}
+	if !contains(result.Moved, "blog") {
+		t.Fatalf("Moved = %v, want to contain blog", result.Moved)
+	}
+
+	newCur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if newCur == nil || newCur.ID == dep.ID {
+		t.Fatalf("want a NEW deployment row (whole-surface move), got %+v (old id %d)", newCur, dep.ID)
+	}
+	if got := specNode(t, newCur.Spec); got != "web2" {
+		t.Errorf("moved to %q, want web2", got)
+	}
+
+	oldRow := depByID(t, s, "blog", dep.ID)
+	if oldRow == nil || oldRow.Status != store.StatusRetired {
+		t.Errorf("old deployment %+v, want status retired", oldRow)
+	}
+}
+
+// TestEvacuateReplicaNoCapacityFails covers the no-capacity-elsewhere case
+// for a per-replica move: a 3-replica app fills every registered node
+// (local/web1/web2), so evacuating web1's replica has nowhere else to go.
+// That replica's move must be reported Failed (app NOT reported Moved, since
+// nothing actually moved), and every replica (including the one on web1)
+// must be left completely untouched.
+func TestEvacuateReplicaNoCapacityFails(t *testing.T) {
+	r, resolver, localFake, fr, s := newSchedulingReconciler(t, "web1", "web2")
+	ctx := context.Background()
+	fr.ProbeStatus = 200
+	setDescendingCapacity(localFake, resolver, "web1", "web2")
+
+	for i, n := range []string{"web1", "web2"} {
+		if err := s.AddNode(store.Node{Name: n, SSHHost: "deploy@" + n, MeshAddr: fmt.Sprintf("100.64.0.%d", i+2), Pool: "default"}); err != nil {
+			t.Fatalf("AddNode %s: %v", n, err)
+		}
+	}
+
+	app := threeReplicaSpreadApp("blog")
+	dep, err := r.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("initial Apply: %v", err)
+	}
+	wantNodes := []string{"local", "web1", "web2"}
+	for i, want := range wantNodes {
+		if dep.Replicas[i].Node != want {
+			t.Fatalf("setup: replica %d on %q, want %q", i, dep.Replicas[i].Node, want)
+		}
+	}
+	web1 := resolver["web1"].(*node.Fake)
+	oldWeb1ContainerID := dep.Replicas[1].ContainerID
+
+	result, err := r.EvacuateNode(ctx, "web1")
+	if err != nil {
+		t.Fatalf("EvacuateNode: %v", err)
+	}
+	if contains(result.Moved, "blog") {
+		t.Errorf("Moved = %v, want NOT to contain blog (no capacity for the affected replica)", result.Moved)
+	}
+	if len(result.Failed) != 1 || result.Failed[0].App != "blog" {
+		t.Fatalf("Failed = %+v, want exactly one entry for blog", result.Failed)
+	}
+
+	after, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if after == nil || after.ID != dep.ID {
+		t.Fatalf("want same deployment row untouched, got %+v", after)
+	}
+	for i, want := range wantNodes {
+		if after.Replicas[i].Node != want || after.Replicas[i].ContainerID != dep.Replicas[i].ContainerID {
+			t.Errorf("replica %d = %+v, want untouched (node %s, container %s)", i, after.Replicas[i], want, dep.Replicas[i].ContainerID)
+		}
+	}
+	if contains(web1.Calls, "RemoveContainer:"+oldWeb1ContainerID) {
+		t.Errorf("failed move must not remove the old container: %v", web1.Calls)
 	}
 }
