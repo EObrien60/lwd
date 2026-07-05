@@ -31,7 +31,7 @@ type ClientIface interface {
 	ListSecrets(ctx context.Context, app string) ([]string, error)
 	DeleteSecret(ctx context.Context, app, key string) error
 	Nodes(ctx context.Context) ([]client.NodeStatus, error)
-	AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL string) error
+	AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL, pool string) error
 	RemoveNode(ctx context.Context, name string) error
 }
 

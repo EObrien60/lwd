@@ -37,7 +37,8 @@ func (s *Server) handleNodeAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.client.AddNode(r.Context(), req.Name, req.SSHHost, req.MeshAddr, req.AgentURL); err != nil {
+	// TODO(P11a Task 8): thread pool
+	if err := s.client.AddNode(r.Context(), req.Name, req.SSHHost, req.MeshAddr, req.AgentURL, ""); err != nil {
 		writeClientErr(w, err)
 		return
 	}

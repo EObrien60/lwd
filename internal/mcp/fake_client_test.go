@@ -53,7 +53,7 @@ type fakeClient struct {
 // nodeAddCall captures the arguments of one AddNode call, so tests can assert
 // on them (including agent_url) without a real daemon.
 type nodeAddCall struct {
-	Name, SSHHost, MeshAddr, AgentURL string
+	Name, SSHHost, MeshAddr, AgentURL, Pool string
 }
 
 func newFakeClient() *fakeClient {
@@ -155,11 +155,11 @@ func (f *fakeClient) Nodes(ctx context.Context) ([]client.NodeStatus, error) {
 	return f.nodes, nil
 }
 
-func (f *fakeClient) AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL string) error {
+func (f *fakeClient) AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL, pool string) error {
 	if f.addNodeErr != nil {
 		return f.addNodeErr
 	}
-	f.addedNodes = append(f.addedNodes, nodeAddCall{Name: name, SSHHost: sshHost, MeshAddr: meshAddr, AgentURL: agentURL})
+	f.addedNodes = append(f.addedNodes, nodeAddCall{Name: name, SSHHost: sshHost, MeshAddr: meshAddr, AgentURL: agentURL, Pool: pool})
 	return nil
 }
 

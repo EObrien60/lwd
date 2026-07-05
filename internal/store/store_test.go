@@ -690,6 +690,132 @@ func TestMigrationFromPreAgentURLSchema(t *testing.T) {
 	}
 }
 
+// TestAddNodePoolRoundTrip covers Phase 11a Task 4: a node's pool persists
+// through AddNode/GetNode/ListNodes, and an empty pool normalizes to
+// "default".
+func TestAddNodePoolRoundTrip(t *testing.T) {
+	s := openTemp(t)
+
+	n := Node{
+		Name:      "web1",
+		SSHHost:   "deploy@web1",
+		MeshAddr:  "100.64.0.2",
+		Pool:      "web",
+		CreatedAt: time.Now(),
+	}
+	if err := s.AddNode(n); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	got, err := s.GetNode("web1")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("GetNode returned nil, want node")
+	}
+	if got.Pool != "web" {
+		t.Fatalf("GetNode.Pool = %q, want %q", got.Pool, "web")
+	}
+
+	// Empty pool normalizes to "default".
+	n2 := Node{
+		Name:      "web2",
+		SSHHost:   "deploy@web2",
+		MeshAddr:  "100.64.0.3",
+		CreatedAt: time.Now(),
+	}
+	if err := s.AddNode(n2); err != nil {
+		t.Fatalf("AddNode (empty pool): %v", err)
+	}
+	got2, err := s.GetNode("web2")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got2 == nil {
+		t.Fatalf("GetNode returned nil, want node")
+	}
+	if got2.Pool != "default" {
+		t.Fatalf("GetNode.Pool = %q, want %q (default normalization)", got2.Pool, "default")
+	}
+
+	nodes, err := s.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes: %v", err)
+	}
+	byName := map[string]Node{}
+	for _, n := range nodes {
+		byName[n.Name] = n
+	}
+	if byName["web1"].Pool != "web" {
+		t.Fatalf("ListNodes web1.Pool = %q, want %q", byName["web1"].Pool, "web")
+	}
+	if byName["web2"].Pool != "default" {
+		t.Fatalf("ListNodes web2.Pool = %q, want %q", byName["web2"].Pool, "default")
+	}
+}
+
+// TestMigrationFromPrePoolSchema covers Phase 11a Task 4: a pre-11a nodes
+// table (no pool column) migrates cleanly on Open, and existing rows default
+// to pool "default".
+func TestMigrationFromPrePoolSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lwd.db")
+
+	// Step 1: Create a pre-Phase-11a nodes table (no pool column). Use raw
+	// sql.Open to bypass Open() which would create the new schema.
+	rawDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+
+	oldSchema := `
+	CREATE TABLE nodes (
+		name      TEXT    PRIMARY KEY,
+		ssh_host  TEXT    NOT NULL,
+		mesh_addr TEXT    NOT NULL,
+		created_at INTEGER NOT NULL,
+		agent_url TEXT    NOT NULL DEFAULT ''
+	);
+	`
+	if _, err := rawDB.Exec(oldSchema); err != nil {
+		rawDB.Close()
+		t.Fatalf("create old schema: %v", err)
+	}
+
+	if _, err := rawDB.Exec(
+		`INSERT INTO nodes (name, ssh_host, mesh_addr, created_at, agent_url) VALUES (?, ?, ?, ?, ?)`,
+		"legacy", "deploy@legacy", "100.64.0.9", time.Now().Unix(), "",
+	); err != nil {
+		rawDB.Close()
+		t.Fatalf("insert legacy row: %v", err)
+	}
+
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close raw DB: %v", err)
+	}
+
+	// Step 2: Open via the package's Open(), which runs migrateAddPoolColumn.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (migrated): %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	// Step 3: Verify the legacy row was preserved and Pool defaulted to "default".
+	got, err := s.GetNode("legacy")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("GetNode returned nil, want legacy row")
+	}
+	if got.SSHHost != "deploy@legacy" || got.MeshAddr != "100.64.0.9" {
+		t.Fatalf("GetNode data mismatch: got %+v", got)
+	}
+	if got.Pool != "default" {
+		t.Fatalf("GetNode.Pool = %q, want %q for migrated row", got.Pool, "default")
+	}
+}
+
 func TestDeleteNode(t *testing.T) {
 	s := openTemp(t)
 	n := Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", CreatedAt: time.Now()}

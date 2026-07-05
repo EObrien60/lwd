@@ -54,6 +54,8 @@ func Run(args []string) int {
 		return runSecret(args[1:])
 	case "node":
 		return runNode(args[1:])
+	case "pool":
+		return runPool(args[1:])
 	case "health":
 		return runHealth(args[1:])
 	default:
@@ -430,31 +432,44 @@ func runNode(args []string) int {
 func runNodeAdd(args []string) int {
 	var positional []string
 	agentURL := ""
+	pool := ""
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--agent" {
+		switch args[i] {
+		case "--agent":
 			if i+1 >= len(args) {
-				fmt.Fprintln(os.Stderr, "usage: lwd node add <name> <ssh-host> <mesh-addr> [--agent <url>]")
+				fmt.Fprintln(os.Stderr, "usage: lwd node add <name> <ssh-host> <mesh-addr> [--agent <url>] [--pool <name>]")
 				return 2
 			}
 			agentURL = args[i+1]
 			i++
-			continue
+		case "--pool":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "usage: lwd node add <name> <ssh-host> <mesh-addr> [--agent <url>] [--pool <name>]")
+				return 2
+			}
+			pool = args[i+1]
+			i++
+		default:
+			positional = append(positional, args[i])
 		}
-		positional = append(positional, args[i])
 	}
 	if len(positional) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: lwd node add <name> <ssh-host> <mesh-addr> [--agent <url>]")
+		fmt.Fprintln(os.Stderr, "usage: lwd node add <name> <ssh-host> <mesh-addr> [--agent <url>] [--pool <name>]")
 		return 2
 	}
 	name, sshHost, meshAddr := positional[0], positional[1], positional[2]
-	if err := newClient().AddNode(context.Background(), name, sshHost, meshAddr, agentURL); err != nil {
+	if err := newClient().AddNode(context.Background(), name, sshHost, meshAddr, agentURL, pool); err != nil {
 		fmt.Fprintln(os.Stderr, "node add:", err)
 		return 1
 	}
+	displayPool := pool
+	if displayPool == "" {
+		displayPool = "default"
+	}
 	if agentURL != "" {
-		fmt.Printf("added node %s (ssh %s, mesh %s, agent %s)\n", name, sshHost, meshAddr, agentURL)
+		fmt.Printf("added node %s (ssh %s, mesh %s, agent %s, pool %s)\n", name, sshHost, meshAddr, agentURL, displayPool)
 	} else {
-		fmt.Printf("added node %s (ssh %s, mesh %s)\n", name, sshHost, meshAddr)
+		fmt.Printf("added node %s (ssh %s, mesh %s, pool %s)\n", name, sshHost, meshAddr, displayPool)
 	}
 	return 0
 }
@@ -465,13 +480,40 @@ func runNodeLs() int {
 		fmt.Fprintln(os.Stderr, "node ls:", err)
 		return 1
 	}
-	fmt.Printf("%-20s %-30s %-15s %-30s %-10s %s\n", "NAME", "SSH", "MESH", "AGENT", "TRANSPORT", "REACHABLE")
+	fmt.Printf("%-20s %-30s %-15s %-30s %-10s %-10s %s\n", "NAME", "SSH", "MESH", "AGENT", "POOL", "TRANSPORT", "REACHABLE")
 	for _, n := range nodes {
 		reachable := "no"
 		if n.Reachable {
 			reachable = "yes"
 		}
-		fmt.Printf("%-20s %-30s %-15s %-30s %-10s %s\n", n.Name, n.SSHHost, n.MeshAddr, n.AgentURL, n.Transport, reachable)
+		fmt.Printf("%-20s %-30s %-15s %-30s %-10s %-10s %s\n", n.Name, n.SSHHost, n.MeshAddr, n.AgentURL, n.Pool, n.Transport, reachable)
+	}
+	return 0
+}
+
+func runPool(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: lwd pool <ls> ...")
+		return 2
+	}
+	switch args[0] {
+	case "ls":
+		return runPoolLs()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown pool command %q\n", args[0])
+		return 2
+	}
+}
+
+func runPoolLs() int {
+	pools, err := newClient().Pools(context.Background())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool ls:", err)
+		return 1
+	}
+	fmt.Printf("%-20s %s\n", "POOL", "NODES")
+	for _, p := range pools {
+		fmt.Printf("%-20s %d\n", p.Name, p.Nodes)
 	}
 	return 0
 }

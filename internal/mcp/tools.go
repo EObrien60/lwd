@@ -524,7 +524,8 @@ func (s *Server) registerLwdNodeAdd(srv *sdk.Server) {
 		Name:        "lwd_node_add",
 		Description: "Register (or update) a node lwd can place apps on: name, ssh host, mesh address, and an optional lwd-agent URL.",
 	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdNodeAddInput) (*sdk.CallToolResult, lwdNodeAddOutput, error) {
-		if err := s.client.AddNode(ctx, in.Name, in.SSHHost, in.MeshAddr, in.AgentURL); err != nil {
+		// TODO(P11a Task 8): thread pool
+		if err := s.client.AddNode(ctx, in.Name, in.SSHHost, in.MeshAddr, in.AgentURL, ""); err != nil {
 			return nil, lwdNodeAddOutput{}, err
 		}
 		return nil, lwdNodeAddOutput{OK: true, Name: in.Name}, nil

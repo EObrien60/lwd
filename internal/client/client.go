@@ -224,10 +224,11 @@ type NodeStatus struct {
 
 // AddNode registers (or updates) a node in the daemon's registry. agentURL
 // may be empty (no lwd-agent registered for this node); if non-empty, the
-// daemon validates it is a well-formed http(s) URL.
-func (c *Client) AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL string) error {
+// daemon validates it is a well-formed http(s) URL. pool may be empty, in
+// which case the daemon defaults it to "default".
+func (c *Client) AddNode(ctx context.Context, name, sshHost, meshAddr, agentURL, pool string) error {
 	body, err := json.Marshal(map[string]string{
-		"name": name, "ssh_host": sshHost, "mesh_addr": meshAddr, "agent_url": agentURL,
+		"name": name, "ssh_host": sshHost, "mesh_addr": meshAddr, "agent_url": agentURL, "pool": pool,
 	})
 	if err != nil {
 		return err
@@ -261,6 +262,33 @@ func (c *Client) Nodes(ctx context.Context) ([]NodeStatus, error) {
 		return nil, err
 	}
 	return nodes, nil
+}
+
+// Pool is a node pool and the number of registered nodes in it, as reported
+// by the daemon's GET /pools.
+type Pool struct {
+	Name  string `json:"name"`
+	Nodes int    `json:"nodes"`
+}
+
+// Pools lists every pool with a registered node in it, plus the count of
+// nodes in each. "default" is always present, even with zero registered
+// nodes, since the implicit local node lives there.
+func (c *Client) Pools(ctx context.Context) ([]Pool, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/pools"), nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, decodeErr(resp)
+	}
+	var pools []Pool
+	if err := json.NewDecoder(resp.Body).Decode(&pools); err != nil {
+		return nil, err
+	}
+	return pools, nil
 }
 
 // Health returns the daemon's current reconciler health snapshot: per-node
