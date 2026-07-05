@@ -78,6 +78,25 @@ type Reconciler struct {
 	src      source.Git
 	bld      build.Builder
 	mu       sync.Mutex
+
+	// healthMu guards health and heal, which are populated by the Phase 10
+	// continuous reconciler loop (not yet added by this task) and read via
+	// HealthSnapshot. reach and nudge are set once at startup via their
+	// setters below.
+	healthMu sync.RWMutex
+	health   Health
+	reach    Reachability
+	nudge    chan<- struct{}
+	heal     map[string]*healState
+}
+
+// healState tracks one app's in-progress self-heal attempts: how many
+// consecutive attempts have been made, and the earliest time the next
+// attempt is allowed to run (a backoff gate). Unexported: internal
+// bookkeeping for the loop added in a later Phase 10 task.
+type healState struct {
+	attempts     int
+	nextEligible time.Time
 }
 
 // New returns a Reconciler bound to a node.Resolver (used to place each
@@ -88,7 +107,68 @@ type Reconciler struct {
 // `docker compose`, a Git source used to clone git-built apps, and a Builder
 // used to `docker build` them.
 func New(resolver node.Resolver, r router.Router, s *store.Store, sec SecretResolver, comp compose.Composer, src source.Git, bld build.Builder) *Reconciler {
-	return &Reconciler{resolver: resolver, router: r, store: s, secrets: sec, compose: comp, src: src, bld: bld}
+	return &Reconciler{resolver: resolver, router: r, store: s, secrets: sec, compose: comp, src: src, bld: bld, heal: map[string]*healState{}}
+}
+
+// SetReachability supplies the Reachability implementation (typically a
+// *node.RegistryResolver) the continuous reconciler loop uses to observe
+// node health. Exists as a setter, rather than a New parameter, so New's
+// many existing call sites don't need to change.
+func (r *Reconciler) SetReachability(rr Reachability) {
+	r.reach = rr
+}
+
+// SetNudge supplies a channel the reconciler sends on (non-blocking) to wake
+// a waiting continuous-reconciler loop early — e.g. right after an Apply —
+// rather than it sitting idle until the next timer tick. Exists as a setter
+// for the same reason as SetReachability.
+func (r *Reconciler) SetNudge(ch chan<- struct{}) {
+	r.nudge = ch
+}
+
+// HealthSnapshot returns a deep copy of the reconciler's current health
+// view: a caller mutating the returned Health (or its Nodes/Apps elements)
+// cannot affect the reconciler's internal state.
+func (r *Reconciler) HealthSnapshot() Health {
+	r.healthMu.RLock()
+	defer r.healthMu.RUnlock()
+	return copyHealth(r.health)
+}
+
+// setHealth stores a deep copy of h as the reconciler's current health view.
+func (r *Reconciler) setHealth(h Health) {
+	r.healthMu.Lock()
+	defer r.healthMu.Unlock()
+	r.health = copyHealth(h)
+}
+
+// copyHealth returns a deep copy of h: fresh Nodes/Apps slices (with their
+// elements copied by value — none of them contain reference types), so
+// neither the source nor the returned copy alias the other's backing array.
+func copyHealth(h Health) Health {
+	out := Health{Edge: h.Edge}
+	if h.Nodes != nil {
+		out.Nodes = make([]NodeHealth, len(h.Nodes))
+		copy(out.Nodes, h.Nodes)
+	}
+	if h.Apps != nil {
+		out.Apps = make([]AppHealth, len(h.Apps))
+		copy(out.Apps, h.Apps)
+	}
+	return out
+}
+
+// signalNudge sends a non-blocking wake-up on r.nudge, if one has been set
+// via SetNudge. It never blocks: if the channel is unbuffered/full (a wake-up
+// is already pending), the send is silently skipped.
+func (r *Reconciler) signalNudge() {
+	if r.nudge == nil {
+		return
+	}
+	select {
+	case r.nudge <- struct{}{}:
+	default:
+	}
 }
 
 // localNode resolves the local node through the same resolver used for
