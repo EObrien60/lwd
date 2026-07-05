@@ -27,6 +27,11 @@ type Fake struct {
 	SaveErr   error
 	LoadErr   error
 
+	// PingErr, if set, is returned by Ping instead of nil — used to simulate
+	// the backing Docker daemon being unreachable (e.g. for the agent's
+	// /healthz probe).
+	PingErr error
+
 	// ImagePresentErr, if set, is returned by ImagePresent instead of
 	// consulting Images — used to test the hard-fail path of
 	// reconciler.ensureImageOnNode (an inspect failure, as opposed to a
@@ -72,6 +77,14 @@ func NewFake() *Fake {
 
 func (f *Fake) record(name string) {
 	f.Calls = append(f.Calls, name)
+}
+
+// Ping records the call and returns PingErr (nil by default).
+func (f *Fake) Ping(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("Ping")
+	return f.PingErr
 }
 
 func (f *Fake) EnsureImage(ctx context.Context, imageRef string) error {
