@@ -1131,6 +1131,64 @@ func TestDeploymentReplicasRoundTrip(t *testing.T) {
 	}
 }
 
+// TestUpdateReplicas covers Phase 12 Task 5's per-replica self-heal
+// persistence primitive: UpdateReplicas overwrites an existing row's
+// Replicas and ContainerID IN PLACE — same row id, same status — rather than
+// inserting a new generation, so a heal that only replaced one dead replica
+// doesn't touch the deployment's history the way a fresh
+// RecordDeployment+SetStatus(retired) pair would.
+func TestUpdateReplicas(t *testing.T) {
+	s := openTemp(t)
+
+	original := []Replica{
+		{ContainerID: "c1", Node: "local", Upstream: "lwd-blog-1-0", Port: 8080},
+		{ContainerID: "c2", Node: "web1", Upstream: "10.0.0.2:30001", Port: 30001},
+	}
+	id, err := s.RecordDeployment(Deployment{
+		App: "blog", Image: "img:1", ContainerID: "c1",
+		Status: StatusRunning, CreatedAt: time.Now(), Replicas: original,
+	})
+	if err != nil {
+		t.Fatalf("RecordDeployment: %v", err)
+	}
+
+	healed := []Replica{
+		original[0],
+		{ContainerID: "c2-healed", Node: "web1", Upstream: "10.0.0.2:30099", Port: 30099},
+	}
+	if err := s.UpdateReplicas(id, healed, healed[0].ContainerID); err != nil {
+		t.Fatalf("UpdateReplicas: %v", err)
+	}
+
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || cur.ID != id {
+		t.Fatalf("want the SAME row (id %d) still current, got %+v", id, cur)
+	}
+	if cur.Status != StatusRunning {
+		t.Errorf("Status = %q, want unchanged running", cur.Status)
+	}
+	if cur.ContainerID != "c1" {
+		t.Errorf("ContainerID = %q, want unchanged c1 (kept in sync with Replicas[0])", cur.ContainerID)
+	}
+	if len(cur.Replicas) != 2 || cur.Replicas[1].ContainerID != "c2-healed" {
+		t.Fatalf("Replicas = %+v, want index 1 healed to c2-healed", cur.Replicas)
+	}
+	if cur.Replicas[0] != original[0] {
+		t.Errorf("Replicas[0] = %+v, want untouched %+v", cur.Replicas[0], original[0])
+	}
+
+	all, err := s.DeploymentsForApp("blog")
+	if err != nil {
+		t.Fatalf("DeploymentsForApp: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("DeploymentsForApp len = %d, want 1 (heal must not insert a new row)", len(all))
+	}
+}
+
 // TestMigrationFromPreReplicasSchema covers Phase 12 Task 2: a pre-12
 // deployments table (no replicas column) migrates cleanly on Open, and an
 // existing row decodes to a nil Replicas.

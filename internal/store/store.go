@@ -658,6 +658,31 @@ func (s *Store) SetStatus(id int64, status string) error {
 	return nil
 }
 
+// UpdateReplicas overwrites an existing deployment row's Replicas (and, in
+// sync, its ContainerID) IN PLACE — unlike RecordDeployment/SetStatus, which
+// together model a brand-new generation superseding the old one, this is
+// used by the Phase 12 Task 5 per-replica self-heal: recreating one (or a
+// few) dead replicas of an already-running generation must not mint a new
+// deployment row or retire/remove the OTHER, still-healthy replicas the way
+// a fresh deployReplicaSet generation would — it's the same generation,
+// missing a container or two, patched back to whole. containerID is passed
+// separately (rather than derived here from replicas[0].ContainerID) so a
+// caller that already computed it doesn't have to re-derive it, and so an
+// empty replicas slice can still clear ContainerID explicitly if ever
+// needed.
+func (s *Store) UpdateReplicas(id int64, replicas []Replica, containerID string) error {
+	d := Deployment{Replicas: replicas}
+	replicasJSON, err := d.replicasJSON()
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE deployments SET replicas = ?, container_id = ? WHERE id = ?`, replicasJSON, containerID, id)
+	if err != nil {
+		return fmt.Errorf("update replicas: %w", err)
+	}
+	return nil
+}
+
 // ListApps returns the distinct app names, sorted ascending.
 func (s *Store) ListApps() ([]string, error) {
 	rows, err := s.db.Query(`SELECT DISTINCT app FROM deployments ORDER BY app ASC`)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"lwd/internal/config"
@@ -156,15 +157,23 @@ func (r *Reconciler) failoverLostNodes(ctx context.Context) {
 // found dead, attempts to self-heal it. It deliberately does NOT hold r.mu
 // while reading the current deployment or probing the node/router — those
 // are all network calls (or, for the fake node in tests, at least
-// logically so) that must not block a concurrent Apply. Only tryHeal, which
-// mutates the shared heal-backoff bookkeeping and actually redeploys, takes
-// r.mu.
+// logically so) that must not block a concurrent Apply. Only tryHeal/
+// tryHealReplicas, which mutate the shared heal-backoff bookkeeping and
+// actually redeploy, take r.mu.
 //
 // It returns nil for anything outside its scope (no current deployment, or a
 // compose app — its container lifecycle is owned by `docker compose`, not
 // lwd's blue-green surface healer) so Reconcile leaves it out of the
 // snapshot's Apps entirely, rather than reporting a misleading health state
 // for a surface it never manages.
+//
+// Phase 12 Task 5: a deployment with a non-empty Replicas (every row
+// deployReplicaSet has ever produced, including N==1) is observed and healed
+// per-replica via reconcileReplicaSet; only a genuinely legacy pre-Phase-12
+// row (Replicas decodes to empty because the column was never populated) falls
+// back to reconcileLegacySurface's single-ContainerID observation — preserving
+// today's behavior byte-for-byte for any deployment recorded before this
+// upgrade.
 func (r *Reconciler) reconcileApp(ctx context.Context, app string) *AppHealth {
 	now := time.Now()
 
@@ -180,6 +189,19 @@ func (r *Reconciler) reconcileApp(ctx context.Context, app string) *AppHealth {
 		return nil
 	}
 
+	if len(cur.Replicas) == 0 {
+		return r.reconcileLegacySurface(ctx, app, cur, now)
+	}
+	return r.reconcileReplicaSet(ctx, app, cur, now)
+}
+
+// reconcileLegacySurface is reconcileApp's pre-Phase-12 body, unchanged: it
+// observes cur's single ContainerID on the single node named by its spec
+// snapshot (nodeFromSpec), and heals it (via tryHeal/healSurfaceLocked) if
+// dead. Used only for a deployment row whose Replicas is empty — a genuinely
+// legacy row from before Phase 12 Task 4 started populating it on every
+// deploy.
+func (r *Reconciler) reconcileLegacySurface(ctx context.Context, app string, cur *store.Deployment, now time.Time) *AppHealth {
 	nodeName := nodeFromSpec(cur.Spec)
 	if nodeName == "" {
 		nodeName = "local"
@@ -205,29 +227,115 @@ func (r *Reconciler) reconcileApp(ctx context.Context, app string) *AppHealth {
 	return r.tryHeal(ctx, app, cur)
 }
 
-// tryHeal attempts to self-heal app's dead surface (cur, its current
-// deployment row as last observed by reconcileApp, WITHOUT r.mu held), gated
-// by a per-app attempt count and exponential backoff: once
-// config.HealMaxAttempts consecutive attempts have failed, it gives up
-// (SurfaceFailed) without trying again; between attempts, a caller that comes
-// back before the backoff window elapses is told to wait (SurfaceDegraded)
-// rather than retrying immediately. It takes r.mu for its whole body since a
-// heal actually redeploys (via healSurfaceLocked, which itself assumes r.mu
-// is already held) and must not interleave with a concurrent Apply.
+// reconcileReplicaSet is reconcileApp's Phase 12 Task 5 body for any
+// deployment carrying a populated Replicas: it observes EVERY replica's
+// container health on ITS OWN node, independently:
 //
-// Because cur was read lock-free, the first thing it does after acquiring
-// r.mu is re-fetch the current deployment and bail (nil, no AppHealth entry)
-// if it no longer matches cur — see the comment inline below for why.
+//   - A replica whose node is reported unreachable (or fails to resolve) is
+//     left alone entirely — no health probe attempted, no heal — since it's
+//     failoverLostNodes's job (once past the grace period) to evacuate a
+//     genuinely lost node, not self-heal's; probing/recreating a container on
+//     a node we can't reach would just hang or fail anyway.
+//   - A replica whose node IS reachable but whose container is dead
+//     (surfaceIsDead) is queued for a targeted per-replica heal.
+//   - Everything else is healthy.
+//
+// If every replica is healthy (none dead, none unreachable), the app is
+// SurfaceHealthy and its heal backoff is cleared, exactly like the legacy
+// single-container path. If some replicas are unreachable but none are
+// observably dead, the app is SurfaceDegraded (there's a hole in the surface
+// we can't currently assess) but nothing is healed — those nodes are left to
+// failover. If any replica IS observably dead, tryHealReplicas attempts to
+// recreate ONLY those dead replicas (gated by the same per-app backoff/
+// attempt bookkeeping as the legacy path) — healthy replicas, even ones
+// currently unreachable, are never touched by this pass.
+func (r *Reconciler) reconcileReplicaSet(ctx context.Context, app string, cur *store.Deployment, now time.Time) *AppHealth {
+	var deadIdx []int
+	var unreachable []string
+
+	for i, rep := range cur.Replicas {
+		nodeName := rep.Node
+		if nodeName == "" {
+			nodeName = "local"
+		}
+
+		if r.reach != nil {
+			if _, ok := r.reach.Reachable(ctx, nodeName); !ok {
+				unreachable = append(unreachable, nodeName)
+				continue
+			}
+		}
+
+		n, _, _, _, rerr := r.resolver.ResolveMeta(nodeName)
+		if rerr != nil {
+			unreachable = append(unreachable, nodeName)
+			continue
+		}
+
+		state, _, herr := n.ContainerHealth(ctx, rep.ContainerID)
+		if surfaceIsDead(state, herr) {
+			deadIdx = append(deadIdx, i)
+		}
+	}
+
+	if len(deadIdx) > 0 {
+		return r.tryHealReplicas(ctx, app, cur, deadIdx)
+	}
+
+	if len(unreachable) > 0 {
+		return &AppHealth{App: app, State: SurfaceDegraded, LastError: "node " + strings.Join(unreachable, ",") + " unreachable", HealAttempts: r.healAttempts(app), UpdatedAt: now}
+	}
+
+	r.clearHealAttempts(app)
+	return &AppHealth{App: app, State: SurfaceHealthy, HealAttempts: 0, UpdatedAt: now}
+}
+
+// tryHeal attempts to self-heal app's dead LEGACY surface (cur, its current
+// deployment row as last observed by reconcileLegacySurface, WITHOUT r.mu
+// held) via the full blue-green redeploy path (healSurfaceLocked). See
+// tryHealWith for the shared backoff/staleness machinery also used by
+// tryHealReplicas.
 func (r *Reconciler) tryHeal(ctx context.Context, app string, cur *store.Deployment) *AppHealth {
+	return r.tryHealWith(ctx, app, cur, func(fresh *store.Deployment) (*store.Deployment, error) {
+		return r.healSurfaceLocked(ctx, fresh)
+	})
+}
+
+// tryHealReplicas attempts to self-heal the specific dead replicas named by
+// deadIdx (indexes into cur.Replicas, as observed by reconcileReplicaSet
+// WITHOUT r.mu held) via the targeted per-replica recreate path
+// (healDeadReplicasLocked) — healthy replicas are never touched. See
+// tryHealWith for the shared backoff/staleness machinery also used by
+// tryHeal.
+func (r *Reconciler) tryHealReplicas(ctx context.Context, app string, cur *store.Deployment, deadIdx []int) *AppHealth {
+	return r.tryHealWith(ctx, app, cur, func(fresh *store.Deployment) (*store.Deployment, error) {
+		return r.healDeadReplicasLocked(ctx, fresh, deadIdx)
+	})
+}
+
+// tryHealWith is the shared per-app backoff/staleness machinery behind both
+// tryHeal (the legacy single-container path) and tryHealReplicas (the Phase
+// 12 Task 5 per-replica path): gated by a per-app attempt count and
+// exponential backoff, once config.HealMaxAttempts consecutive attempts have
+// failed it gives up (SurfaceFailed) without trying again; between attempts,
+// a caller that comes back before the backoff window elapses is told to wait
+// (SurfaceDegraded) rather than retrying immediately. It takes r.mu for its
+// whole body since healFn actually redeploys/recreates containers (assuming
+// r.mu already held) and must not interleave with a concurrent Apply.
+//
+// Because cur was read lock-free by the caller, the first thing it does after
+// acquiring r.mu is re-fetch the current deployment and bail (nil, no
+// AppHealth entry) if it no longer matches cur — a manual Apply/Rollback/
+// Remove (all serialize on r.mu) may have superseded it in the meantime, and
+// healing from a stale snapshot would resurrect a just-removed app or revert
+// a newer deploy; if the current deployment is gone or is a different row, a
+// manual action won — skip, the next pass re-observes reality. healFn is
+// always invoked with this freshly re-fetched row, never the possibly-stale
+// cur the caller passed in.
+func (r *Reconciler) tryHealWith(ctx context.Context, app string, cur *store.Deployment, healFn func(fresh *store.Deployment) (*store.Deployment, error)) *AppHealth {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Re-validate under the lock: reconcileApp observed `cur` dead without
-	// holding r.mu, and a manual Apply/Rollback/Remove (all serialize on
-	// r.mu) may have superseded it in the meantime. Healing from a stale
-	// snapshot would resurrect a just-removed app or revert a newer deploy.
-	// If the current deployment is gone (removed/retired) or is a different
-	// row, a manual action won — skip; the next pass re-observes reality.
 	fresh, err := r.store.CurrentDeployment(app)
 	if err != nil {
 		return &AppHealth{App: app, State: SurfaceDegraded, LastError: "recheck current deployment: " + err.Error(), UpdatedAt: time.Now()}
@@ -235,7 +343,6 @@ func (r *Reconciler) tryHeal(ctx context.Context, app string, cur *store.Deploym
 	if fresh == nil || fresh.ID != cur.ID {
 		return nil
 	}
-	cur = fresh
 
 	hs := r.heal[app]
 	if hs == nil {
@@ -252,13 +359,16 @@ func (r *Reconciler) tryHeal(ctx context.Context, app string, cur *store.Deploym
 	}
 
 	hs.attempts++
-	if _, err := r.healSurfaceLocked(ctx, cur); err != nil {
+	if _, err := healFn(fresh); err != nil {
 		hs.nextEligible = now.Add(healBackoff(hs.attempts))
 		return &AppHealth{App: app, State: SurfaceFailed, LastError: err.Error(), HealAttempts: hs.attempts, UpdatedAt: now}
 	}
 
-	// Success: deployReplicaSet already called resetHeal(app), so hs is
-	// gone from r.heal now; report healthy with a reset attempt count.
+	// Success: reset this app's heal bookkeeping explicitly — healFn may
+	// (healSurfaceLocked, transitively via deployReplicaSet) or may not
+	// (healDeadReplicasLocked, which never touches r.heal) already have done
+	// so; resetHeal is a plain map delete, safe to call redundantly.
+	r.resetHeal(app)
 	return &AppHealth{App: app, State: SurfaceHealthy, HealAttempts: 0, UpdatedAt: now}
 }
 

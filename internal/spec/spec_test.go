@@ -925,3 +925,39 @@ func TestValidateReplicasCompose(t *testing.T) {
 		t.Fatal("want error for replicas > 1 with compose")
 	}
 }
+
+// TestValidateReplicasWithBackingRejected covers Phase 12 Task 5's guard: a
+// multi-replica app declaring backing [[services]] is rejected, since backing
+// services run PINNED on a single node's per-app network and a replica spread
+// across other nodes has no way to reach it. replicas=1 with services is
+// still valid — backing is only a problem once there's more than one node in
+// play.
+func TestValidateReplicasWithBackingRejected(t *testing.T) {
+	base := App{
+		Name:     "webapp",
+		Image:    "img:1",
+		Domain:   "x.example.com",
+		Port:     8080,
+		Services: []Service{{Name: "db", Image: "postgres:16"}},
+	}
+
+	t.Run("replicas > 1 with services is rejected", func(t *testing.T) {
+		a := base
+		a.Replicas = 2
+		err := a.Validate()
+		if err == nil {
+			t.Fatal("want error for replicas > 1 with backing services")
+		}
+		if !strings.Contains(err.Error(), "backing") {
+			t.Errorf("error = %q, want it to mention backing services", err.Error())
+		}
+	})
+
+	t.Run("replicas = 1 with services is OK", func(t *testing.T) {
+		a := base
+		a.Replicas = 1
+		if err := a.Validate(); err != nil {
+			t.Errorf("want no error for replicas=1 with backing services, got %v", err)
+		}
+	})
+}

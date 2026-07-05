@@ -1442,52 +1442,64 @@ func (r *Reconciler) removeCompose(ctx context.Context, appName string, cur *sto
 	return r.store.SetStatus(cur.ID, store.StatusRetired)
 }
 
-// removeSingleService removes every container labeled lwd.app=appName, downs
-// the app's PINNED backing project if it had one (cur.Compose non-empty —
-// named volumes are intentionally left in place, data is not auto-destroyed),
-// removes the app's Caddy route (resolved from cur's Spec snapshot, if any),
-// and retires cur, if present. cur may be nil (nothing recorded for appName
-// yet) — removal still runs as a defensive cleanup of any stray containers.
-// The node it operates against is resolved from cur's Spec snapshot's Node
-// field (the node the app was actually placed on), defaulting to "local"
-// when cur is nil or carries no snapshot.
+// removeSingleService removes every container labeled lwd.app=appName on
+// EVERY node the app's current replica set actually runs on (Phase 12 Task
+// 5 — a multi-replica app spreads its containers across distinct nodes, and
+// removing by label only on the anchor node, as this used to do, would leave
+// every OTHER replica's container running and orphaned), downs the app's
+// PINNED backing project if it had one (cur.Compose non-empty — named
+// volumes are intentionally left in place, data is not auto-destroyed; a
+// backing project only ever runs on the anchor node, so it's downed there
+// exactly once), removes the app's Caddy route (resolved from cur's Spec
+// snapshot, if any), and retires cur, if present. cur may be nil (nothing
+// recorded for appName yet) — removal still runs as a defensive cleanup of
+// any stray containers on the local node.
 //
-// If that node no longer resolves (e.g. it was deregistered via `lwd node
+// The node(s) to operate against come from cur.Replicas — one per DISTINCT
+// node a replica is recorded on, anchor (Replicas[0]'s node) first. A
+// genuinely legacy pre-Phase-12 row (Replicas empty) falls back to
+// nodeFromSpec(cur.Spec), exactly as this used to work unconditionally;
+// "local" is the final fallback for a nil cur or a snapshot recording no
+// node at all.
+//
+// If a given node no longer resolves (e.g. it was deregistered via `lwd node
 // rm` after the app was deployed to it), remote container/backing teardown
-// is impossible — there is nothing left to talk to — but the app must still
-// be removable: the controller-side Caddy route is removed and the
-// deployment row is retired regardless, with only the node-side cleanup
-// skipped (logged, not failed). This mirrors removeCompose's and
+// on THAT node is impossible — there is nothing left to talk to — but this
+// must not stop the other nodes' containers from being removed, nor stop the
+// app from being removed overall: the controller-side Caddy route is removed
+// and the deployment row is retired regardless, with only that node's
+// cleanup skipped (logged, not failed). This mirrors removeCompose's and
 // RemoveRoute's own best-effort rationale below: an app should never be
 // stuck un-removable because of state that outlived its backing node.
 func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cur *store.Deployment) error {
 	var domain string
-	nodeName := "local"
+	nodeNames := replicaNodeNames(cur)
 	if cur != nil {
 		domain = domainFromSpec(cur.Spec)
-		if nn := nodeFromSpec(cur.Spec); nn != "" {
-			nodeName = nn
-		}
 	}
+	anchorNode := nodeNames[0]
 
-	// ResolveMeta (not plain Resolve): a PINNED backing project's teardown
-	// below needs the node's DOCKER_HOST too, to target the same remote
-	// daemon its Up originally ran against.
-	n, _, dockerHost, _, err := r.resolver.ResolveMeta(nodeName)
-	if err != nil {
-		log.Printf("remove %s: node %q no longer resolves (%v); skipping remote container/backing teardown, still removing route and retiring", appName, nodeName, err)
-	} else {
+	for _, nodeName := range nodeNames {
+		// ResolveMeta (not plain Resolve): a PINNED backing project's
+		// teardown below needs the node's DOCKER_HOST too, to target the
+		// same remote daemon its Up originally ran against.
+		n, _, dockerHost, _, err := r.resolver.ResolveMeta(nodeName)
+		if err != nil {
+			log.Printf("remove %s: node %q no longer resolves (%v); skipping container/backing teardown on it, still removing route and retiring", appName, nodeName, err)
+			continue
+		}
+
 		containers, err := n.ListContainers(ctx, map[string]string{"lwd.app": appName})
 		if err != nil {
-			return fmt.Errorf("list containers: %w", err)
+			return fmt.Errorf("list containers on %q: %w", nodeName, err)
 		}
 		for _, c := range containers {
 			if err := n.RemoveContainer(ctx, c.ID); err != nil {
-				return fmt.Errorf("remove container %s: %w", c.ID, err)
+				return fmt.Errorf("remove container %s on %q: %w", c.ID, nodeName, err)
 			}
 		}
 
-		if cur != nil && cur.Compose != "" {
+		if cur != nil && cur.Compose != "" && nodeName == anchorNode {
 			if err := r.downBacking(ctx, appName, cur.Compose, dockerHost); err != nil {
 				return err
 			}
@@ -1503,6 +1515,38 @@ func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cu
 		return r.store.SetStatus(cur.ID, store.StatusRetired)
 	}
 	return nil
+}
+
+// replicaNodeNames returns the distinct node names cur's current replica set
+// actually runs on, anchor (Replicas[0]'s node, or nodeFromSpec for a legacy
+// row) always first: used by removeSingleService to remove every replica's
+// containers across however many nodes they're spread over, rather than only
+// the anchor's. cur may be nil (never recorded) — returns ["local"].
+func replicaNodeNames(cur *store.Deployment) []string {
+	if cur == nil {
+		return []string{"local"}
+	}
+
+	var names []string
+	seen := map[string]bool{}
+	add := func(n string) {
+		if n == "" {
+			n = "local"
+		}
+		if !seen[n] {
+			seen[n] = true
+			names = append(names, n)
+		}
+	}
+
+	if len(cur.Replicas) > 0 {
+		for _, rep := range cur.Replicas {
+			add(rep.Node)
+		}
+	} else {
+		add(nodeFromSpec(cur.Spec))
+	}
+	return names
 }
 
 // downBacking tears down a git/image app's PINNED backing project via

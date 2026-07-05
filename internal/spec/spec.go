@@ -356,6 +356,15 @@ func (a *App) Validate() error {
 	if a.Replicas > 1 && a.Compose != "" {
 		return fmt.Errorf("replicas not supported for compose apps")
 	}
+	// Phase 12 Task 5's backing guard: backing [[services]] run PINNED on a
+	// single node's per-app network (RenderBackingCompose/ensureBacking), so
+	// a multi-node replica set has no way to reach it from every node — only
+	// the anchor replica's node would ever be on that network. Checked here
+	// (rather than folded into the Services validation block below) so it
+	// fires regardless of Services ordering/validity.
+	if a.Replicas > 1 && len(a.Services) > 0 {
+		return fmt.Errorf("replicas not supported with backing [[services]] (backing runs on a single node; use replicas=1)")
+	}
 
 	// Services validation (allowed on image and git apps, not on compose)
 	if len(a.Services) > 0 {
