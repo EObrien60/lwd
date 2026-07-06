@@ -1,173 +1,273 @@
 # lwd — lightweight deploy
 
-A suckless, self-hosted deployment engine for Docker apps. Point it at an app,
-deploy with one command, get automatic HTTPS and zero-downtime rollouts for
-free. Single static Go binary that is both the daemon and the CLI, plus three
-optional client/worker binaries: [`lwd-web`](#web-ui-lwd-web) (a browser
-dashboard), [`lwd-mcp`](#agent-access-lwd-mcp) (an MCP server for coding
-agents), and [`lwd-agent`](#the-lwd-agent-transport) (a dumb per-node worker
-that replaces raw docker-over-ssh for a registered node).
+> Buy a machine. Install Linux. Install lwd. Deploy software with the UX of
+> Vercel, the resilience of Fargate, and the operational simplicity of Docker
+> Compose.
 
-> This is the **router + blue-green + secrets + compose apps + web UI + git
-> deploy + backing services + multi-node federation + dumb node agent + node
-> UX + continuous reconciler/self-heal + capacity-aware scheduler + node
-> pools + node drain/evacuate + automatic node-loss failover** milestone
-> (Phases 1–11b — **Phase 11 is now complete**). Surface replicas +
-> load-balancing (P12) are next (see `docs/VISION.md`).
+lwd is a suckless, self-hosted deployment engine for Docker apps: `lwd apply`
+gets you automatic HTTPS and a zero-downtime rollout for free, on your own
+hardware, with no control-plane babysitting. It is built in the Unix
+tradition — it **composes** Docker, Caddy, Git, and (for a fleet) WireGuard,
+rather than replacing any of them. One static Go binary is both the daemon
+and the CLI; three optional binaries add a web dashboard, an MCP server for
+coding agents, and a per-node worker for multi-machine fleets.
 
-## Build
+## Table of contents
+
+- [Status](#status)
+- [Quickstart](#quickstart)
+- [Concepts](#concepts)
+- [The four binaries](#the-four-binaries)
+- [lwd.toml reference](#lwdtoml-reference)
+- [CLI command reference](#cli-command-reference)
+- [How deploys work](#how-deploys-work)
+- [App shapes](#app-shapes)
+  - [Image apps](#image-apps)
+  - [Compose apps](#compose-apps)
+  - [Deploy from Git](#deploy-from-git)
+  - [Backing services](#backing-services)
+- [Secrets](#secrets)
+- [Multi-node federation](#multi-node-federation)
+- [Scheduling, capacity, and pools](#scheduling-capacity-and-pools)
+- [Replicas & load balancing](#replicas--load-balancing)
+- [Node maintenance & failover](#node-maintenance--failover)
+- [Self-healing & health](#self-healing--health)
+- [Web UI (lwd-web)](#web-ui-lwd-web)
+- [Agent access (lwd-mcp)](#agent-access-lwd-mcp)
+- [Authoring lwd.toml (Claude skill)](#authoring-lwdtoml-claude-skill)
+- [Architecture & networking model](#architecture--networking-model)
+- [Security model](#security-model)
+- [Configuration reference](#configuration-reference)
+- [Roadmap](#roadmap)
+- [Development & testing](#development--testing)
+- [License](#license)
+
+## Status
+
+lwd is under active, phased development (P1–P12 merged; see
+[Roadmap](#roadmap)). Be precise about what "works" means here:
+
+- **Verified against real Docker in this environment:** single-node deploy
+  (`lwd apply` → running container → routed through Caddy with a real HTTP
+  response), blue-green redeploys, `lwd scale` with round-robin load
+  balancing across replicas, `lwd health`/`lwd status`, and `lwd rm`.
+- **Implemented and covered by unit + integration tests (fakes, no Docker
+  required), plus Docker-gated end-to-end tests that pass locally but are
+  NOT exercised on a real multi-machine cluster in this environment:**
+  multi-node federation (the ssh and `lwd-agent` transports, `docker
+  save|load` image movement), cross-node scheduling/placement, automatic
+  node-loss failover, and drain/evacuate. The Docker-gated multi-node e2e
+  test (`TestEndToEndRemoteNode`) SKIPs without a real second machine (or
+  passwordless ssh to `localhost` with a reachable Docker daemon) — treat
+  multi-node as implemented-and-tested-against-fakes, not
+  battle-tested-in-production.
+- **Not yet built:** P13 (multiple Caddy edges + DNS round-robin), P14
+  (first-class postgres/valkey/minio resource drivers), P15 (resource HA via
+  Patroni + backups). See [Roadmap](#roadmap).
+
+Repository: [github.com/EObrien60/lwd](https://github.com/EObrien60/lwd).
+
+## Quickstart
+
+This gets a real app running on one box, routed through HTTPS-capable Caddy,
+in under five minutes. It mirrors a deploy that has been run and verified
+end-to-end against real Docker.
+
+**Prerequisites:** Go 1.25+, Docker, and (for compose apps only) the `docker
+compose` CLI plugin. No cgo is required — lwd uses a pure-Go SQLite driver.
 
 ```bash
+# 1. Build the daemon + CLI (one binary does both)
 CGO_ENABLED=0 go build -o lwd ./cmd/lwd
+
+# 2. Start the daemon (creates /var/lib/lwd, a private `lwd` Docker
+#    network, and a managed `lwd-caddy` container fronting ports 80/443)
+sudo LWD_DATA_DIR=/var/lib/lwd ./lwd daemon &
+
+# 3. Define an app
+mkdir myapp && cat > myapp/lwd.toml <<'EOF'
+name   = "app"
+image  = "traefik/whoami:latest"
+domain = "app.localhost"
+port   = 80
+EOF
+
+# 4. Deploy it
+./lwd apply ./myapp
+# deployed app (traefik/whoami:latest) container <id>
+
+# 5. Hit it through Caddy
+curl -H "Host: app.localhost" http://127.0.0.1/
+# Hostname: ...
+# (response headers include `Via: 1.1 Caddy`)
 ```
 
-## Run the daemon
+`app.localhost` gets an internally self-signed certificate automatically
+(no public CA involved) because it's a `.localhost`/bare hostname — use a
+real public FQDN in `domain` to get a real Let's Encrypt certificate instead.
+
+From here:
 
 ```bash
-sudo LWD_DATA_DIR=/var/lib/lwd ./lwd daemon
+./lwd scale app 3      # 3 load-balanced replicas — round-robin verified
+./lwd status app       # replica count + per-replica node
+./lwd health           # nodes / edge / self-heal state
+./lwd ls                # every app's status
+./lwd logs app -f       # stream logs
+./lwd rm app            # stop and deregister
 ```
 
-The daemon listens on a unix socket at `$LWD_DATA_DIR/lwd.sock` (default
-`/var/lib/lwd/lwd.sock`) and talks to the local Docker daemon. On startup (and
-before the first deploy) it brings up a private `lwd` Docker network and a
-managed `lwd-caddy` container that fronts every app on ports 80/443 — this is
-the only container that ever publishes host ports.
+## Concepts
 
-## Define an app
+lwd's mental model has three kinds of things, plus the machinery that keeps
+them converged:
 
-Create `lwd.toml` in a directory:
+- **Surfaces** — stateless, disposable application containers: sites, APIs,
+  workers. Surfaces scale horizontally (see [Replicas](#replicas--load-balancing)),
+  move between machines (see [Node maintenance & failover](#node-maintenance--failover)),
+  and are always deployed blue-green — never patched in place.
+- **Resources** — stateful things with identity and their own storage: a
+  Postgres database, a cache, an object store. lwd runs them today as
+  [backing services](#backing-services) pinned to one node's disk — they are
+  **never** blue-greened and **never** auto-migrated. (A dedicated
+  resource-driver model with HA is planned; see [Roadmap](#roadmap), P14/P15.)
+- **Nodes** — dumb compute: a machine's CPU, RAM, disk, and network. Nodes
+  don't know about applications; applications are scheduled onto them. The
+  implicit `local` node is the machine `lwd daemon` runs on; more can be
+  [registered](#multi-node-federation).
+- **Deployments & generations** — every `lwd apply`/`rollback`/`scale`
+  produces a new deployment row with a snapshotted, fully-resolved spec
+  (image, env, secrets already substituted where relevant, replica set). A
+  rollback restores that exact snapshot, not a re-resolution of whatever
+  `lwd.toml` says today.
+- **Pools** — a named grouping of nodes the [scheduler](#scheduling-capacity-and-pools)
+  picks within, so you can dedicate a subset of your fleet to a class of app.
+- **The edge** — the single shared Caddy instance (`lwd-caddy`) that
+  terminates TLS and reverse-proxies every app's `domain` to its current
+  surface(s). It is the only container that ever binds host ports 80/443.
+- **The reconciler** — a continuous control loop, off the request path, that
+  self-heals dead surfaces, observes node/edge reachability, and (past a
+  grace period) fails scheduled surfaces off a node that's gone. See
+  [Self-healing & health](#self-healing--health).
+
+## The four binaries
+
+| Binary | What it is | Build |
+| --- | --- | --- |
+| `lwd` | The daemon (`lwd daemon`) **and** the CLI client, in one static binary. The daemon owns Docker, the SQLite store, the router, secrets, and the reconciler; the CLI is just a client of its unix socket. | `CGO_ENABLED=0 go build -o lwd ./cmd/lwd` |
+| `lwd-web` | An optional browser dashboard — a thin HTTP client of the same daemon socket the CLI uses. See [Web UI](#web-ui-lwd-web). | `CGO_ENABLED=0 go build -o lwd-web ./cmd/lwd-web` |
+| `lwd-mcp` | An optional local [MCP](https://modelcontextprotocol.io) server (stdio only) that lets a coding agent drive lwd. See [Agent access](#agent-access-lwd-mcp). | `CGO_ENABLED=0 go build -o lwd-mcp ./cmd/lwd-mcp` |
+| `lwd-agent` | An optional, dumb per-node worker that replaces docker-over-ssh as the transport to a registered node. See [Multi-node federation](#multi-node-federation). | `CGO_ENABLED=0 go build -o lwd-agent ./cmd/lwd-agent` |
+
+Build all four at once:
+
+```bash
+CGO_ENABLED=0 go build ./cmd/lwd ./cmd/lwd-web ./cmd/lwd-mcp ./cmd/lwd-agent
+```
+
+Every binary supports a `version` subcommand (`lwd version`, `lwd-web
+version`, ...) that prints its name and build version.
+
+## lwd.toml reference
+
+An app is one `lwd.toml` file in a directory (`lwd apply <dir>` reads
+`<dir>/lwd.toml`). Every field below is drawn directly from
+`internal/spec/spec.go`'s `App` struct and `Validate()`.
+
+### Core
+
+| Field | Type | Default | Required? | Meaning |
+| --- | --- | --- | --- | --- |
+| `name` | string | — | yes | App identity. Must match `[a-zA-Z0-9][a-zA-Z0-9_.-]*`. |
+| `image` | string | — | yes, for an [image app](#image-apps) (mutually exclusive with `git`/`compose`) | The OCI image to run. |
+| `domain` | string | — | yes for [git](#deploy-from-git) and [compose](#compose-apps) apps; **not enforced** for a plain image app (one with no `domain` simply gets no Caddy route) | The FQDN Caddy routes to this app. A public FQDN gets a real ACME cert; a `.localhost`/bare hostname gets an internally self-signed one. |
+| `port` | int | — | yes, for image/git/compose apps | The app's **container** port (not a host port — lwd never publishes app ports directly). |
+| `env` | map[string]string | `{}` | no | Plain (non-secret) environment variables passed to the container (or, for compose, to the `docker compose` process). |
+| `secrets` | []string | `[]` | no | **Names** only — see [Secrets](#secrets). Each must match `[A-Za-z_][A-Za-z0-9_]*`. A secret wins over a same-named `env` key. |
+
+### Placement
+
+| Field | Type | Default | Required? | Meaning |
+| --- | --- | --- | --- | --- |
+| `node` | string | `""` (unset) | no | `""` lets the [scheduler](#scheduling-capacity-and-pools) place the app; `"local"` pins it to the controller; any other value pins it to a [registered node](#multi-node-federation) name. A `compose` app may only be `""`/`"local"` — remote compose is rejected. |
+| `pool` | string | `"default"` | no | Narrows which pool an *unpinned* app schedules into. Must match `[A-Za-z0-9][A-Za-z0-9_-]*`. Ignored (but still validated) if `node` is pinned. |
+| `replicas` | int | `1` | no | Number of load-balanced surface replicas, 1–50. Not supported with `compose` or `[[services]]`. See [Replicas & load balancing](#replicas--load-balancing). |
+
+### `[health]`
+
+| Field | Type | Default | Required? | Meaning |
+| --- | --- | --- | --- | --- |
+| `health.path` | string | `""` | no | An HTTP path polled for a 2xx through Caddy during blue-green staging. If unset, falls back to the image's own Docker `HEALTHCHECK`, then to a plain liveness check. See [How deploys work](#how-deploys-work). |
+| `health.timeout` | duration string (e.g. `"30s"`) | `30s` | no | How long the layered health check is given before the candidate is considered failed. |
+
+### `[requirements]`
+
+| Field | Type | Default | Required? | Meaning |
+| --- | --- | --- | --- | --- |
+| `requirements.cpu` | float | unset | no | Minimum free CPU cores a candidate node must have (e.g. `0.5`, `2`). Must be `>= 0`. |
+| `requirements.memory` | size string | unset | no | Minimum free memory (e.g. `"512M"`, `"2G"`, `"1Ki"`). Binary units throughout (K/Ki, M/Mi, G/Gi, T/Ti all base-1024) — parsed by `spec.ParseSize`. |
+
+Omit `[requirements]` entirely for "runs anywhere with room." See
+[Scheduling, capacity, and pools](#scheduling-capacity-and-pools).
+
+### `[git]` + `[build]` (build-from-source)
+
+| Field | Type | Default | Required? | Meaning |
+| --- | --- | --- | --- | --- |
+| `git.url` | string | — | yes, if `[git]` is present | Clone URL. Allowed forms: `http(s)://`, `git://`, `ssh://`, `file://`, or scp-like `user@host:path`. Command-executing transports (`ext::`, `fd::`, a bare local path) are rejected. |
+| `git.ref` | string | `"main"` | no | Branch, tag, or commit SHA. A branch tracks its latest commit on every deploy. |
+| `git.path` | string | `""` (repo root) | no | Subdirectory within the repo used as the **build context** — see note below. No `..` segments allowed. |
+| `build.dockerfile` | string | `"Dockerfile"` semantics via `docker build -f` | no | Dockerfile path, relative to `git.path`. No `..` segments allowed. |
+| `build.context` | string | unset | no | Parsed and path-validated (no `..` segments) but **not currently used** by the build: the effective build context is always `git.path`. Documented here for accuracy — leave it unset. |
+
+`[git]` requires `[build]`, `domain`, and `port`, and cannot be combined with
+`image` or `compose`. See [Deploy from Git](#deploy-from-git).
+
+### Compose apps
+
+| Field | Type | Default | Required? | Meaning |
+| --- | --- | --- | --- | --- |
+| `compose` | string (path) | — | yes, to select the compose shape | Path to a `docker-compose.yml`, relative to the app directory (or absolute). |
+| `service` | string | — | yes, if `compose` is set | The compose service Caddy fronts. |
+
+Cannot combine with `image`, `git`, `[build]`, `[[services]]`, or
+`replicas > 1`; cannot be placed on a non-local `node`. See
+[Compose apps](#compose-apps).
+
+### `[[services]]` (backing services)
+
+| Field | Type | Default | Required? | Meaning |
+| --- | --- | --- | --- | --- |
+| `services[].name` | string | — | yes | Must match `[a-z0-9][a-z0-9-]*`, unique within the app. |
+| `services[].image` | string | — | yes | Image for the backing container. |
+| `services[].command` | string | `""` | no | Overrides the image's default command. |
+| `services[].env` | map[string]string | `{}` | no | Plain env vars for the backing container. |
+| `services[].secrets` | []string | `[]` | no | Secret names, resolved and injected the same fail-closed way as the app's own `secrets`. |
+| `services[].volume` | string | `""` | no | `name:path` for a persistent named Docker volume, or a bind-mount path. |
+
+Only valid on `image`/`[git]` apps (not `compose`), and not combined with
+`replicas > 1`. See [Backing services](#backing-services).
+
+### Not supported
+
+`surfaces` is parsed (as `[]string`) but **always rejected** by `Validate()`
+— it exists so a document that sets it fails with a clear error rather than
+being silently ignored.
+
+### Example: minimal image app
 
 ```toml
-name = "blog"
-image = "ghcr.io/me/blog:latest"
+name   = "blog"
+image  = "ghcr.io/me/blog:latest"
 domain = "blog.example.com"
-port = 8080
+port   = 8080
 
 [health]
-path = "/healthz"
+path    = "/healthz"
 timeout = "30s"
 ```
 
-`domain` is live: it's how Caddy routes requests to this app. Use a public
-FQDN for automatic ACME certificates, or a `.localhost`/bare hostname (e.g.
-`blog.localhost`, `blog`) for local development — those get an internally
-self-signed cert instead of hitting a public CA.
-
-## Deploy, inspect, and roll back
-
-```bash
-lwd apply ./myapp     # deploy ./myapp/lwd.toml (blue-green for image and git-built apps, delegated to `docker compose` for compose apps)
-lwd ls                # list apps and status
-lwd logs blog -f      # stream logs
-lwd history blog      # show past deployments for an app
-lwd rollback blog     # redeploy the previous version
-lwd scale blog 3      # run 3 load-balanced replicas (see Replicas & load balancing)
-lwd rm blog           # stop and deregister
-```
-
-## How deploys work
-
-This section describes single-service (`image`) apps; a git-built app (see
-[Deploy from Git](#deploy-from-git)) uses this exact same blue-green path once
-its image has been built — the only difference is *what* image gets deployed.
-See [Compose apps](#compose-apps) for the multi-container `compose` model,
-which does not use blue-green.
-
-Every `apply` of a single-service or git-built app is a blue-green swap, never
-an in-place recreate:
-
-1. A new "surface" container is started alongside whatever is currently
-   running, attached only to the private `lwd` network — it never publishes a
-   host port.
-2. It's staged behind a throwaway internal hostname on the shared Caddy router
-   and health-checked **through Caddy** (never by talking to the container
-   directly), using a layered policy:
-   - if `health.path` is set, poll it for a 2xx through Caddy;
-   - otherwise, if the image declares a Docker `HEALTHCHECK`, honor it;
-   - otherwise, fall back to a liveness check (container still running + Caddy
-     can reach it at all).
-3. Only once the new container passes health does the real domain flip to it.
-   The previous container keeps serving every request until that instant, so
-   there is no downtime window.
-4. The old surface is then retired and removed.
-
-A failed candidate never touches the live route: if health checks don't pass,
-the new container and its staging route are torn down and the failure is
-recorded, while whatever was already running keeps serving traffic untouched.
-
-Every deployment's resolved spec is snapshotted, so `lwd rollback` restores
-the exact previous image/config from that snapshot — not a re-resolution of
-whatever `lwd.toml` currently says — via the same zero-downtime blue-green
-path used for every other deploy. (For a compose app, `lwd rollback` instead
-restores the snapshotted compose file content — see
-[Compose apps](#compose-apps).)
-
-## Compose apps
-
-An app can be a multi-container [Docker Compose](https://docs.docker.com/compose/)
-stack instead of a single image — declare `compose` + `service` instead of `image`:
-
-```toml
-name    = "webapp"
-compose = "docker-compose.yml"   # relative to the app dir (or an absolute path)
-service = "web"                  # the compose service Caddy fronts
-domain  = "webapp.example.com"
-port    = 8080                   # container port of `service`
-env     = { LOG_LEVEL = "info" } # passed to `docker compose` as environment
-secrets = ["DATABASE_URL"]       # resolved, then passed the same way
-
-[health]
-path = "/healthz"
-```
-
-This requires the **`docker compose` CLI plugin** on the host running the daemon
-(Docker Desktop and modern Docker Engine both ship it — single-service `image` apps
-don't need it). `lwd.toml` validation rejects mixing `compose` with `image` or
-`[build]`; `surfaces` is not supported for either shape.
-
-### How compose deploys work (in-place recreate, not blue-green)
-
-lwd delegates orchestration entirely to `docker compose` rather than running its own
-blue-green swap:
-
-1. `docker compose -p lwd-<app> -f <compose file> up -d --remove-orphans`. Compose only
-   recreates services whose image or config changed since the last `up` — **an
-   unchanged backing service (a database, a cache) is left running untouched.** This is
-   the core guarantee of the compose model: redeploying to ship a new web-service image
-   does not restart the database.
-2. lwd resolves `service`'s running container, joins it to the shared `lwd` network, and
-   points `domain` at it through Caddy.
-3. It's health-checked through the route using the same layered policy as single-service
-   apps (`health.path` if set, otherwise a liveness fallback) — but through the **live**
-   route, not a staging one.
-
-**Honest tradeoff:** this is **not zero-downtime**. Because compose — not lwd's surface
-machinery — owns the container lifecycle, there is no old container left to keep
-serving while the new one is health-checked; the web service takes a brief in-place
-restart on every redeploy, and the route flips to it before health-gating runs. If the
-health check then fails, lwd does not tear anything down: the (possibly broken) new
-stack is left live and the deployment is recorded as failed. Run `lwd rollback <app>`
-to restore the previous compose content and recover.
-
-### Env, secrets, and rollback for compose apps
-
-`env` and declared `secrets` are resolved exactly like single-service apps — fail-closed
-on any unset secret, aborting before `docker compose` ever runs — and passed as
-**environment variables to the `docker compose` process**, so the compose file's
-`${VAR}` interpolation and any service's own `environment:` entries can reference them.
-Secret values never touch disk as part of a project file.
-
-Every deploy snapshots the compose file's content at that moment, so `lwd rollback` (see
-below) restores the exact prior stack — re-applying the stored content with secrets
-re-resolved against their current values — rather than whatever the compose file on disk
-currently says. `lwd rm <app>` runs `docker compose down` against the stored content,
-removing the project's containers and its own default network. `lwd logs` and `lwd ls`
-work the same as for single-service apps, against `service`'s container.
-
-## Deploy from Git
-
-Instead of a pre-built `image`, an app can be built straight from a git repo —
-declare `[git]` + `[build]` instead of `image`:
+### Example: build from Git
 
 ```toml
 name   = "myapp"
@@ -176,70 +276,32 @@ port   = 8080
 
 [git]
 url = "https://github.com/me/myapp"
-ref = "main"   # branch, tag, or commit sha; a branch tracks its latest commit on every deploy
-# path = "."   # subdir within the repo to use as the build context root
+ref = "main"
 
 [build]
-dockerfile = "Dockerfile"   # relative to git path
+dockerfile = "Dockerfile"
 ```
 
-This composes the box's own tools exactly like lwd already composes `docker`,
-`docker compose`, and `caddy` — there is **no GitHub/GitLab API, OAuth, or
-webhook receiver** involved. `lwd apply` shells out to the host's `git clone`
-and then `docker build`; private repos work if the box's own git is already
-authenticated (an SSH key or a credential helper) — lwd itself manages no git
-credentials and never sees one.
+### Example: replicas + pool + requirements
 
-### Build → blue-green flow
+```toml
+name     = "worker"
+image    = "ghcr.io/me/worker:latest"
+domain   = "worker.example.com"
+port     = 8080
+pool     = "web"
+replicas = 3
 
-1. lwd clones `[git].ref` into a throwaway temp directory (removed after the
-   build) with the box's `git`, resolving it to a commit sha.
-2. It runs `docker build` against the checked-out tree (`[build].dockerfile`,
-   relative to `[git].path`), tagging the result `lwd-build/<app>:<shortsha>`.
-   If that exact tag already exists locally (redeploying the same commit),
-   the build is skipped — idempotent redeploys don't rebuild.
-3. The built image is then deployed exactly like an `image` app: a fresh
-   zero-downtime blue-green surface (see [How deploys work](#how-deploys-work)) —
-   staged, health-checked through Caddy, then cut over. No registry is
-   involved; the image only ever needs to exist on the local Docker daemon.
-4. The deployment record stores the resolved commit sha and the built image
-   tag, alongside the usual spec snapshot.
+[requirements]
+cpu    = 1
+memory = "1G"
+```
 
-### Rollback (tag-by-sha)
-
-Every build is tagged and kept by commit sha, so `lwd rollback <app>`
-redeploys the **previous deployment's already-built image tag** directly —
-no re-clone, no rebuild, just another blue-green swap onto
-`lwd-build/<app>:<oldsha>`, which is still sitting on the local Docker daemon.
-This costs some local disk for old image layers over time (nothing prunes
-old `lwd-build/*` tags automatically yet).
-
-### What git deploy supports
-
-Git deploy only supports the git-repo-has-a-Dockerfile → single-service
-blue-green shape. `lwd.toml` remains the source of truth for the app's name,
-domain, port, env, secrets, and backing services — lwd never reads a
-`lwd.toml` committed inside the cloned repo itself (a "the repo configures
-itself" model is a possible future addition, not built). Deploying a
-repo's *own* `docker-compose.yml` in place (as opposed to the Phase 4
-user-provided-compose model, which is unaffected) is also not built — see
-[Known limitations](#known-limitations-this-milestone). Validation rejects
-mixing `[git]` with `image` or `compose`, and requires `[build]` (a
-Dockerfile), `domain`, and `port`.
-
-`lwd-web`'s Deploy modal has a matching **From Git** tab (URL/ref/subdir,
-Dockerfile, name/domain/port, env, secrets, backing services) that builds the
-`lwd.toml` for you and applies it — see [Web UI](#web-ui-lwd-web).
-
-## Backing services
-
-Any single-service app — whether `image`-based or git-built — can declare
-**pinned backing services** (a database, a cache, an object store…) that lwd
-runs alongside it, even though the app itself is just one container:
+### Example: app with a backing Postgres
 
 ```toml
 name   = "myapp"
-image  = "ghcr.io/me/myapp:latest"   # or [git] + [build] — backing works with either
+image  = "ghcr.io/me/myapp:latest"
 domain = "myapp.example.com"
 port   = 8080
 env    = { DATABASE_URL = "postgres://app:app@db:5432/app" }
@@ -249,433 +311,119 @@ name   = "db"
 image  = "postgres:16"
 env    = { POSTGRES_USER = "app", POSTGRES_PASSWORD = "app", POSTGRES_DB = "app" }
 volume = "db-data:/var/lib/postgresql/data"
-
-[[services]]
-name    = "minio"
-image   = "minio/minio"
-command = "server /data"
-env     = { MINIO_ROOT_USER = "admin" }
-secrets = ["MINIO_ROOT_PASSWORD"]   # resolved and injected into the backing service too
-volume  = "minio-data:/data"
 ```
 
-Each `[[services]]` entry accepts `name`, `image`, `command` (optional),
-`env`, `secrets` (declared names, resolved and injected the same fail-closed
-way as the app's own `secrets`), and `volume` (`name:path` for a named,
-persistent volume, or a bind-mount path).
-
-- **Pinned, never blue-greened.** Backing services are rendered into a
-  generated `docker-compose` project (`lwd-<app>`) and brought up with
-  `docker compose up -d`, on a dedicated per-app network. They are **not**
-  torn down or recreated on every `apply`/`rollback` of the app itself —
-  compose's own "only recreate what changed" semantics mean an unchanged
-  backing service (and its data) survives redeploy after redeploy.
-- **Named volumes persist.** A `volume = "name:path"` declares a top-level
-  named Docker volume; it is not removed by a normal redeploy, rollback, or
-  even `lwd rm` (which runs `compose down` without `-v` — data is never
-  auto-destroyed).
-- **Reachable by name.** The app's own surface container is connected to both
-  the shared `lwd` network (so Caddy can reach it) and the per-app backing
-  network (so it can reach `db`, `minio`, etc. by container name, exactly as
-  written in `env`/`secrets` above). Backing services publish no host ports;
-  they're internal-only.
-- **Works with `image` or `[git]` apps, not Phase-4 `compose` apps.**
-  `lwd.toml` validation rejects `[[services]]` on a `compose` app — those
-  already define their whole stack (including their own database/cache
-  services) directly in the compose file; see [Compose apps](#compose-apps).
-- **Removal:** `lwd rm <app>` removes the surface container(s) **and** runs
-  `compose down` on the backing project — this does remove the backing
-  containers, but named volumes are left in place unless pruned separately.
-
-`lwd-web`'s **From Git** and **Builder** tabs both have a "Backing services"
-section that builds `[[services]]` entries into the generated `lwd.toml` for
-you — see [Web UI](#web-ui-lwd-web).
-
-## Multi-node (federation)
-
-By default every app deploys to the same machine `lwd daemon` runs on. lwd
-can additionally deploy an app to another registered machine over
-**docker-over-ssh**, moving whatever image it needs there with `docker save |
-ssh | load` — no image registry required, and lwd manages no ssh credentials
-of its own (the daemon's own `ssh` — agent, keys, `~/.ssh/config` — must
-already reach the target non-interactively, exactly like [Deploy from
-Git](#deploy-from-git)'s use of the box's own git).
-
-**`node = "local"` pins an app to the controller; leaving `node` unset lets
-lwd pick where it runs** — see [Scheduling & pools](#scheduling--pools) for
-the placement rules. On a single-node install (no other nodes registered)
-these two are equivalent in practice: there's only ever one place to run.
-
-### Register a node
-
-```bash
-lwd node add web1 deploy@web1.example.com 100.64.0.2
-lwd node add web1 deploy@web1.example.com 100.64.0.2 --agent http://100.64.0.2:8078
-lwd node ls
-lwd node rm web1
-```
-
-- `<ssh-host>` is anything `ssh` itself accepts (`user@host`, or a `Host`
-  alias from `~/.ssh/config`).
-- `<mesh-addr>` is the address the controller reaches that node at for app
-  traffic. This is meant to be a **WireGuard mesh** address: the central
-  Caddy talks plain HTTP to a remote surface across it, so it should be a
-  private, trusted network, not a public IP. Standing up the mesh itself
-  (WireGuard keys/peers) is outside lwd's scope, same as ssh — bring your
-  own.
-- `--agent <url>` is optional: the base URL of a running
-  [`lwd-agent`](#the-lwd-agent-transport) on that node (typically
-  `http://<mesh-addr>:8078`). If set, lwd prefers talking to that agent over
-  docker-over-ssh whenever it's reachable — see
-  [The lwd-agent transport](#the-lwd-agent-transport).
-- `local` is implicit and never appears in `lwd node ls`; registering a node
-  named `local` is not meaningful and not supported.
-- `lwd node ls`, `lwd-web`'s **Nodes** view, and `lwd-mcp`'s `lwd_node_list`
-  tool all show each node's live **transport** (`agent`, `ssh`, or `local`)
-  and **reachability**, probed fresh on every call — see
-  [Web UI](#web-ui-lwd-web) and [Agent access](#agent-access-lwd-mcp).
-
-### Place an app on a node
-
-Add `node = "<name>"` to `lwd.toml` to pin it to a specific node:
+### Example: compose app
 
 ```toml
-name   = "worker"
-image  = "ghcr.io/me/worker:latest"
-domain = "worker.example.com"
-port   = 8080
-node   = "web1"
+name    = "webapp"
+compose = "docker-compose.yml"
+service = "web"
+domain  = "webapp.example.com"
+port    = 8080
+env     = { LOG_LEVEL = "info" }
+secrets = ["DATABASE_URL"]
+
+[health]
+path = "/healthz"
 ```
 
-Setting `node = "local"` pins it to the controller. **Omitting `node`
-entirely** hands placement to the scheduler instead of pinning it anywhere —
-see [Scheduling & pools](#scheduling--pools). Every existing single-node
-`lwd.toml` (no `node` line, no other nodes registered) is unaffected: with
-nothing else to choose from, the scheduler places it on `local`, same as
-before. `lwd-web`'s Deploy modal (both **From Git** and **Builder** tabs) has
-a **Node** dropdown — `Auto` (unset), `local`, or a registered node — that
-adds (or omits) the `node = "..."` line for you, plus optional **Pool**/
-**CPU**/**Memory** fields; `lwd-mcp`'s `lwd_apply` and `lwd_deploy_git` tools
-take optional `node`, `pool`, and `requirements` arguments that do the
-same — see [Web UI](#web-ui-lwd-web) and [Agent access](#agent-access-lwd-mcp).
+## CLI command reference
 
-### How a remote deploy works
+Every command below is dispatched from `internal/cli/cli.go`'s `Run`. All
+client subcommands talk to the daemon over its unix socket.
 
-1. **The build always stays on the controller.** A git-built app's `docker
-   build` (see [Deploy from Git](#deploy-from-git)) never runs on the target
-   node; only the resulting image is shipped there.
-2. Before starting the container, lwd makes the image available on the
-   target: it first tries an ordinary registry pull **on the target
-   itself** (covers any image the target can fetch on its own, with no data
-   flowing through the controller); if that doesn't produce the image (e.g.
-   a locally-built `lwd-build/<app>:<sha>` tag that was never pushed
-   anywhere), lwd transfers it directly — `docker save` on the controller,
-   piped over the transport (agent or ssh) into `docker load` on the target.
-3. The surface container runs on the target node, reached over whichever
-   [transport](#the-lwd-agent-transport) is currently selected for it — a
-   registered `lwd-agent` if one is reachable, otherwise the Docker SDK's ssh
-   connection helper (the same mechanism `docker -H ssh://<ssh-host>` uses).
-   Either way the behavior is identical from here: a **local** surface
-   publishes no host port at all — Caddy reaches it by container name on the
-   shared `lwd` network, unchanged from single-node. A **remote** surface
-   instead publishes an ephemeral host port bound to the node's mesh address,
-   and the central Caddy's upstream for that route becomes
-   `<mesh-addr>:<published-port>`. Blue-green staging, health-checking
-   (through Caddy), and cutover all work exactly as described in [How
-   deploys work](#how-deploys-work) — only the upstream address differs.
-4. A remote app's declared [`[[services]]`](#backing-services) are brought
-   up with `docker compose` **targeting the node's own daemon**
-   (`DOCKER_HOST=ssh://<ssh-host>` in the process env passed to the compose
-   CLI — backing services always go over ssh/`DOCKER_HOST`, independent of
-   which transport runs the surface container itself) — pinned alongside the
-   surface on that node, not the controller.
+### Apps
 
-### What's remote-capable today
+| Command | Flags | What it does |
+| --- | --- | --- |
+| `lwd apply [dir]` | — | Deploys `<dir>/lwd.toml` (default `.`). Blue-green for image/git apps, delegated to `docker compose` for compose apps. |
+| `lwd ls` | — | Lists every app: name, status, domain, replica count, image. |
+| `lwd status <app>` | — | One app's status plus (when available) per-replica node/container detail. |
+| `lwd logs <app>` | `-f`, `--follow` | Prints (or streams) the app's container logs. |
+| `lwd history <app>` | — | Lists past deployments: ID, status, image, created time. |
+| `lwd rollback <app>` | — | Redeploys the previous deployment's exact snapshotted spec. |
+| `lwd scale <app> <replicas>` | — | Redeploys the app's current spec at a new replica count (`replicas` must be a positive integer). |
+| `lwd rm <app>` | — | Stops and deregisters the app. |
 
-- `image` apps and `[git]`+`[build]` apps — with or without
-  `[[services]]` — can be placed on a registered node.
-- **A `compose =` app cannot be placed on a remote node yet.**
-  `lwd.toml` validation rejects `compose` combined with a non-local `node`
-  outright (`compose apps on remote nodes are not supported yet`): unlike
-  the image/git backing-services path above, `applyCompose`'s `docker
-  compose up` and routing don't yet thread a resolved node's `DOCKER_HOST`
-  through, so silently allowing it would run the stack on the controller
-  instead of the node the user asked for. Run a compose app on `local`, or
-  reshape it as an `image`/`[git]` app with `[[services]]` if it needs to
-  run on a remote node.
-- Node reachability is now continuously observed (see [Self-healing &
-  health](#self-healing--health)), and a dead surface is healed in place on
-  its existing node. An unpinned app is placed once, at apply time, by the
-  capacity-aware scheduler (see [Scheduling & pools](#scheduling--pools)).
-  **Cross-node reschedule when a node goes away entirely** — both
-  operator-initiated (`lwd node drain`/`evacuate`) and fully automatic on
-  node loss — is now live; see [Node maintenance &
-  failover](#node-maintenance--failover).
+```
+$ lwd ls
+APP                  STATUS     DOMAIN                         REPLICAS  IMAGE
+blog                 running    blog.example.com               1         ghcr.io/me/blog:latest
+```
 
-## Scheduling & pools
+```
+$ lwd apply ./myapp
+deployed app (traefik/whoami:latest) container 3f2a9c1b7e4d
+```
 
-Every registered node (plus the implicit `local` node) belongs to a **pool**
-— a group the scheduler picks within. Nodes registered without an explicit
-pool, and `local`, live in `"default"`.
+### Secrets
+
+| Command | What it does |
+| --- | --- |
+| `lwd secret set <app> <KEY>` | Sets a secret's value, read from **stdin**. |
+| `lwd secret ls <app>` | Lists secret names for the app (never values). |
+| `lwd secret rm <app> <KEY>` | Deletes a secret. |
 
 ```bash
-lwd node add web1 deploy@web1.example.com 100.64.0.2 --pool web
-lwd node add web2 deploy@web2.example.com 100.64.0.3 --pool web
-lwd pool ls
+echo -n 'postgres://...' | lwd secret set blog DATABASE_URL
+# secret DATABASE_URL set for blog; redeploy to apply
+```
+
+### Nodes
+
+| Command | Flags | What it does |
+| --- | --- | --- |
+| `lwd node add <name> <ssh-host> <mesh-addr>` | `--agent <url>`, `--pool <name>` | Registers a node. `<ssh-host>` is anything `ssh` accepts; `<mesh-addr>` is the address the controller reaches it at for app traffic (meant to be a WireGuard mesh address). |
+| `lwd node ls` | — | Lists every registered node: ssh host, mesh addr, agent URL, pool, live transport, schedulable state, reachability. |
+| `lwd node rm <name>` | — | Deregisters a node. Apps already placed on it are not moved. |
+| `lwd node capacity` | — | Lists every node's live CPU/mem/disk (used/total or available/total) and whether it was measured (`KNOWN`). |
+| `lwd node inspect <name>` | — | One node's pool, transport, reachability, capacity, and the surfaces currently placed on it. |
+| `lwd node drain <name>` | — | Cordons the node, then moves every scheduler-placed surface off it. |
+| `lwd node evacuate <name>` | — | Moves every scheduler-placed surface off the node, **without** cordoning it. |
+| `lwd node uncordon <name>` | — | Clears a cordon; never moves anything already running. |
+
+```
+$ lwd node add web1 deploy@web1.example.com 100.64.0.2 --agent http://100.64.0.2:8078 --pool web
+added node web1 (ssh deploy@web1.example.com, mesh 100.64.0.2, agent http://100.64.0.2:8078, pool web)
 ```
 
 ```
+$ lwd node capacity
+NODE             POOL       SCHEDULABLE  CPU            MEM                  DISK                 KNOWN
+local            default    yes          1.20/8         6.1G/16.0G           140.0G/200.0G        yes
+web1             web        yes          3.60/4         1.0G/8.0G            8.0G/100.0G          yes
+web2             web        cordoned     —              —                    —                    no
+```
+
+```
+$ lwd node drain web1
+Moved: blog
+Skipped (pinned): payments-db-proxy
+```
+
+### Pools
+
+| Command | What it does |
+| --- | --- |
+| `lwd pool ls` | Lists every pool and its node count. |
+
+```
+$ lwd pool ls
 POOL                 NODES
 default              1
 web                  2
 ```
 
-### Placing an app
+### Fleet health & daemon
 
-- **`node` unset** (no `node` line in `lwd.toml`) — the daemon schedules it:
-  at apply time, it gathers every reachable node in the app's `pool`
-  (`"default"` if `pool` is also unset — always includes `local`) along with
-  each one's live [capacity](#the-lwd-agent-transport), picks the node with
-  the most free memory (ties broken by free CPU, then name), and deploys
-  there. This is a one-time placement decision made at `apply`, not a
-  continuously rebalanced one — redeploying the same app schedules it again
-  from scratch (it may land somewhere different if capacity shifted). Once
-  placed, a scheduled app's surface can still move later — but only via
-  drain/evacuate or automatic failover, never a background rebalancer; see
-  [Node maintenance & failover](#node-maintenance--failover).
-- **`node = "local"`** or **`node = "<registered-name>"`** — pins the app
-  exactly as before Phase 11a; the scheduler is never consulted.
-- **`pool = "<name>"`** narrows which pool an unpinned app schedules into.
-  Ignored (but still validated) if `node` is pinned.
-- **`[requirements]`** declares what the app needs — `cpu` (cores, e.g.
-  `0.5`) and/or `memory` (a size string, e.g. `"512M"`, `"2G"`) — and the
-  scheduler excludes any candidate node that doesn't have that much free.
-  Neither field is required; omit `[requirements]` entirely for "runs
-  anywhere with room."
-
-```toml
-name    = "worker"
-image   = "ghcr.io/me/worker:latest"
-domain  = "worker.example.com"
-port    = 8080
-pool    = "web"
-
-[requirements]
-cpu    = 1
-memory = "1G"
-```
-
-A node whose live capacity couldn't be measured (e.g. a briefly-unreachable
-remote, or an ssh-only node that only ever reports totals, never live usage)
-is **optimistically assumed to fit** any requirement rather than being
-excluded outright — this keeps a flaky capacity probe from turning into a
-failed deploy. See [The lwd-agent transport](#the-lwd-agent-transport) for
-which nodes report precise, live-usage capacity (agent-connected) versus
-best-effort totals (ssh-only).
-
-**Single-node stays exactly as before:** with no other nodes registered,
-every pool but `default` is empty, `local` is the only candidate, and an
-unpinned app always lands there — scheduling changes nothing observable for
-a single-machine install.
-
-### Inspecting capacity and placement
-
-```bash
-lwd node capacity
-```
+| Command | What it does |
+| --- | --- |
+| `lwd health` | Prints the reconciler's live snapshot: node reachability, edge (Caddy) reachability, and per-app self-heal state (`healthy`/`degraded`/`healing`/`failed`) with heal-attempt counts. |
+| `lwd daemon` | Runs the daemon in the foreground: brings up the `lwd` Docker network + `lwd-caddy`, starts the reconciler loop, and listens on the unix socket. |
 
 ```
-NODE             POOL       CPU            MEM                  DISK                 KNOWN
-local            default    1.20/8         6.1G/16.0G           140.0G/200.0G        yes
-web1             web        3.60/4         1.0G/8.0G            8.0G/100.0G          yes
-web2             web        —              —                    —                    no
-```
-
-`CPU` is *used*/*cores*, `MEM` and `DISK` are *available*/*total* — the same
-numbers the scheduler ranks candidates by. `KNOWN = no` means this node's
-capacity couldn't be measured on the last probe (see the agent-vs-ssh note
-above); it's still a placement candidate, just an optimistic one.
-
-```bash
-lwd node inspect web1
-```
-
-```
-NODE:      web1
-POOL:      web
-TRANSPORT: agent
-REACHABLE: true
-CPU:       3.60/4 cores
-MEM:       1.0G/8.0G
-DISK:      8.0G/100.0G
-
-SURFACES
-APP                  STATUS     DOMAIN                         IMAGE
-worker               running    worker.example.com             ghcr.io/me/worker:latest
-```
-
-`node inspect` derives "what's running here" from every app's most recently
-recorded deployment spec (there's no separate placement table to query) —
-the same data `lwd-web`'s Nodes/Health views and `lwd-mcp`'s `lwd_node_list`
-tool render as pool badges and CPU/memory/disk bars/fields.
-
-## The lwd-agent transport
-
-`lwd-agent` is a **fourth, optional binary**: a dumb per-node worker that
-replaces raw docker-over-ssh as the transport a registered node's containers
-run over. It performs **no orchestration of its own** — every request it gets
-is delegated straight through to a local `node.Node` (the same abstraction
-the controller uses for its own Docker daemon); all placement, scheduling,
-and blue-green logic still lives entirely on the controller.
-
-### Build and run
-
-```bash
-CGO_ENABLED=0 go build -o lwd-agent ./cmd/lwd-agent
-LWD_AGENT_TOKEN=changeme ./lwd-agent   # binds :8078 by default
-```
-
-- `LWD_AGENT_TOKEN` (required) — a shared bearer token; `lwd-agent` refuses to
-  start without one. The controller sends this same token (its own
-  `LWD_AGENT_TOKEN` env var, wired into `node.NewRegistryResolver`) as
-  `Authorization: Bearer <token>` on every request except `/healthz`, which is
-  unauthenticated (used only for an external liveness probe). The controller's
-  `LWD_AGENT_TOKEN` must match the agent's: if it is missing or wrong, the
-  agent's authenticated `/ready` readiness probe (used for transport
-  selection, see below) fails, the agent transport is treated as unavailable,
-  and lwd falls back to docker-over-ssh. `/ready` returns 200 only when the
-  request is authenticated **and** the agent's own Docker daemon is reachable,
-  so a node whose agent is up and authorized but whose Docker is down is also
-  treated as unavailable and likewise falls back to ssh.
-- `LWD_AGENT_ADDR` (default `:8078`) — listen address. Bind this to the
-  node's **WireGuard mesh interface** (e.g. `100.64.0.2:8078`), not a public
-  one — `lwd-agent` has no TLS of its own; it relies entirely on the mesh for
-  transport privacy, same as the plain-HTTP mesh traffic described in
-  [Networking model](#networking-model).
-
-### Registering and using it
-
-```bash
-lwd node add web1 deploy@web1.example.com 100.64.0.2 --agent http://100.64.0.2:8078
-```
-
-Once registered, every deploy targeting `node = "web1"` resolves its
-transport fresh: the daemon builds an agent client for the registered
-`agent_url` and pings its authenticated `/ready` endpoint with the
-controller's `LWD_AGENT_TOKEN`; that endpoint returns 200 only when the agent
-is up, the token is valid, **and** the agent's own Docker daemon is reachable.
-If it succeeds, the entire deploy (
-image presence, network setup, run/remove/health/logs, and the
-`docker save|load` image-transfer fallback) goes over the agent's HTTP API
-instead of ssh. If the agent doesn't answer — not registered, temporarily
-down, answering with a missing/wrong token, or up but with an unreachable
-Docker daemon — lwd **falls back to docker-over-ssh automatically** — the exact P9a behavior — so registering a
-node without `--agent` (or with a currently unreachable one, or a
-misconfigured token) keeps working exactly as before. This fallback is
-re-evaluated on every resolve, not cached permanently, so a node's agent
-coming back up (or its token being fixed) is picked up on the next deploy
-without restarting the daemon.
-
-### Trust boundary
-
-**A registered `lwd-agent`'s bearer token is effectively root on that node.**
-Its HTTP API exposes raw Docker primitives (run/remove any container, load
-arbitrary image tarballs, read any container's logs) with no per-app or
-per-namespace restriction — anyone who can reach `LWD_AGENT_ADDR` with a
-valid token can run anything on that machine, exactly as anyone with access
-to `ssh://<ssh-host>`'s Docker socket could in the P9a ssh transport. This is
-why `lwd-agent` must bind only the mesh interface (never a public one) and
-why the shared token must be treated like an ssh private key: keep it out of
-version control, rotate it if it leaks, and don't reuse it as any other
-credential.
-
-`lwd-web`'s **Nodes** view and `lwd-mcp`'s `lwd_node_list`/`lwd_node_add`/
-`lwd_node_remove` tools manage the node registry (including `agent_url`) the
-same way the CLI's `lwd node` subcommands do — see
-[Web UI](#web-ui-lwd-web) and [Agent access](#agent-access-lwd-mcp).
-
-### Node capacity: agent vs ssh
-
-The transport a node is reached over also decides how precise its reported
-[capacity](#scheduling--pools) is:
-
-- **Agent-connected nodes report precise, live usage** — `lwd-agent` reads
-  `/proc/meminfo` and `/proc/loadavg` and `statfs`s the root filesystem on
-  its own host directly, the same way the controller measures its own
-  (`local`) capacity. CPU-used, memory-available, and disk-free all reflect
-  what's happening on that machine right now.
-- **ssh-only nodes report best-effort totals from `docker info`** — without
-  an agent running there to read `/proc` locally, lwd falls back to what the
-  remote Docker daemon itself reports (CPU core count, total memory), which
-  has no live *usage* figures. `CPUUsed` and `MemAvailable` are left at their
-  zero value in this case (still `Known: true` — the totals themselves are
-  real, just not usage-aware), so the scheduler's free-memory ranking treats
-  such a node as though nothing is using it yet.
-- **A probe that fails entirely** (unreachable node, agent down, ssh
-  timeout) reports `Known: false` — see [Scheduling &
-  pools](#scheduling--pools) for how that's handled (optimistic inclusion,
-  never a hard exclusion).
-
-This is the same reason `lwd-agent` is worth running on a node you plan to
-schedule onto with `[requirements]`: it's the difference between the
-scheduler seeing real headroom versus just "how big is this box."
-
-## Self-healing & health
-
-The daemon runs a **continuous reconciler loop** entirely off the request
-path: `lwd apply`/`lwd rollback` still return as soon as *their own* deploy
-finishes, and the loop runs in the background on its own schedule —
-`cli.runDaemon` starts it in a goroutine at daemon startup, with one pass
-immediately (so a freshly started daemon doesn't wait a full interval before
-its first check), then one pass on every tick of `LWD_RECONCILE_INTERVAL`
-(default `15s`), plus one extra, non-blocking pass nudged right after every
-successful `apply`/`rollback` (so a bad deploy gets a fast first look rather
-than waiting out the interval). Each pass recovers its own panics and logs
-its own errors — a bad reconcile never takes down the daemon.
-
-**What actually gets healed: single-service surfaces that have CRASHED,
-EXITED, or otherwise gone missing** (`image` or `[git]`-built apps, with or
-without `[[services]]`) — the same population `lwd rollback` operates on.
-Each pass checks the current deployment's container; if it's not `running`
-at all (gone/exited/crashed), the reconciler heals it by running the exact
-blue-green flow `apply` itself uses (recreate — a git app's already-built
-image tag is reused, never rebuilt), then re-points the route and records a
-fresh deployment row, exactly as if you'd run `lwd rollback` or `redeploy` by
-hand. Repeated failures back off exponentially (15s, 30s, 1m, ...) and give
-up after `LWD_HEAL_MAX_ATTEMPTS` consecutive attempts (default `5`), at which
-point the app is reported `failed` and left alone rather than retried
-forever.
-
-A container that is **running but reports Docker `HEALTHCHECK`-unhealthy is
-NOT detected or healed by this loop** — it's reported `healthy` in the
-snapshot, same as an actually-healthy container. Layered self-healing based
-on a running container's `HEALTHCHECK` status is out of scope for this
-milestone; today it only recreates surfaces that Docker itself reports as
-crashed, exited, or gone.
-
-**What does *not* get healed:**
-
-- **`compose =` apps** — their container lifecycle belongs to `docker
-  compose`, not lwd's blue-green surface model; the reconciler doesn't
-  observe or touch them at all (no entry appears for them in the health
-  snapshot). Recover a broken compose stack with `lwd rollback`, same as
-  today.
-- **Edge reachability is observed, not acted on** — every pass probes the
-  shared edge (Caddy)'s admin API and records what it saw, but there is only
-  one edge, so there is nothing to reschedule it onto.
-- **Node reachability is observed AND, past a grace period, acted on**: a
-  registered node that stays unreachable is automatically failed over — see
-  [Node maintenance & failover](#node-maintenance--failover) for the full
-  mechanics (grace period, what moves vs. what doesn't, single-node
-  behavior).
-
-**Checking on it:**
-
-```bash
-lwd health
-```
-
-```
+$ lwd health
 NODES
 NAME                 TRANSPORT  REACHABLE
 local                local      yes
@@ -688,135 +436,326 @@ APP                  STATE      HEAL ATTEMPTS  LAST ERROR
 blog                 healthy    0
 ```
 
-This reads the same snapshot the daemon exposes at `GET /health` (via
-`client.Health`, returning `nodes`/`edge`/`apps` — no secret values ever
-appear in it), which `lwd-web`'s **Health** panel (see [Web
-UI](#web-ui-lwd-web)) also renders live in the browser. `state` is one of
-`healthy`, `degraded` (observed unhealthy, not yet healing or waiting on
-backoff), `healing` (a heal attempt is in flight), or `failed` (gave up after
-`LWD_HEAL_MAX_ATTEMPTS`).
+## How deploys work
 
-## Node maintenance & failover
+This describes the path for **image** and **git-built** apps (identical
+once the image is built); [compose apps](#compose-apps) use a different,
+explicitly non-zero-downtime path.
 
-Phase 10 heals a dead surface **in place**, on the node it's already on.
-Phase 11a schedules an unpinned surface **once**, at `apply` time. Neither
-moves an already-running surface **off a node that later disappears** — that
-gap is what this section closes: cross-node reschedule, both
-operator-initiated (planned maintenance) and fully automatic (unplanned node
-loss).
+Every `apply` is a blue-green swap, never an in-place recreate:
 
-**Only scheduler-placed ("scheduled") surfaces are ever moved.** A surface is
-"scheduled" if it landed on its node because `node` was left unset in
-`lwd.toml` (see [Scheduling & pools](#scheduling--pools)) — its concrete node
-is recorded in the deployment's spec snapshot as
-`store.Deployment.Scheduled`. Everything else is left exactly where it is,
-no matter what:
+1. A new surface container is started alongside whatever is currently
+   running, attached only to the private `lwd` network — it never publishes
+   a host port itself.
+2. It's staged behind a throwaway internal hostname on the shared Caddy
+   router and health-checked **through Caddy** (never by talking to the
+   container directly), using a layered policy:
+   - if `health.path` is set, poll it for a 2xx through Caddy;
+   - otherwise, if the image declares a Docker `HEALTHCHECK`, honor it;
+   - otherwise, fall back to a liveness check (container still running and
+     reachable through Caddy at all).
+3. Only once the candidate passes health does the real domain flip to it.
+   The previous container keeps serving every request until that instant —
+   there is no downtime window.
+4. The old surface is retired and removed.
 
-- An app with `node = "..."` **pinned** explicitly — you asked for that node
-  by name, so lwd never second-guesses it.
-- A `compose =` app — its lifecycle belongs to `docker compose`, not lwd's
-  blue-green surface model (same carve-out as [self-healing](#self-healing--health)).
-- Any backing service (`[[services]]`) — always pinned alongside its
-  surface's node.
+A failed candidate never touches the live route: the new container and its
+staging route are torn down, the failure is recorded, and whatever was
+already running keeps serving traffic untouched.
 
-### Operator-initiated: drain, evacuate, uncordon
+Every deployment's resolved spec is snapshotted, so `lwd rollback` restores
+the exact previous image/config from that snapshot — not a re-resolution of
+whatever `lwd.toml` currently says — via the same blue-green path. A
+git-built app's rollback redeploys the previous deployment's already-built
+image tag directly (no re-clone, no rebuild).
+
+## App shapes
+
+### Image apps
+
+The default shape: declare `image` + `domain` + `port` and deploy. See
+[the minimal example](#example-minimal-image-app) above.
+
+### Compose apps
+
+Declare `compose` + `service` instead of `image` to run a multi-container
+[Docker Compose](https://docs.docker.com/compose/) stack. This requires the
+**`docker compose` CLI plugin** on the daemon's host (single-service `image`
+apps don't need it). `lwd.toml` validation rejects mixing `compose` with
+`image` or `[build]`; `surfaces` and `[[services]]` are not supported on a
+compose app, and it can only run on `local`.
+
+**How it deploys (in-place recreate, not blue-green):**
+
+1. `docker compose -p lwd-<app> -f <compose file> up -d --remove-orphans`.
+   Compose only recreates services whose image or config changed — an
+   unchanged backing service (a database, a cache) is left running
+   untouched. This is the model's core guarantee: redeploying to ship a new
+   web-service image does not restart the database.
+2. lwd resolves `service`'s running container, joins it to the shared `lwd`
+   network, and points `domain` at it through Caddy.
+3. It's health-checked through the **live** route using the same layered
+   policy as an image app.
+
+**Honest tradeoff: this is not zero-downtime.** Because `docker compose`,
+not lwd's blue-green surface machinery, owns the container lifecycle, the
+web service takes a brief in-place restart on every redeploy, and the route
+flips to it before health-gating runs. If the health check then fails, lwd
+does **not** tear anything down — the possibly-broken new stack is left
+live and the deployment is recorded as failed. Run `lwd rollback <app>` to
+restore the previous compose content and recover.
+
+`env` and declared `secrets` are resolved fail-closed (aborting before
+`docker compose` ever runs on any unset secret) and passed as environment
+variables to the `docker compose` process, so the compose file's `${VAR}`
+interpolation can reference them. Every deploy snapshots the compose file's
+content, so `lwd rollback` restores the exact prior stack. `lwd rm <app>`
+runs `docker compose down` against the stored content (named volumes are
+left in place).
+
+### Deploy from Git
+
+Declare `[git]` + `[build]` instead of `image` to build straight from a repo
+— no GitHub/GitLab API, OAuth, or webhook receiver involved; `lwd apply`
+shells out to the host's own `git clone` and then `docker build`. Private
+repos work if the box's own git is already authenticated (an SSH key or
+credential helper) — lwd manages no git credentials itself.
+
+**Build → blue-green flow:**
+
+1. lwd clones `git.ref` into a throwaway temp directory (removed after the
+   build), resolving it to a commit SHA.
+2. It runs `docker build` against the checked-out tree, tagging the result
+   `lwd-build/<app>:<shortsha>`. If that exact tag already exists locally
+   (redeploying the same commit), the build is skipped.
+3. The built image is deployed exactly like an `image` app: a fresh
+   zero-downtime blue-green surface. No registry is involved — the image
+   only needs to exist on the local Docker daemon.
+4. The deployment record stores the resolved commit SHA and the built image
+   tag.
+
+Every build is tagged and kept by commit SHA, so `lwd rollback <app>`
+redeploys the previous deployment's already-built image tag directly —
+no re-clone, no rebuild. Old `lwd-build/*` tags are not pruned automatically
+yet, which costs local disk over time.
+
+Git deploy only supports the git-repo-has-a-Dockerfile → single-service
+shape: `lwd.toml` remains the source of truth for name/domain/port/env/
+secrets/backing services, and lwd never reads an `lwd.toml` committed inside
+the cloned repo. `lwd-web`'s Deploy modal has a matching **From Git** tab.
+
+### Backing services
+
+Any `image`- or `[git]`-based app can declare pinned backing services (a
+database, a cache, an object store) via `[[services]]` — see the
+[reference](#services-backing-services) and [example](#example-app-with-a-backing-postgres)
+above.
+
+- **Pinned, never blue-greened.** Backing services run in a generated
+  `docker-compose` project (`lwd-<app>`) on a dedicated per-app network, and
+  are not torn down or recreated on every `apply`/`rollback` of the app
+  itself — an unchanged backing service (and its data) survives redeploy
+  after redeploy.
+- **Named volumes persist** across redeploy, rollback, and `lwd rm` (which
+  runs `compose down` without `-v`).
+- **Reachable by name.** The app's surface container joins both the shared
+  `lwd` network (so Caddy can reach it) and the per-app backing network (so
+  it can reach `db`, `minio`, etc. by container name). Backing services
+  publish no host ports.
+- **Not for compose apps.** A `compose` app already defines its whole stack
+  directly; validation rejects `[[services]]` there.
+- **Removal:** `lwd rm <app>` removes the surface **and** runs `compose
+  down` on the backing project — this removes the backing containers, but
+  named volumes are left in place.
+
+## Secrets
+
+Apps declare secret **names** only:
+
+```toml
+secrets = ["DATABASE_URL", "API_KEY"]
+```
+
+Values live in the daemon's own store, encrypted at rest, set out-of-band:
 
 ```bash
-lwd node drain web1      # cordon web1, then move its scheduled surfaces off it
-lwd node evacuate web1   # move its scheduled surfaces off it, WITHOUT cordoning
-lwd node uncordon web1   # clear the cordon — web1 is eligible for placement again
+lwd secret set blog DATABASE_URL   # reads the value from stdin
+lwd secret ls blog                 # lists names only — never values
+lwd secret rm blog DATABASE_URL
 ```
 
-- **`drain`** = cordon (`store.Node.Schedulable = false`, excluding the node
-  from future scheduler placement — see [Placing an app](#placing-an-app))
-  **then** evacuate: every scheduled surface currently on the node is moved,
-  via the same blue-green redeploy path a self-heal uses, onto whichever
-  other reachable, schedulable, in-pool node the scheduler ranks highest.
-  Use this ahead of planned maintenance (a reboot, a decommission) — nothing
-  new will land on the node afterward, and everything already there is gone.
-- **`evacuate`** does the move WITHOUT cordoning first: the node stays
-  eligible for new placements. Useful for a one-off rebalance without taking
-  the node out of rotation.
-- **`uncordon`** clears the cordon. It never touches anything already
-  running — a cordoned node's existing surfaces (if you evacuated instead of
-  draining, or added the node cordoned) keep running untouched.
+At deploy time the reconciler resolves every declared name and injects it
+into the surface container's environment (a secret wins over a same-named
+`env` key). Resolution is **fail-closed**: if any declared secret has no
+value set, `apply` aborts before starting anything — the new container is
+never created and whatever was already running keeps serving traffic
+untouched.
 
-Every one of these prints (or, via the daemon API/`lwd-web`/`lwd-mcp`,
-returns as JSON) an **`EvacuateResult`**: which apps' surfaces actually
-**moved**, which were **skipped** (pinned — see above), and which **failed**
-to move (with why — typically "no other node has room"). A failed move
-leaves the original surface running untouched; nothing is torn down until
-its replacement is confirmed live, same blue-green guarantee as every other
-redeploy path in lwd.
+Values are encrypted with **AES-256-GCM** using a key generated on first use
+and stored at `<data_dir>/secret.key` with **`0600`** permissions. Once set,
+a value is **never read back out of the daemon** — the API and CLI only
+expose `set`, `ls` (names only), and `rm`; there is no `get`.
 
+## Multi-node federation
+
+> Implemented and covered by fake-backed tests; the Docker-gated multi-node
+> end-to-end test is not exercised on a real cluster in this environment —
+> see [Status](#status).
+
+By default every app deploys to `local`, the machine `lwd daemon` runs on.
+lwd can additionally deploy to another registered machine over
+**docker-over-ssh** (or the [`lwd-agent` transport](#the-lwd-agent-transport)),
+moving whatever image it needs there with `docker save | ssh | load` — no
+image registry required. lwd manages no ssh credentials of its own: the
+daemon's own `ssh` (agent, keys, `~/.ssh/config`) must already reach the
+target non-interactively.
+
+### Register a node
+
+```bash
+lwd node add web1 deploy@web1.example.com 100.64.0.2
+lwd node add web1 deploy@web1.example.com 100.64.0.2 --agent http://100.64.0.2:8078
+lwd node ls
+lwd node rm web1
 ```
-$ lwd node drain web1
-Moved: blog
-Skipped (pinned): payments-db-proxy
-Failed: (none)
+
+- `<ssh-host>` is anything `ssh` itself accepts (`user@host`, or a `Host`
+  alias from `~/.ssh/config`).
+- `<mesh-addr>` is meant to be a **WireGuard mesh** address: the central
+  Caddy talks plain HTTP to a remote surface across it, so it should be a
+  private, trusted network, not a public IP. Standing up the mesh itself is
+  outside lwd's scope, same as ssh — bring your own.
+- `--agent <url>` is optional: the base URL of a running `lwd-agent` on that
+  node. If set, lwd prefers it over docker-over-ssh whenever reachable.
+- `local` is implicit and never appears in `lwd node ls`.
+
+### Place an app on a node
+
+```toml
+name   = "worker"
+image  = "ghcr.io/me/worker:latest"
+domain = "worker.example.com"
+port   = 8080
+node   = "web1"
 ```
 
-`lwd node ls` and `lwd node capacity`'s `SCHEDULABLE` column (see
-[Inspecting capacity and placement](#inspecting-capacity-and-placement))
-show `yes` or `cordoned` for every registered node.
+`node = "local"` pins to the controller; omitting `node` hands placement to
+the [scheduler](#scheduling-capacity-and-pools). A single-node install (no
+other nodes registered, `node` unset) is completely unaffected — there's
+only ever one place to run.
 
-### Automatic failover on node loss
+### How a remote deploy works
 
-The [continuous reconciler](#self-healing--health) tracks how long each
-registered node has been continuously unreachable. Once that streak exceeds
-`LWD_FAILOVER_GRACE` (a duration string, e.g. `2m`; **default `60s`**), the
-next reconcile pass automatically evacuates every scheduled surface on that
-node — exactly as a manual `lwd node drain` would, minus the cordon (a node
-that comes back is immediately eligible again; nothing re-populates it
-automatically — see [Known limitations](#known-limitations-this-milestone)).
-The grace period exists so a brief network blip doesn't trigger a
-reschedule; a genuinely dead node is moved off within one grace window of
-going dark.
+1. **The build always stays on the controller.** A git app's `docker build`
+   never runs on the target node; only the resulting image is shipped.
+2. Before starting the container, lwd tries an ordinary registry pull on
+   the target itself first; if that doesn't produce the image (e.g. a
+   locally-built tag never pushed anywhere), lwd transfers it directly:
+   `docker save` on the controller, piped over the transport into `docker
+   load` on the target.
+3. The surface runs on the target, reached over whichever
+   [transport](#the-lwd-agent-transport) is currently selected — a
+   registered `lwd-agent` if reachable, otherwise the Docker SDK's ssh
+   connection helper. A **local** surface publishes no host port; a
+   **remote** surface publishes an ephemeral host port bound to the node's
+   mesh address, and Caddy's upstream becomes `<mesh-addr>:<published-port>`.
+   Blue-green staging, health-checking, and cutover work exactly as on
+   `local`.
+4. A remote app's `[[services]]` are brought up with `docker compose`
+   **targeting the node's own daemon** (`DOCKER_HOST=ssh://<ssh-host>`),
+   pinned alongside the surface on that node.
 
-- A **pinned** surface on the lost node is left running (it can't be —
-  reachability permitting — it's simply reported `degraded` in the health
-  snapshot, same as any surface on an unreachable node) and is **never**
-  moved by automatic failover, same as a manual evacuate.
-- The old container is removed from the dead node **only if the node is
-  still reachable enough to ask** (e.g. an evacuate triggered manually while
-  it's flapping); for an actually-gone node, there's nothing to ask, so
-  cleanup is skipped and the old deployment row is still marked retired —
-  its container simply dies along with the node.
-- **Single-node installs have nothing to fail over**: with no other node
-  registered, there's no failure to detect (nothing but `local` is ever
-  probed for loss) and nowhere to move a surface even if there were —
-  behavior is completely unchanged from every earlier phase.
-- This is loss-triggered reschedule, not a background rebalancer: a
-  healthy fleet is never touched, and a node that comes back after a
-  failover stays empty (of that surface) until you place something on it
-  again — see the one-shot/no-rebalancing note in [Scheduling &
-  pools](#scheduling--pools).
-- **Controller-partition case**: if the *controller* loses mesh connectivity
-  to its nodes (rather than a single node dying), every registered node
-  reads unreachable after `LWD_FAILOVER_GRACE`, and each one's scheduled
-  `default`-pool surfaces are evacuated onto the local node — bounded by
-  local capacity; surfaces that don't fit are left reported-degraded rather
-  than force-placed. This is the correct recovery for the realistic version
-  of this partition, since the controller also hosts Caddy and so can't
-  route to those remote surfaces either way. When the partition heals, the
-  original remote containers are orphaned on their nodes — their deployment
-  rows are already retired, so a future reconcile pass or `lwd node rm`
-  cleans them up; nothing removes them automatically today. Single
-  edge/controller is the current design; multi-edge is P13 (see
-  `docs/VISION.md`).
+**What's remote-capable today:** `image` and `[git]`+`[build]` apps, with or
+without `[[services]]`. **A `compose` app cannot be placed on a remote node**
+— validation rejects it outright, because `applyCompose` doesn't yet thread
+a resolved node's `DOCKER_HOST` through.
 
-`lwd-web`'s **Nodes** view exposes drain/evacuate/uncordon as buttons (per
-node, rendering the returned `EvacuateResult`) and a schedulable/cordoned
-badge; its **Health** panel also flags a cordoned node. `lwd-mcp` exposes the
-same three operations as `lwd_node_drain`/`lwd_node_evacuate`/
-`lwd_node_uncordon` tools — see [Web UI](#web-ui-lwd-web) and [Agent
-access](#agent-access-lwd-mcp).
+### The lwd-agent transport
+
+`lwd-agent` is a dumb per-node worker that replaces raw docker-over-ssh. It
+performs **no orchestration of its own** — every request is delegated
+straight to a local `node.Node` (the same abstraction the controller uses
+for its own Docker daemon); all placement, scheduling, and blue-green logic
+stays entirely on the controller.
+
+```bash
+CGO_ENABLED=0 go build -o lwd-agent ./cmd/lwd-agent
+LWD_AGENT_TOKEN=changeme ./lwd-agent   # binds :8078 by default
+```
+
+- `LWD_AGENT_TOKEN` (required) — a shared bearer token; `lwd-agent` refuses
+  to start without one. The controller sends its own `LWD_AGENT_TOKEN` as
+  `Authorization: Bearer <token>` on every request except `/healthz`
+  (unauthenticated liveness probe).
+- `LWD_AGENT_ADDR` (default `:8078`) — listen address. Bind this to the
+  node's WireGuard mesh interface, not a public one — `lwd-agent` has no TLS
+  of its own and relies entirely on the mesh for transport privacy.
+
+Once registered with `--agent <url>`, every deploy targeting that node
+resolves its transport fresh: the daemon pings the agent's authenticated
+`/ready` endpoint (200 only when the token is valid **and** the agent's own
+Docker is reachable). If it succeeds, the whole deploy goes over the
+agent's HTTP API instead of ssh; if it fails for any reason, lwd **falls
+back to docker-over-ssh automatically**, re-evaluated on every resolve (not
+cached), so a node's agent coming back up is picked up on the next deploy.
+
+**Trust boundary:** a registered `lwd-agent`'s bearer token is effectively
+**root on that node** — its HTTP API exposes raw Docker primitives
+(run/remove any container, load arbitrary image tarballs, read any
+container's logs) with no per-app restriction. Bind it only to the mesh
+interface, and treat the token like an ssh private key.
+
+**Capacity precision also depends on transport:** agent-connected nodes
+report precise, live usage (reading `/proc/meminfo`, `/proc/loadavg`, and
+`statfs` on their own host); ssh-only nodes report best-effort totals from
+`docker info` (no live usage figures, but still `Known: true`); a probe that
+fails entirely reports `Known: false` (optimistically included as a
+placement candidate rather than excluded — see
+[Scheduling, capacity, and pools](#scheduling-capacity-and-pools)).
+
+## Scheduling, capacity, and pools
+
+Every registered node (plus the implicit `local`) belongs to a **pool** —
+nodes registered without one, and `local`, live in `"default"`.
+
+```bash
+lwd node add web1 deploy@web1.example.com 100.64.0.2 --pool web
+lwd node add web2 deploy@web2.example.com 100.64.0.3 --pool web
+lwd pool ls
+```
+
+**Placing an app:**
+
+- **`node` unset** — the daemon schedules it: at apply time, it gathers
+  every reachable node in the app's `pool` (`"default"` if unset — always
+  includes `local`) along with each one's live capacity, picks the node
+  with the most free memory (ties broken by free CPU, then name), and
+  deploys there. This is a **one-time placement decision** made at `apply`
+  — redeploying the same app schedules it again from scratch, and may land
+  somewhere different if capacity shifted. Once placed, a scheduled app's
+  surface only moves later via drain/evacuate or automatic failover, never
+  a background rebalancer.
+- **`node = "local"` or `node = "<name>"`** — pins the app; the scheduler is
+  never consulted.
+- **`pool = "<name>"`** narrows which pool an unpinned app schedules into.
+- **`[requirements]`** excludes any candidate node without that much free
+  `cpu`/`memory`. A node whose live capacity couldn't be measured is
+  **optimistically assumed to fit** rather than excluded, so a flaky probe
+  never turns into a failed deploy.
+
+**Single-node stays exactly as before:** with no other nodes registered,
+every pool but `default` is empty, `local` is the only candidate, and an
+unpinned app always lands there.
+
+Inspect placement and capacity with `lwd node capacity` and `lwd node
+inspect <name>` — see the [CLI reference](#nodes) for sample output. `node
+inspect` derives "what's running here" from every app's most recently
+recorded deployment spec — there is no separate placement table.
 
 ## Replicas & load balancing
 
-Every app so far has run as exactly one container. Phase 12 lets an `image`
-or `[git]`-built app run as **N load-balanced replicas** instead — declare it
-in `lwd.toml`:
+An `image` or `[git]`-built app can run as **N load-balanced replicas**
+instead of one container:
 
 ```toml
 replicas = 3
@@ -826,274 +765,200 @@ or scale a running app live, without touching `lwd.toml`:
 
 ```bash
 lwd scale blog 3     # scale up
-lwd scale blog 1      # scale back down to a single instance
+lwd scale blog 1     # scale back down
 ```
 
-`lwd scale` (and the equivalent `POST /apps/{name}/scale` daemon API,
-`lwd-web`'s scale control, and `lwd-mcp`'s `lwd_scale` tool) reuses the app's
-**current recorded spec snapshot** — same as `lwd rollback` — and only
-changes `Replicas`, so scaling never accidentally picks up an unrelated
-`lwd.toml` edit sitting on disk.
+`lwd scale` (and the equivalent `POST /apps/{name}/scale`, `lwd-web`'s scale
+control, and `lwd-mcp`'s `lwd_scale` tool) reuses the app's current recorded
+spec snapshot — same as `lwd rollback` — and only changes `Replicas`, so
+scaling never accidentally picks up an unrelated `lwd.toml` edit sitting on
+disk.
 
-- **Round-robin + passive health.** Caddy load-balances across every replica
-  with a simple round-robin policy, and passively ejects one that starts
-  failing (`fail_duration`) from rotation until it recovers — no separate
-  health-check polling loop on the router's side. For `replicas = 1` (the
-  default), the Caddyfile it generates is **byte-identical** to every
-  earlier phase: a single-replica app is not a "1-wide load-balanced pool"
-  internally, it's the exact same single-upstream route as before Phase 12.
-- **Spread placement.** An unpinned (`node` unset) multi-replica app is
-  scheduled one replica per node, ranked by the same most-free-capacity
-  logic as a single-replica app (see [Scheduling &
-  pools](#scheduling--pools)) — falling back to sharing nodes if there
-  aren't enough distinct ones to go around. A **pinned** (`node = "..."`)
-  multi-replica app puts every replica on that one node.
-- **Deploy is still zero-downtime blue-green, just for the whole set at
-  once:** a fresh set of N replicas is started and health-gated (same
-  layered policy as a single-service app — `health.path`, then Docker
-  `HEALTHCHECK`, then plain liveness) before the live route flips to it;
-  if even ONE new replica fails health, the whole generation is rolled back
-  — nothing new goes live, and whatever was already running keeps serving
-  untouched. Only once every replica in the new set is confirmed healthy are
-  the old set's replicas retired, each removed on **its own node**.
-- **Per-replica self-heal and failover.** The [continuous
-  reconciler](#self-healing--health) heals a dead replica **individually, in
-  place, on its own node** — the other replicas are never touched, and
-  there's no whole-set redeploy just because one instance crashed. The same
-  granularity applies to [automatic node-loss
-  failover](#automatic-failover-on-node-loss) and manual
-  [drain/evacuate](#operator-initiated-drain-evacuate-uncordon): only the
-  replicas actually on the affected node move; siblings on other nodes are
-  left running.
-- **Not supported with `compose =` apps or `[[services]]`.** A compose app's
-  lifecycle already belongs to `docker compose`, not lwd's blue-green model.
-  Backing services run **pinned** on a single node's per-app network, so a
-  multi-node replica set would leave every replica but the pinned anchor's
-  unable to reach it — `lwd.toml` validation rejects `replicas > 1` combined
-  with either.
-- **`replicas = 1` (or omitting the field) is exactly today's single
-  surface** — one container, one upstream, nothing new to reason about. This
-  is a deliberate non-regression contract, not just a default: every
-  earlier phase's behavior, tests, and generated Caddy config are unchanged
-  for a single-replica app.
+- **Round-robin + passive health.** Caddy load-balances across every
+  replica with round-robin, passively ejecting one that starts failing
+  (`fail_duration`) until it recovers — no separate polling loop on the
+  router's side. `replicas = 1` (the default) generates a **byte-identical**
+  Caddyfile to every earlier phase — it is not internally a "1-wide pool."
+- **Spread placement.** An unpinned multi-replica app is scheduled one
+  replica per node, ranked by the same most-free-capacity logic as a
+  single-replica app — falling back to sharing nodes if there aren't enough
+  distinct ones. A **pinned** multi-replica app puts every replica on that
+  one node.
+- **Set-based blue-green.** A fresh set of N replicas is started and
+  health-gated (same layered policy) before the live route flips to it; if
+  even one new replica fails health, the whole generation is rolled back —
+  nothing new goes live. Only once every replica in the new set is healthy
+  are the old set's replicas retired, each removed on its own node.
+- **Per-replica self-heal and failover.** The reconciler heals a dead
+  replica individually, in place, on its own node — siblings are untouched.
+  The same granularity applies to automatic node-loss failover and manual
+  drain/evacuate: only the replicas on the affected node move.
+- **Not supported with `compose` apps or `[[services]]`** (backing services
+  run pinned on a single node's network, so a multi-node replica set
+  couldn't reach it from every node).
 - **Human-scaling only** — there is no autoscaler, no target-CPU/RPS policy,
-  and no continuous rebalancing of a healthy multi-replica set. You (or your
-  own external tooling, via the daemon API / `lwd-mcp`) decide when to scale;
-  lwd just executes it safely.
+  and no continuous rebalancing of a healthy multi-replica set.
 
-`lwd-web`'s app detail view has a **Replicas** tab: the live count, a
-scale up/down control, and a per-replica table (node, container, upstream)
-sourced from the current deployment's recorded replica set; the Deploy
-modal's **From Git**/**Builder** tabs have an optional **Replicas** field
-that emits `replicas = N` into the generated document. `lwd-mcp` exposes
-`lwd_scale` (`{app, replicas}`, annotated `destructiveHint`) plus an optional
-`replicas` argument on `lwd_apply`/`lwd_deploy_git`; `lwd_status`/`lwd_list`
-(and the plain daemon `GET /apps`) already report the current replica count
-via `api.AppStatus.Replicas`.
+## Node maintenance & failover
 
-## Secrets
+**Only scheduler-placed ("scheduled") surfaces are ever moved.** A surface
+is "scheduled" if it landed on its node because `node` was left unset — its
+concrete node is recorded in the deployment's spec snapshot
+(`store.Deployment.Scheduled`). Everything else is left exactly where it is:
+an explicitly `node = "..."`-pinned app, a `compose` app, and any backing
+service.
 
-Apps can declare secret names in `lwd.toml`:
-
-```toml
-secrets = ["DATABASE_URL", "API_KEY"]
-```
-
-Only the **names** are committed to `lwd.toml`; the values live in the
-daemon's own store, encrypted at rest, and are set out-of-band:
+### Operator-initiated: drain, evacuate, uncordon
 
 ```bash
-lwd secret set blog DATABASE_URL   # reads the value from stdin
-lwd secret ls blog                 # lists names only — never values
-lwd secret rm blog DATABASE_URL
+lwd node drain web1      # cordon web1, then move its scheduled surfaces off it
+lwd node evacuate web1   # move its scheduled surfaces off it, WITHOUT cordoning
+lwd node uncordon web1   # clear the cordon
 ```
 
-At deploy time, the reconciler resolves every name in `secrets` and injects
-it into the surface container's environment (a secret wins over a same-named
-key in `env`). Resolution is **fail-closed**: if any declared secret has no
-value set, `apply` aborts before starting anything — the new container is
-never created and whatever was already running (if anything) keeps serving
-traffic untouched.
+- **`drain`** = cordon (excludes the node from future scheduler placement)
+  **then** evacuate: every scheduled surface currently on the node is moved,
+  via the same blue-green path a self-heal uses, onto whichever other
+  reachable, schedulable, in-pool node ranks highest.
+- **`evacuate`** does the move without cordoning — the node stays eligible
+  for new placements.
+- **`uncordon`** clears the cordon; it never touches anything already
+  running.
 
-Values are encrypted with AES-256-GCM using a key generated on first use and
-stored at `<data_dir>/secret.key` with `0600` permissions. Once a value is
-set, it is **never read back out of the daemon** — the API and CLI only
-expose `set`, `ls` (names only), and `rm`; there is no `get`.
+Every one of these returns an `EvacuateResult`: which apps **moved**, which
+were **skipped** (pinned), and which **failed** to move (with why — usually
+"no other node has room"). A failed move leaves the original surface running
+untouched.
 
-## Authoring lwd.toml (Claude skill)
+### Automatic failover on node loss
 
-`skills/lwd-toml/` is a [Claude Code](https://claude.com/claude-code) skill
-that writes an `lwd.toml` for you: point it at a project directory and it
-inspects for a `Dockerfile`/`docker-compose.yml`, detects the
-language/framework and listening port, spots backing-service dependencies
-(a postgres/redis/mysql/minio client, or a db service in a compose file),
-picks the right app shape (`[git]`+`[build]`, `image =`, or
-`compose =`/`service =`), and writes a valid `lwd.toml` — asking only for
-what it can't infer (the `domain`, and confirmation of the port/backing
-services). It never invents secret values, only names.
+The continuous reconciler tracks how long each registered node has been
+continuously unreachable. Once that streak exceeds `LWD_FAILOVER_GRACE`
+(default `60s`), the next reconcile pass automatically evacuates every
+scheduled surface on that node — exactly as a manual drain would, minus the
+cordon (a node that comes back is immediately eligible again; nothing
+re-populates it automatically).
 
-To use it, copy or symlink the skill directory into Claude Code's personal
-skills folder:
+- A **pinned** surface on a lost node is left running as-is (reported
+  `degraded`) and is **never** moved by automatic failover.
+- The old container is removed from the dead node only if it's still
+  reachable enough to ask; for an actually-gone node, cleanup is skipped and
+  the old deployment row is simply marked retired.
+- **Single-node installs have nothing to fail over** — behavior is
+  unchanged from every earlier phase.
+- This is loss-triggered reschedule, not a background rebalancer: a healthy
+  fleet is never touched, and a node that comes back stays empty until you
+  place something on it again.
+- **Controller-partition case:** if the controller itself loses mesh
+  connectivity to its nodes, every registered node reads unreachable after
+  the grace period, and each one's scheduled `default`-pool surfaces are
+  evacuated onto the local node, bounded by local capacity (surfaces that
+  don't fit are left reported-degraded). When the partition heals, the
+  original remote containers are orphaned; a future reconcile pass or `lwd
+  node rm` cleans up their now-retired rows. Multi-edge routing (P13) is the
+  long-term fix for a single controller/edge being the partition point.
+
+## Self-healing & health
+
+The daemon runs a **continuous reconciler loop**, entirely off the request
+path: `lwd apply`/`rollback` return as soon as their own deploy finishes,
+and the loop runs on its own schedule — one pass immediately at daemon
+startup, then one per `LWD_RECONCILE_INTERVAL` tick (default `15s`), plus a
+non-blocking nudge right after every successful `apply`/`rollback`. Each
+pass recovers its own panics — a bad reconcile never takes down the daemon.
+
+**What gets healed:** single-service surfaces (`image`/`[git]` apps, with or
+without `[[services]]`) that have crashed, exited, or otherwise gone
+missing. The reconciler recreates them through the exact blue-green flow
+`apply` itself uses (a git app's already-built image tag is reused, never
+rebuilt). Repeated failures back off exponentially (15s, 30s, 1m, ...) and
+give up after `LWD_HEAL_MAX_ATTEMPTS` (default `5`) attempts, at which point
+the app is reported `failed` and left alone.
+
+A container that is **running but Docker `HEALTHCHECK`-unhealthy is NOT
+detected or healed** by this loop — it's reported `healthy`, same as an
+actually-healthy container.
+
+**What does not get healed:** `compose` apps (their lifecycle belongs to
+`docker compose`, not lwd's surface model — no entry appears for them in
+the health snapshot); the edge (Caddy reachability is observed and
+reported, never acted on — there's only one edge to route through today).
+**Node reachability is observed and, past a grace period, acted on** — see
+[Node maintenance & failover](#node-maintenance--failover).
 
 ```bash
-cp -r skills/lwd-toml ~/.claude/skills/lwd-toml
-# or: ln -s "$(pwd)/skills/lwd-toml" ~/.claude/skills/lwd-toml
+lwd health
 ```
 
-Then ask Claude Code to "make an lwd.toml for this project" or "deploy this
-with lwd" from within the target project. The skill's worked examples
-(`skills/lwd-toml/references/examples/*.toml`) are round-trip validated
-against the real `internal/spec` parser/validator by
-`internal/spec/examples_test.go`, so they stay in sync with the schema.
+reads the same snapshot the daemon exposes at `GET /health` (no secret
+value ever appears in it), which `lwd-web`'s **Health** panel also renders
+live. `state` is one of `healthy`, `degraded` (observed unhealthy, not yet
+healing/backing off), `healing` (a heal attempt in flight), or `failed`
+(gave up after `LWD_HEAL_MAX_ATTEMPTS`).
 
 ## Web UI (lwd-web)
 
-`lwd-web` is a **separate dashboard binary** — a "self-hosted Vercel" front
-end for lwd. It is just another client of the daemon's existing unix-socket
-API (the same API the `lwd` CLI uses): it makes **zero changes to the
-daemon**, reconciler, router, or store, and can do nothing the daemon API
-doesn't already permit.
-
-### Build
+`lwd-web` is a separate dashboard binary — a "self-hosted Vercel" front end
+for lwd. It is just another client of the daemon's existing unix-socket API
+(the same one the CLI uses): it makes **zero changes to the daemon** and can
+do nothing the daemon API doesn't already permit.
 
 ```bash
 CGO_ENABLED=0 go build -o lwd-web ./cmd/lwd-web
-```
-
-### Run
-
-```bash
 LWD_WEB_PASSWORD=changeme ./lwd-web
 ```
 
 - `LWD_WEB_PASSWORD` (required) — the dashboard's admin password; `lwd-web`
   refuses to start without it.
 - `LWD_WEB_ADDR` (default `127.0.0.1:8079`) — listen address.
-- `LWD_WEB_SECRET` (optional) — cookie-signing key; if unset, a random key is
-  generated at startup (sessions reset on restart).
-- The daemon's unix socket is located the same way the CLI locates it —
-  `LWD_SOCKET`, or `LWD_DATA_DIR` (default `/var/lib/lwd`) + `lwd.sock` — so
-  run `lwd-web` on the same host as the daemon, with the same `LWD_DATA_DIR`
-  if you've customized it.
+- `LWD_WEB_SECRET` (optional) — the cookie-signing key; **must be at least
+  16 bytes** if set (`lwd-web` refuses to start with a shorter one). If
+  unset, a random 32-byte key is generated at startup and sessions reset on
+  restart.
+- `LWD_SOCKET` (optional) — overrides the daemon socket path lwd-web
+  connects to; defaults to `LWD_DATA_DIR` (default `/var/lib/lwd`) +
+  `lwd.sock`, same resolution the daemon itself uses. (Note: this env var is
+  read by `lwd-web` only — the `lwd` CLI and `lwd-mcp` always use
+  `LWD_DATA_DIR`/`lwd.sock` directly and do not consult `LWD_SOCKET`.)
 
-### Auth
+**Auth:** a single shared admin password gates the whole dashboard.
+`POST /login` checks it with a constant-time compare and sets an
+`HttpOnly`, `SameSite=Lax` signed session cookie — `Secure` when served over
+TLS directly, or behind a TLS-terminating proxy that sets
+`X-Forwarded-Proto: https`. Sessions expire after 24 hours. There is no
+multi-user/role model — this is a single-operator tool, same as the daemon.
 
-A single shared admin password (`LWD_WEB_PASSWORD`) gates the whole
-dashboard. `POST /login` checks the password with a constant-time compare
-and sets an `HttpOnly`, `SameSite=Lax` signed session cookie (`Secure` when
-served over TLS); the session expires after 24 hours. There's no
-multi-user/role model — this is a single-operator tool, same as the daemon
-itself.
+**Exposing it safely:** `lwd-web` binds `127.0.0.1:8079` by default with no
+built-in TLS — don't expose it directly to the internet. Either SSH-tunnel
+to it (`ssh -L 8079:localhost:8079 you@host`) or front it with lwd's own
+Caddy, the same way you'd front any other app.
 
-### Exposing it safely
-
-`lwd-web` binds `127.0.0.1:8079` by default and speaks plain HTTP with no
-built-in TLS, so don't expose it directly to the internet. Instead:
-
-- **SSH tunnel** (simplest): `ssh -L 8079:localhost:8079 you@host`, then browse
-  `http://localhost:8079` locally.
-- **Front it with lwd's own Caddy**: point a `domain` at `lwd-web`'s address
-  the same way you'd front any other app, so you get automatic HTTPS. (Since
-  `lwd-web` isn't itself deployed as an lwd app in this milestone, this means
-  adding it to the Caddy config manually or deploying it as a plain container
-  that proxies to the host; dogfooding `lwd-web` as an lwd-managed app is a
-  later enhancement.)
-
-### Features
-
-- **Overview** — every app's name, domain, status, image, and health at a
-  glance (plus a `×N` badge for a load-balanced app — see [Replicas & load
-  balancing](#replicas--load-balancing)), with a **Deploy** action to create
-  a new app.
-- **Deploy modal — From Git / Builder / Paste** — three ways to author a new
-  app's `lwd.toml`, each with a live preview of the generated document:
-  - **From Git** builds a [git-deployed](#deploy-from-git) app: URL, ref,
-    subdir, Dockerfile, plus name/domain/port/env/secrets and any backing
-    services.
-  - **Builder** builds an `image`-based app the same way, minus the git
-    fields.
-  - **Paste** takes a raw `lwd.toml` document directly (also used for
-    **Edit & apply** on an existing app's config).
-  Both From Git and Builder have an "Add backing service" control that emits
-  `[[services]]` entries (name, image, command, env, secrets, volume) into
-  the generated document — see [Backing services](#backing-services). Both
-  also have a **Node** dropdown (`Auto`/`local`/a registered node), an
-  optional **Pool** dropdown, optional **CPU**/**Memory** requirement
-  fields, and an optional **Replicas** field, that emit
-  `node`/`pool`/`[requirements]`/`replicas` — see [Scheduling &
-  pools](#scheduling--pools) and [Replicas & load
-  balancing](#replicas--load-balancing).
-- **Replicas** — a tab on the app detail view: the live replica count, a
-  scale up/down control (`POST /api/apps/{name}/scale`), and a per-replica
-  table (node, container, upstream) — see [Replicas & load
-  balancing](#replicas--load-balancing).
-- **Live logs** — a per-app log stream over SSE, with a follow toggle.
-- **History + rollback** — past deployments for an app, with a one-click
-  **Roll back** to any prior deployment (for a git-built app, this redeploys
-  the prior built image tag, same as `lwd rollback`).
-- **Secrets** — list secret names (never values), set, and delete.
-- **Redeploy** — re-apply an app's current deployment spec snapshot (e.g.
-  after fixing something on the daemon host, or just to restart it).
-- **Config edit** — view and edit an app's `lwd.toml` and re-apply it.
-- **Nodes** — a dedicated view (reachable from the header, alongside the
-  Fleet overview) listing every registered [node](#multi-node-federation):
-  **pool**, ssh host, mesh address, agent URL, live **transport**
-  (`agent`/`ssh`), a **reachable/unreachable** indicator probed fresh on
-  every load, and a **schedulable/cordoned** badge; an inline form to
-  register a new node (name, ssh host, mesh address, optional agent URL,
-  optional pool). Each node row has **Drain**, **Evacuate**, and (once
-  cordoned) **Uncordon** actions — see [Node maintenance &
-  failover](#node-maintenance--failover) — plus a **Remove** action; a
-  drain/evacuate renders the returned moved/skipped/failed result inline.
-  The Deploy modal's **From Git**/**Builder** tabs also have a **Node**
-  dropdown (populated from this same list, plus `Auto` and `local`) and a
-  **Pool** dropdown (from `GET /api/pools`) — see
-  [Scheduling & pools](#scheduling--pools).
-- **Health** — a dedicated view (reachable from the header, alongside Fleet
-  and Nodes) rendering the [continuous reconciler's](#self-healing--health)
-  live snapshot from `GET /api/health`: every node's pool, transport/
-  reachability, a **cordoned** badge (see [Node maintenance &
-  failover](#node-maintenance--failover)), and live **CPU/memory/disk** (as
-  small meter bars, or "unknown" if the last probe couldn't measure it — see
-  [Node capacity: agent vs ssh](#node-capacity-agent-vs-ssh)); the shared
-  edge (Caddy) reachability; and every self-healed app's state
-  (`healthy`/`degraded`/`healing`/`failed`) with its heal-attempt count and
-  last error, auto-refreshing every few seconds. Read-only, and carries no
-  secret values.
-
-As with the CLI, compose apps deployed or edited through the UI still need
-their compose file present on the daemon host, and a git-built app's repo
-must still be reachable (and, for a private repo, the daemon host's git
-already authenticated) at deploy time; pasting/generating a full `lwd.toml`
-for a single-service, git-built, or backing-service app works fully from the
-UI end to end.
+**Features:** an **Overview** of every app (status, image, health, replica
+badge) with a **Deploy** action; a Deploy modal with **From Git** / **Builder**
+/ **Paste** tabs (each with a live `lwd.toml` preview, backing-service
+builder, and Node/Pool/CPU/Memory/Replicas fields); a **Replicas** tab per
+app (live count, scale control, per-replica node/container/upstream table);
+**live logs** over SSE; **history + rollback**; **secrets** (set/list/delete,
+never values); **redeploy** and **config edit**; a **Nodes** view
+(list/add/remove/drain/evacuate/uncordon, live transport + reachability +
+pool + schedulable badge); and a **Health** view (the reconciler's live
+snapshot, auto-refreshing).
 
 ## Agent access (lwd-mcp)
 
-`lwd-mcp` is a **third, optional binary** (the fourth being
-[`lwd-agent`](#the-lwd-agent-transport), a node worker rather than a daemon
-client): a local
-[Model Context Protocol](https://modelcontextprotocol.io) server that lets a
-coding agent (Claude Code, or any other MCP host) drive lwd directly. Like
-`lwd-web`, it is just another client of the daemon's existing unix-socket
-API — it makes **zero changes to the daemon** and can do nothing the daemon
-API doesn't already permit. It speaks MCP over **stdio only**: no network
-listener, no auth of its own (the daemon socket is `0600` and reachable only
-by whoever can already run `lwd`/`lwd-mcp` on the box), and it requires
-`lwd daemon` to already be running.
-
-### Build
+`lwd-mcp` is a local [Model Context Protocol](https://modelcontextprotocol.io)
+server that lets a coding agent (Claude Code, or any other MCP host) drive
+lwd directly. Like `lwd-web`, it's just another client of the daemon's
+unix-socket API — zero daemon changes, nothing beyond what the daemon API
+already permits. It speaks MCP over **stdio only**: no network listener, no
+auth of its own (the daemon socket is `0600`), and it requires `lwd daemon`
+to already be running.
 
 ```bash
 CGO_ENABLED=0 go build -o lwd-mcp ./cmd/lwd-mcp
 ```
 
-### Register with an MCP host
-
-`lwd-mcp` locates the daemon socket the same way the CLI does — `LWD_DATA_DIR`
-(default `/var/lib/lwd`) + `lwd.sock` — so point it at the same
-`LWD_DATA_DIR` the daemon uses if you've customized it. A Claude
-Code-style `.mcp.json` entry:
+Register it with an MCP host — a Claude Code-style `.mcp.json` entry:
 
 ```json
 {
@@ -1101,9 +966,7 @@ Code-style `.mcp.json` entry:
     "lwd": {
       "command": "/path/to/lwd-mcp",
       "args": [],
-      "env": {
-        "LWD_DATA_DIR": "/var/lib/lwd"
-      }
+      "env": { "LWD_DATA_DIR": "/var/lib/lwd" }
     }
   }
 }
@@ -1111,360 +974,213 @@ Code-style `.mcp.json` entry:
 
 ### Tools
 
-All tool names, inputs, and outputs are stable, plain JSON (no secret value is
-ever returned by any tool):
+All 18 tools are stable, plain JSON in and out — no secret value is ever
+returned by any tool:
 
 | Tool | Description |
 | --- | --- |
-| `lwd_list` | List all lwd-managed apps with their current status, image, domain, and replica count. |
-| `lwd_status` | Get the current status (including replica count) and deployment history of a single app. |
-| `lwd_logs` | Get the most recent logs (`tail`-limited, default 200 lines) for an app. |
-| `lwd_history` | List recorded deployments (image, status, time) for an app. |
-| `lwd_apply` | Deploy an app from an `lwd.toml`, given inline (`toml`) or a local directory (`dir`); optional `node`/`pool`/`requirements` (`cpu`, `memory`)/`replicas` arguments set the same-named `lwd.toml` fields before validating, overriding whatever the toml itself says — see [Scheduling & pools](#scheduling--pools) and [Replicas & load balancing](#replicas--load-balancing). |
-| `lwd_deploy_git` | Deploy an app built from a git repo, from discrete fields (url/ref/dockerfile/name/domain/port/services), without hand-authoring an `lwd.toml`; also takes optional `node`/`pool`/`requirements`/`replicas` arguments. |
-| `lwd_rollback` | Roll back an app to its previous deployment. |
-| `lwd_scale` | Change an app's replica count; the router load-balances across the resulting set — see [Replicas & load balancing](#replicas--load-balancing). |
+| `lwd_list` | List all apps with current status, image, domain, and replica count. |
+| `lwd_status` | Status + deployment history for one app. |
+| `lwd_logs` | Recent logs (`tail`-limited, default 200 lines). |
+| `lwd_history` | Recorded deployments (image, status, time). |
+| `lwd_apply` | Deploy from an `lwd.toml`, given inline (`toml`) or a local directory (`dir`); optional `node`/`pool`/`requirements`/`replicas` override the toml. |
+| `lwd_deploy_git` | Deploy from a git repo, from discrete fields (url/ref/dockerfile/name/domain/port/services), without hand-authoring an `lwd.toml`. |
+| `lwd_rollback` | Roll back to the previous deployment. |
+| `lwd_scale` | Change replica count. |
 | `lwd_remove` | Permanently stop and remove an app. |
-| `lwd_secret_set` | Set (or overwrite) a secret value for an app. The value is never echoed back. |
-| `lwd_secret_list` | List the names of secrets set for an app — names only, never values. |
-| `lwd_secret_delete` | Delete a secret from an app. |
-| `lwd_node_list` | List every registered [node](#multi-node-federation): ssh host, mesh address, agent URL, pool, `schedulable` (cordon state), and its live transport (`agent`/`ssh`), reachability, and [capacity](#scheduling--pools) (CPU/memory/disk). |
-| `lwd_node_add` | Register (or update) a node: `name`, `ssh_host`, `mesh_addr`, and optional `agent_url`/`pool`. |
-| `lwd_node_remove` | Deregister a node. Apps already placed on it are not moved or removed. |
-| `lwd_node_drain` | Cordon a node then move every scheduler-placed surface off it onto another fitting node — see [Node maintenance & failover](#node-maintenance--failover). Pinned surfaces are left untouched. |
-| `lwd_node_evacuate` | Move every scheduler-placed surface off a node onto another fitting node, without cordoning it. |
-| `lwd_node_uncordon` | Clear a node's cordon, making it eligible for scheduler placement again. Never moves or touches anything already deployed. |
+| `lwd_secret_set` | Set (or overwrite) a secret. Never echoed back. |
+| `lwd_secret_list` | List secret names (never values). |
+| `lwd_secret_delete` | Delete a secret. |
+| `lwd_node_list` | List registered nodes: ssh host, mesh address, agent URL, pool, schedulable, transport, reachability, capacity. |
+| `lwd_node_add` | Register (or update) a node. |
+| `lwd_node_remove` | Deregister a node. |
+| `lwd_node_drain` | Cordon a node, then move its scheduler-placed surfaces off it. |
+| `lwd_node_evacuate` | Move a node's scheduler-placed surfaces off it, without cordoning. |
+| `lwd_node_uncordon` | Clear a node's cordon. |
 
 `lwd_list`, `lwd_status`, `lwd_logs`, `lwd_history`, `lwd_secret_list`, and
 `lwd_node_list` are annotated `readOnlyHint: true`; `lwd_remove`,
 `lwd_secret_delete`, `lwd_node_remove`, `lwd_node_drain`, `lwd_node_evacuate`,
-and `lwd_scale` are annotated `destructiveHint: true` (scale, like
-drain/evacuate, actually tears down and recreates running containers);
-`lwd_node_uncordon` is deliberately NOT annotated destructive — it only
-lifts a placement restriction and never touches anything already running.
-lwd-mcp itself asks nothing before calling the daemon — it relies entirely
-on **the MCP host's
-own per-call approval UI** (e.g. Claude Code's tool-permission prompt) to
-gate destructive and state-changing tools before they run; there is no
-additional confirmation argument to pass.
+and `lwd_scale` are annotated `destructiveHint: true`. `lwd_node_uncordon` is
+deliberately **not** destructive — it only lifts a placement restriction.
+`lwd-mcp` asks nothing before calling the daemon; it relies entirely on the
+MCP host's own per-call approval UI to gate destructive tools.
 
-## Networking model
+## Authoring lwd.toml (Claude skill)
 
-- lwd creates and manages one private Docker network, `lwd`, **on every node
-  it deploys to**. Every local app container, every remote app container (on
-  its own node), and the `lwd-caddy` container (on the controller) join the
-  `lwd` network on their respective host.
-- A **local** app container publishes **no host ports** — Caddy reaches it by
-  container name and port on the `lwd` network. This is why `lwd.toml`'s
-  `port` is just the app's container port (e.g. `80` for `traefik/whoami`),
-  not a host port to reserve.
-- A **remote** app container (placed via [`node =
-  "..."`](#multi-node-federation)) publishes an ephemeral host port bound to
-  its node's mesh address, since the controller's Caddy has no other way to
-  reach across nodes; `lwd.toml`'s `port` is still just the container port —
-  the host port is chosen automatically.
-- Only `lwd-caddy`, on the controller, binds host ports 80 and 443 for
-  traffic, and 2019 (loopback-only) for its admin API, which lwd uses to push
-  routing config. A registered node runs no lwd-managed container of its
-  own besides the app surfaces (and their backing services) placed on it.
-
-## Scope of this milestone
-
-- Single host.
-- `domain` (routing + TLS) is fully live, for single-service, git-built, and
-  compose apps.
-- `secrets` (declare names in `lwd.toml`, set values via `lwd secret set`)
-  is fully live: values are encrypted at rest and injected into the
-  container/compose environment at deploy time, fail-closed on any unset
-  name — including for backing-service `secrets`.
-- `compose` (multi-container apps, delegated to the `docker compose` CLI
-  plugin — see [Compose apps](#compose-apps)) is fully live.
-- `[git]` + `[build]` (build-from-source: box-native `git clone` + `docker
-  build` → zero-downtime blue-green, no registry — see
-  [Deploy from Git](#deploy-from-git)) is fully live.
-- `[[services]]` (pinned backing services alongside an `image` or `[git]` app
-  — see [Backing services](#backing-services)) is fully live.
-- `surfaces` in `lwd.toml` is parsed but rejected with a clear error for all
-  shapes; the surfaces-outside-compose blue-green model discussed for the web
-  tier of a compose app is deliberately not built (YAGNI for now).
-- **Multi-node (federation)** — `lwd node add/ls/rm`, `node = "..."`
-  placement, a **dumb `lwd-agent` transport** preferred over docker-over-ssh
-  when reachable (automatic fallback to ssh otherwise), and `docker
-  save|load` image movement (see [Multi-node](#multi-node-federation) and
-  [The lwd-agent transport](#the-lwd-agent-transport)) — is live for `image`
-  and `[git]`+`[build]` apps (with or without `[[services]]`). A `compose =`
-  app can only be placed on `local` for now (validation rejects the
-  combination). The single-node path (`node` unset, no other nodes
-  registered) is fully unchanged.
-- **Capacity-aware scheduling and node pools** (see
-  [Scheduling & pools](#scheduling--pools)) are fully live: an app with
-  `node` unset is placed, once, at apply time, on the most-free node in its
-  `pool` (`[requirements]` optionally gates candidates by free CPU/memory);
-  `lwd node capacity`/`lwd node inspect`/`lwd pool ls`, `lwd-web`'s Nodes and
-  Health views, and `lwd-mcp`'s `lwd_node_list` all surface pool + live
-  capacity. Initial placement is one-shot, not a continuous rebalancer — see
-  the next bullet for what moves a surface *after* it's placed.
-- **Node drain/evacuate/uncordon and automatic node-loss failover** (see
-  [Node maintenance & failover](#node-maintenance--failover)) are fully
-  live: `lwd node drain`/`evacuate`/`uncordon` (+ the daemon API, `lwd-web`
-  buttons, and `lwd-mcp` tools) for operator-initiated migration off a node,
-  and a continuous-reconciler pass that automatically evacuates a node's
-  scheduled surfaces once it's been unreachable past `LWD_FAILOVER_GRACE`
-  (default `60s`). Only scheduler-placed surfaces ever move — pinned apps,
-  compose apps, and backing services never do. Single-node installs are
-  unaffected (nothing to fail over with no other node registered).
-- **Surface replicas + load balancing** (Phase 12, see [Replicas & load
-  balancing](#replicas--load-balancing)) are fully live: `replicas = N` in
-  `lwd.toml` (or `lwd scale <app> <replicas>` / the daemon API / `lwd-web` /
-  `lwd-mcp` live, no redeploy-from-source needed) for `image`/`[git]` apps —
-  Caddy round-robins with passive health across the set, placement spreads
-  one replica per node, deploy is set-based blue-green (the whole new set
-  must be healthy before it goes live), and self-heal/failover act on
-  individual replicas rather than the whole set. Human-scaling only (no
-  autoscaler). Not supported with `compose =` apps or `[[services]]`.
-  `replicas = 1` (the default) is byte-identical to every earlier phase.
-- [`lwd-web`](#web-ui-lwd-web) (a separate dashboard binary) is fully live:
-  overview, live logs, history/rollback, secrets, redeploy, config edit, a
-  **Replicas** tab (live count, per-replica node/container/upstream table, a
-  scale up/down control), a **Nodes** view
-  (list/add/remove/drain/evacuate/uncordon, live transport + reachability +
-  pool + schedulable state), a **Health** view (the continuous reconciler's
-  live snapshot, including per-node CPU/memory/disk and cordon state), and a
-  Deploy modal with **From Git**, **Builder**, and **Paste** tabs (From Git
-  and Builder support declaring backing services, picking a node/pool,
-  setting resource requirements, and an optional replica count), all as a
-  thin client of the same daemon API the CLI uses. Deploying `lwd-web`
-  itself as an lwd-managed app and multi-user auth are not built yet.
-- [`lwd-mcp`](#agent-access-lwd-mcp) (a separate stdio MCP server binary) is
-  fully live: all eighteen tools
-  (list/status/logs/history/apply/deploy_git/rollback/scale/remove/secret
-  set-list-delete/node list-add-remove-drain-evacuate-uncordon), including
-  pool/requirements/replicas/capacity and node drain/evacuate/uncordon (see
-  [Node maintenance & failover](#node-maintenance--failover) and [Replicas &
-  load balancing](#replicas--load-balancing)), as a thin client of the same
-  daemon API the CLI and `lwd-web` use — no daemon changes, no network
-  listener, no secret value ever returned. Networked MCP transport is not
-  built yet.
-- [Self-healing & health](#self-healing--health) — a continuous reconciler
-  loop, off the request path, self-heals dead single-service surfaces
-  (`image`/`[git]` apps), observes edge (Caddy) reachability, and
-  automatically fails scheduled surfaces over off a node that's gone
-  unreachable past grace (see the bullet above) — is fully live. `compose=`
-  apps are not self-healed (see [Known
-  limitations](#known-limitations-this-milestone)).
-
-### Known limitations (this milestone)
-
-- Compose deploys are **not zero-downtime** (see
-  [Compose apps](#compose-apps)): the routed service gets a brief in-place
-  restart on every redeploy, and a failed health check leaves the
-  (possibly broken) new stack live rather than rolling back automatically —
-  run `lwd rollback` to recover. Single-service and git-built apps remain
-  zero-downtime blue-green.
-- Git deploy is repo-has-a-Dockerfile → single-service only. lwd never reads
-  a `lwd.toml` committed inside the cloned repo (config stays entirely in the
-  `lwd.toml` alongside the app, not the repo itself), and deploying a repo's
-  *own* `docker-compose.yml` in place (git + repo-compose) is deferred — the
-  Phase 4 user-provided-compose model is unaffected. Auto-redeploy on push
-  (a git hook or poller) and pushing built images to a registry are also not
-  built; lwd stays manual-trigger and single-host by design.
-- Backing-service (`[[services]]`) and top-level `secrets` **names** must be
-  valid environment-variable identifiers (`[A-Za-z_][A-Za-z0-9_]*`) — they're
-  injected as container env vars and, for backing services, spliced into an
-  unescapable `${NAME}` compose-interpolation reference, so `lwd.toml`
-  validation rejects any other form up front.
-- Mutable image tags (e.g. `:latest`) are re-pulled on every `apply` when the
-  registry is reachable; if the pull fails but the image exists locally, the
-  local copy is used. (Git-built images are never pulled — see
-  [Deploy from Git](#deploy-from-git).)
-- Public ACME certificates require the daemon's host to be reachable on
-  80/443 from the internet for the domains being issued; purely local/internal
-  domains (`.localhost`, bare hostnames) always use Caddy's self-signed
-  internal CA instead and work fully offline.
-- Building lwd requires **Go 1.25+** (a transitive dependency of the Docker
-  SDK raises the floor above the 1.22 language baseline).
-- Every domain is served over both HTTP and HTTPS with no automatic
-  HTTP→HTTPS redirect. Public domains still get Let's Encrypt certificates,
-  but plaintext HTTP is not upgraded — forced-HTTPS for public domains is a
-  later enhancement.
-- All app containers share the `lwd` Docker network with the Caddy container,
-  whose admin API is reachable on that network. lwd assumes all deployed apps
-  are trusted (single-operator use); isolating the router admin API from app
-  containers is a later hardening step.
-- Secret values are encrypted at rest with AES-256-GCM, which protects the
-  SQLite database file and its backups (e.g. a leaked backup or disk image is
-  useless without the key). It does **not** protect against an attacker with
-  root (or the daemon's own user) on the host: the key file lives alongside
-  the database in `<data_dir>/secret.key`, so anyone who can read the data
-  directory can decrypt every secret. This is a data-at-rest control, not a
-  substitute for host security.
-- **A `compose =` app cannot be placed on a remote node** — see [What's
-  remote-capable today](#whats-remote-capable-today), so it can never be
-  drained/evacuated/failed-over either (it's always on `local`, and `local`
-  can't be cordoned/evacuated).
-- **No fail-back and no rebalancing**: once [automatic
-  failover](#node-maintenance--failover) moves a surface off a lost node, it
-  stays on its new node even after the old one comes back — nothing
-  re-populates a recovered node automatically, and a healthy fleet is never
-  rebalanced in the background. This applies equally to a multi-replica
-  app's individual replicas (see [Replicas & load
-  balancing](#replicas--load-balancing)): a healed/failed-over replica stays
-  on its new placement, it doesn't move back or get rebalanced later.
-- **Replicas are human-scaled only** (see [Replicas & load
-  balancing](#replicas--load-balancing)) — no autoscaler, no
-  target-CPU/RPS-based policy, and not supported for `compose =` apps or
-  apps with `[[services]]`. A single edge (Caddy) load-balances across a
-  replica set's upstreams; N Caddy edges is P13 (see `docs/VISION.md`).
-- A remote surface's mesh-address traffic between the controller's Caddy and
-  the node is **plain HTTP** — lwd relies on the mesh itself (e.g.
-  WireGuard) for transport encryption between nodes; it adds none of its
-  own on top. This is unchanged by the `lwd-agent` transport: its own
-  controller↔agent HTTP traffic is likewise unencrypted at the application
-  layer and relies entirely on the mesh — see
-  [The lwd-agent transport](#the-lwd-agent-transport)'s trust-boundary note.
-
-## Testing
+`skills/lwd-toml/` is a [Claude Code](https://claude.com/claude-code) skill
+that writes an `lwd.toml` for you: point it at a project directory and it
+inspects for a `Dockerfile`/`docker-compose.yml`, detects the
+language/framework and listening port, spots backing-service dependencies,
+picks the right app shape, and writes a valid `lwd.toml` — asking only for
+what it can't infer (the `domain`, and confirmation of port/backing
+services). It never invents secret values, only names.
 
 ```bash
-go test ./...                              # unit tests (e2e SKIPs without Docker)
-LWD_DOCKER_TEST=1 go test ./test/ -v       # + real end-to-end test against Docker
+cp -r skills/lwd-toml ~/.claude/skills/lwd-toml
+# or: ln -s "$(pwd)/skills/lwd-toml" ~/.claude/skills/lwd-toml
 ```
 
-`internal/web`'s `TestIntegrationWebClientDaemon` runs as part of the plain
-`go test ./...` (no Docker, no build tag): it starts a real daemon
-`api.Server` on a temp unix socket backed by the fake node/router/compose
-stack, drives `lwd-web`'s HTTP handler over real HTTP through a real
-`internal/client`, and exercises login → `/api/apps` → `/api/apply` →
-`/api/apps` again, proving the browser → `lwd-web` → daemon chain end to end.
+Then ask Claude Code to "make an lwd.toml for this project" from within the
+target project. The skill's worked examples
+(`skills/lwd-toml/references/schema.md`, `detect.md`) are kept in sync with
+`internal/spec`'s actual validation rules.
 
-`internal/mcp`'s `TestIntegrationMCPClientDaemon` does the same for
-`lwd-mcp`, also as part of the plain `go test ./...` (no Docker, no build
-tag): it starts the same kind of fake-backed daemon on a temp unix socket,
-builds a real `internal/client`, wires it into `mcp.NewServer`, and drives
-the real go-sdk MCP server over an in-memory transport — `tools/list`
-(asserting every one of the eighteen tools is registered), then `lwd_list`
-(empty), `lwd_apply` with an inline `lwd.toml`, and `lwd_list` again to
-confirm the app appears — proving the agent tool call → `lwd-mcp` →
-`internal/client` → daemon chain end to end.
+## Architecture & networking model
 
-The end-to-end suite drives the full stack — a real Docker daemon, a real
-`lwd-caddy` container, and real deployments (`traefik/whoami`, and for the
-compose test also `redis`) — against real Docker:
+```
+Linux → Docker → WireGuard mesh → Caddy (edge) → lwd-agent → lwd Controller → Applications
+```
 
-- `TestEndToEndBlueGreenRollback` runs two blue-green deploys and a rollback,
-  asserting zero downtime across the swap.
-- `TestEndToEndSecretInjection` wires a real `secrets.Store` into the
-  reconciler, sets a secret, deploys an app declaring it, and asserts (via
-  `docker inspect`, not the app's HTTP response) that the value reached the
-  container's environment — then asserts a deploy declaring an unset secret
-  fails closed with no container left running.
-- `TestEndToEndComposeApp` deploys a real two-service compose stack (a `web`
-  service Caddy fronts, plus a `cache` backing service standing in for a
-  database) via a real `compose.CLI`, asserts the web service is reachable
-  through Caddy, then redeploys and asserts the `cache` container's ID is
-  **unchanged** — proving compose does not recreate an unchanged backing
-  service across a redeploy. It additionally `t.Skip`s (with a clear message)
-  if the `docker compose` CLI plugin is not available.
-- `TestEndToEndGitDeploy` creates a throwaway local git repo (a one-line
-  `FROM traefik/whoami` Dockerfile) and deploys it as a git-built app
-  declaring a `cache` (`redis`) backing service, via real `source.CLI` (git)
-  and `build.CLI` (`docker build`) — proving build-from-source end to end: the
-  cloned repo is actually built into a locally-tagged `lwd-build/e2e-git:<sha>`
-  image (checked with `docker image inspect`) and deployed through Caddy;
-  redeploying the same ref reuses the built tag while still starting a fresh
-  blue-green surface, and the pinned `cache` container's ID is **unchanged**
-  across both the redeploy and a `lwd rollback`. It `t.Skip`s if `git` or the
-  `docker compose` CLI plugin (needed for the backing service) is not
-  available.
-- `TestEndToEndRemoteNode` exercises [multi-node
-  federation](#multi-node-federation) end to end: it registers `ssh://localhost`
-  as a stand-in "remote" node against a real `node.RegistryResolver`, deploys
-  an app pinned to it, and asserts (via `docker -H ssh://localhost ...`, not
-  just the local daemon view) that the image is present and the surface
-  container is running on that node, reachable through Caddy at the node's
-  mesh address — then deploys a second, `node = "local"` app in the same run
-  and asserts it still works unchanged. It requires key-based ssh to
-  `localhost` with a reachable Docker daemon there (`docker -H
-  ssh://localhost version` must succeed); it probes for that first and
-  `t.Skip`s with a clear message — it never fakes a pass — if unusable, which
-  is the common case in a sandboxed/CI environment with no sshd running.
-- `TestEndToEndAgentNodeDeploy` exercises the [`lwd-agent`
-  transport](#the-lwd-agent-transport) end to end: it starts a real
-  `internal/agent.Server` (backed by a real `node.NewLocal()`) on loopback,
-  registers a node pointing at it, asserts the resolver actually selects the
-  `agent` transport (not ssh — the registered ssh host is deliberately left
-  undialable, so a silent fallback would fail the test rather than pass by
-  coincidence), and deploys `traefik/whoami` through it, asserting it's
-  reachable through Caddy. Because it stands in for a second machine with a
-  loopback address, it first probes whether a *sibling* container can reach a
-  host-published `127.0.0.1` port at all — some Docker setups (notably Docker
-  Desktop's Linux VM) restrict that to the host itself, a limitation a real
-  WireGuard mesh address would not have — and `t.Skip`s with a clear message,
-  rather than failing, if that probe itself fails.
+- The **controller** (the `lwd daemon` process) owns desired state — the
+  SQLite store, the reconciler, the router manager, secrets — and is **not
+  on the request path**: if it crashes, already-deployed apps keep serving;
+  new deploys and reconcile passes just pause.
+- lwd creates and manages one private Docker network, `lwd`, **on every
+  node it deploys to**. Every local app container, every remote app
+  container (on its own node), and the `lwd-caddy` container (on the
+  controller) join `lwd` on their respective host.
+- A **local** app container publishes **no host ports** — Caddy reaches it
+  by container name and port on the `lwd` network. This is why `port` in
+  `lwd.toml` is just the container port, not something you reserve on the
+  host.
+- A **remote** app container publishes an ephemeral host port bound to its
+  node's mesh address, and the controller's Caddy upstream becomes
+  `<mesh-addr>:<published-port>`.
+- Only `lwd-caddy`, on the controller, binds host ports 80 and 443 for
+  traffic, plus 2019 (loopback-only) for its admin API, which lwd uses to
+  push routing config. A registered node runs no lwd-managed container of
+  its own besides the app surfaces (and their backing services) placed on
+  it.
 
-The **agent transport-selection path** doesn't need any of the above: `go
-test ./...` (no Docker, no build tag) always runs
-`TestEndToEndAgentTransportSelection`, which starts a real
-`internal/agent.Server` (backed by a fake `node.Node`, so no Docker daemon is
-needed) on loopback via `httptest.NewServer`, registers it in a real
-`store.Store`, and asserts a real `node.RegistryResolver` — the exact type
-`cli.runDaemon` wires up — dials its authenticated `/ready` endpoint over
-real HTTP and selects `"agent"` (via both `Reachable` and `ResolveMeta`)
-rather than falling back to ssh.
+The daemon exposes a small HTTP API over its unix socket (`internal/api`),
+which every client — the CLI, `lwd-web`, `lwd-mcp` — talks to identically:
 
-Neither does the **[self-heal](#self-healing--health) path**:
-`TestEndToEndSelfHeal` also always runs as part of `go test ./...`, entirely
-against fakes (`node.Fake`, `router.FakeRouter`, a real `store.Store`) — no
-Docker daemon anywhere. It builds the reconciler exactly as `cli.runDaemon`
-does, deploys an `image` app, kills its surface the way a real container
-death would be observed (removing it from the fake node so a
-`ContainerHealth` check reports it gone), calls `Reconcile` once, and asserts
-the same things an operator (or the web Health panel, or `lwd health`) would
-see: a brand-new running surface, the live route re-pointed at it, a fresh
-`running` deployment row, and the health snapshot reporting the app healthy
-again.
+| Method & path | Purpose |
+| --- | --- |
+| `POST /apply` | Deploy an app from a resolved spec. |
+| `GET /apps` | List apps + status. |
+| `GET /apps/{name}/logs` | Fetch/stream logs. |
+| `GET /apps/{name}/history` | Deployment history. |
+| `POST /apps/{name}/rollback` | Roll back. |
+| `POST /apps/{name}/scale` | Change replica count. |
+| `DELETE /apps/{name}` | Remove an app. |
+| `POST /apps/{name}/secrets` | Set a secret. |
+| `GET /apps/{name}/secrets` | List secret names. |
+| `DELETE /apps/{name}/secrets/{key}` | Delete a secret. |
+| `POST /nodes` | Register a node. |
+| `GET /nodes` | List nodes. |
+| `DELETE /nodes/{name}` | Deregister a node. |
+| `POST /nodes/{name}/drain` | Drain a node. |
+| `POST /nodes/{name}/evacuate` | Evacuate a node. |
+| `POST /nodes/{name}/uncordon` | Uncordon a node. |
+| `GET /pools` | List pools. |
+| `GET /health` | The reconciler's live health snapshot. |
 
-Nor does the **[scheduler](#scheduling--pools) path**: `TestEndToEndScheduling`
-also always runs as part of `go test ./...`, entirely against fakes — a real
-reconciler/store/scheduler, two registered `node.Fake`s in pool `"default"`
-with deliberately different `MemAvailable`, plus the implicit `local` node
-(left with unmeasured, `Known: false` capacity so it can never win the
-ranking). It deploys an app with `node` left **unset**, and asserts the
-surface actually ran on the higher-capacity node (checking which fake
-received the `RunContainer` call, not just the recorded spec) and that the
-deployment row's spec snapshot records that concrete node — proving
-`resolvePlacement`'s full candidate-gathering (local + every registered node
-in the app's pool) and `scheduler.Place`'s most-free ranking end to end, with
-no Docker involved.
+## Security model
 
-Nor does the **[node maintenance & failover](#node-maintenance--failover)
-path**, also always part of `go test ./...`, entirely against fakes:
-`TestEndToEndNodeDrain` deploys an unpinned app across two registered fake
-nodes (it lands on the more-free one), then cordons and `EvacuateNode`s that
-node — exactly what `POST /nodes/{name}/drain` (and `lwd node drain`) do —
-and asserts the surface is redeployed on the other node, the old container
-removed, and the old deployment row retired.
-`TestEndToEndNodeLossFailover` deploys a scheduled surface plus a surface
-explicitly pinned to the same node, marks that node unreachable, seeds
-`unreachableSince` past `config.FailoverGrace()` (via the exported
-`Reconciler.SeedUnreachableSince`, so the test doesn't sleep), and asserts a
-plain `Reconcile` pass moves only the scheduled surface — the pinned one is
-left running untouched, reported `degraded`.
+- The daemon's unix socket is created with **`0600`** permissions — only the
+  user that started `lwd daemon` (or root) can talk to it. Every client
+  (CLI, `lwd-web`, `lwd-mcp`) inherits its access purely from filesystem
+  permission on that socket.
+- Secrets are encrypted at rest with **AES-256-GCM**, key at
+  `<data_dir>/secret.key` (**`0600`**). This is a data-at-rest control: it
+  protects a leaked backup or disk image, **not** against an attacker with
+  root (or the daemon's own user) on the live host — anyone who can read the
+  data directory can decrypt every secret.
+- A registered `lwd-agent`'s bearer token is **effectively root on that
+  node** — see [The lwd-agent transport](#the-lwd-agent-transport). Bind it
+  to the mesh interface only, never a public one.
+- A remote surface's mesh-address traffic between the controller's Caddy and
+  a node (and the controller's traffic to a registered `lwd-agent`) is
+  **plain HTTP** — lwd relies entirely on the mesh (e.g. WireGuard) for
+  transport encryption; it adds none of its own on top.
+- **Known limitation:** all app containers share the `lwd` Docker network
+  with the Caddy container, whose admin API is reachable on that network.
+  lwd assumes all deployed apps are trusted (single-operator use);
+  isolating the router admin API from app containers is a later hardening
+  step.
+- **Known limitation:** every domain is served over both HTTP and HTTPS
+  with **no automatic HTTP→HTTPS redirect**. Public domains still get
+  Let's Encrypt certificates, but plaintext HTTP is not upgraded.
+- `lwd-web`'s session cookie is `HttpOnly`/`SameSite=Lax`, and `Secure` when
+  served over TLS (directly, or behind a proxy setting
+  `X-Forwarded-Proto: https`) — see [Web UI](#web-ui-lwd-web).
 
-Nor does the **[replicas](#replicas--load-balancing) path**:
-`TestEndToEndReplicas`, also always part of `go test ./...`, entirely against
-fakes — a real reconciler/store/scheduler and three registered `node.Fake`s
-in pool `"default"` with distinct `MemAvailable`. It deploys an unpinned
-`Replicas: 3` app and asserts all 3 land on 3 distinct nodes with a
-3-upstream live route and a 3-entry `Deployment.Replicas`; scales it down to
-1 (the same current-spec-snapshot-plus-overridden-Replicas path `POST
-/apps/{name}/scale` uses) and asserts the other two replicas' containers are
-removed on their own nodes and the route drops to 1 upstream; then scales
-back to 3, kills exactly one replica's container, and asserts a plain
-`Reconcile` pass recreates ONLY that replica, in place, on its own node —
-the deployment row updated in place (same ID) and the other two replicas
-completely untouched.
+## Configuration reference
 
-All six Docker-gated tests clean up every container, network, node
-registration, and (for the git test) built image they create, and will
-`t.Skip` (rather than fail) if ports 80/443 are already in use on the host.
+All env vars are read directly by the process they affect — most have a
+default and are optional.
+
+| Variable | Default | Read by | Meaning |
+| --- | --- | --- | --- |
+| `LWD_DATA_DIR` | `/var/lib/lwd` | `lwd` (daemon + CLI), `lwd-mcp` | Root directory for the unix socket (`lwd.sock`), SQLite DB (`lwd.db`), generated Caddyfile, and the secret-encryption key (`secret.key`). |
+| `LWD_AGENT_TOKEN` | — | `lwd daemon` (as the client credential), `lwd-agent` (required to start) | Shared bearer token authenticating controller ↔ `lwd-agent` traffic. |
+| `LWD_AGENT_ADDR` | `:8078` | `lwd-agent` | Listen address for the agent's HTTP API — bind to the mesh interface. |
+| `LWD_WEB_PASSWORD` | — | `lwd-web` (required to start) | The dashboard's single admin password. |
+| `LWD_WEB_ADDR` | `127.0.0.1:8079` | `lwd-web` | Listen address for the dashboard. |
+| `LWD_WEB_SECRET` | random (regenerated per process) | `lwd-web` | Cookie-signing key; must be at least 16 bytes if set. |
+| `LWD_SOCKET` | (falls back to `LWD_DATA_DIR`/`lwd.sock`) | `lwd-web` only | Overrides the daemon socket path. Not consulted by the `lwd` CLI or `lwd-mcp`. |
+| `LWD_RECONCILE_INTERVAL` | `15s` | `lwd daemon` | Delay between continuous-reconciler passes (`time.ParseDuration`; a zero/negative/unparseable value falls back to the default). |
+| `LWD_HEAL_MAX_ATTEMPTS` | `5` | `lwd daemon` | Consecutive self-heal attempts on a dead surface before it's reported `failed`. |
+| `LWD_FAILOVER_GRACE` | `60s` | `lwd daemon` | How long a registered node must be continuously unreachable before its scheduled surfaces are automatically evacuated. |
+
+## Roadmap
+
+- **P1–P8 — done:** core deploy; HTTPS/blue-green/rollback; secrets; compose
+  apps; web UI; git deploy + build-from-source + backing services; the
+  lwd.toml authoring skill; local MCP.
+- **P9a — done:** node registry + docker-over-ssh transport + `docker
+  save|load` image movement + explicit `node =` placement + WireGuard-mesh
+  routing.
+- **P9b — done:** the dumb `lwd-agent` binary as a preferred transport over
+  docker-over-ssh, with automatic fallback; node UX in the CLI/web/MCP.
+- **P10 — done:** the continuous reconciler loop; self-heals dead surfaces;
+  observes (but doesn't yet act on) node/edge reachability.
+- **P11a — done:** capacity-aware scheduler, node pools, `[requirements]`.
+- **P11b — done:** node drain/evacuate/uncordon; automatic node-loss
+  failover.
+- **P12 — done:** surface replicas + Caddy round-robin load balancing;
+  `lwd scale`.
+- **P13 — planned:** multi-edge routing — N Caddy edges, each fed identical
+  controller-pushed route config, with DNS round-robin across edge IPs.
+- **P14 — planned:** first-class resource drivers (postgres/valkey/minio)
+  in single-mode (one node, local disk, backups), evolving today's
+  generated-compose backing services.
+- **P15 — planned:** resource HA — Patroni-based Postgres failover, plus
+  scheduled backups and restore.
+
+Single-node stays a first-class, zero-mesh path throughout — the one-box
+experience must never regress as federation lands. See `docs/VISION.md` for
+the full philosophy and design principles behind this ordering.
+
+## Development & testing
+
+```bash
+go test ./...                          # unit + integration tests — no Docker needed
+LWD_DOCKER_TEST=1 go test ./test/ -v   # + real end-to-end tests against Docker
+```
+
+The plain `go test ./...` run (no build tag, no Docker) already covers a lot
+end-to-end against fakes: `internal/web`'s `TestIntegrationWebClientDaemon`
+drives the browser → `lwd-web` → daemon chain over real HTTP; `internal/mcp`'s
+`TestIntegrationMCPClientDaemon` drives the same for `lwd-mcp` over MCP's
+in-memory transport; and dedicated fake-backed tests exercise agent
+transport selection, self-heal, scheduling, node drain/failover, and
+replicas — all without a Docker daemon.
+
+The Docker-gated suite (`LWD_DOCKER_TEST=1 go test ./test/ -v`) drives the
+full stack against real Docker: blue-green + rollback, secret injection,
+a real compose app, a real git build, a remote node over `ssh://localhost`,
+and a real `lwd-agent` deploy. Each test `t.Skip`s (rather than fails) with
+a clear message when its prerequisite isn't available in the environment
+(no `docker compose` plugin, no `git`, no passwordless ssh to `localhost`,
+ports 80/443 already in use) — it never fakes a pass.
+
+This codebase was built with a subagent-driven, phase-by-phase development
+process (see `docs/VISION.md` for the phase roadmap this README documents);
+each phase's implementation, tests, and documentation update landed together.
+
+## License
+
+No license file is currently published in this repository (TBD).
