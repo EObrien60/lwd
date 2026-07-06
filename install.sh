@@ -42,6 +42,20 @@
 #                   git checkout), rebuild, reinstall the binaries, and
 #                   restart any running lwd/lwd-web/lwd-agent services.
 #                   Does not touch /etc/lwd env files or any config.
+#   --destroy, --remove  Uninstall: stop/disable/remove the lwd/lwd-web/
+#                   lwd-agent systemd units and remove the installed
+#                   binaries from $PREFIX. Never builds or installs
+#                   anything. By default, interactively asks (default No)
+#                   whether to also remove /etc/lwd, /var/lib/lwd (secret
+#                   key + deployment DB), and all deployed apps + the
+#                   lwd-caddy container + the lwd Docker network.
+#   --destroy-all   Like --destroy, but also removes config, daemon state,
+#                   and all deployed apps + the lwd-caddy container + the
+#                   lwd network, with no prompt. Named Docker volumes
+#                   (backing DB data) are always left intact.
+#   --no-interactive  With --destroy (not --destroy-all), skip the prompt
+#                   and default to NOT removing config/apps (install-only
+#                   uninstall). Has no effect outside --destroy.
 #   -h, --help      Show this help.
 #
 # It never uses cgo (CGO_ENABLED=0, pure-Go SQLite), so no C toolchain is
@@ -63,6 +77,9 @@ GO_VERSION=""
 REPO_URL="https://github.com/EObrien60/lwd"
 REPO_REF="main"
 UPDATE=0
+DESTROY=0
+DESTROY_ALL=0
+NONINTERACTIVE=0
 GOROOT_DL="/usr/local/go"          # where a downloaded Go toolchain lands
 BINS=(lwd lwd-web lwd-mcp lwd-agent)
 
@@ -98,6 +115,9 @@ while [ $# -gt 0 ]; do
     --repo)     REPO_URL="${2:?--repo needs a URL}"; shift ;;
     --ref)      REPO_REF="${2:?--ref needs a git ref}"; shift ;;
     --update)   UPDATE=1 ;;
+    --destroy|--remove) DESTROY=1 ;;
+    --destroy-all) DESTROY=1; DESTROY_ALL=1 ;;
+    --no-interactive) NONINTERACTIVE=1 ;;
     -h|--help)  usage 0 ;;
     *)          die "unknown option: $1 (see --help)" ;;
   esac
@@ -543,7 +563,133 @@ See the README for multi-node fleets, replicas/scaling, secrets, and the MCP ser
 STEPS
 }
 
+# ---- destroy / uninstall ----------------------------------------------------
+do_destroy() {
+  log "uninstalling lwd (units + binaries in $PREFIX)"
+
+  # --- always: stop/disable/remove systemd units --------------------------
+  if command -v systemctl >/dev/null 2>&1; then
+    local u
+    for u in lwd lwd-web lwd-agent; do
+      if [ -f "/etc/systemd/system/${u}.service" ]; then
+        log "removing ${u}.service"
+        asroot systemctl stop "${u}.service" 2>/dev/null || true
+        asroot systemctl disable "${u}.service" 2>/dev/null || true
+        asroot rm -f "/etc/systemd/system/${u}.service"
+        ok "${u}.service stopped, disabled, and removed"
+      else
+        log "${u}.service not installed — skipping"
+      fi
+    done
+    asroot systemctl daemon-reload
+  else
+    warn "systemctl not found — skipping unit removal"
+    warn "if a bare 'lwd daemon' process is running, stop it yourself (not touching it here)"
+  fi
+
+  # --- always: remove installed binaries -----------------------------------
+  local b removed_bins=()
+  for b in "${BINS[@]}"; do
+    if [ -f "$PREFIX/$b" ]; then
+      asroot rm -f "$PREFIX/$b"
+      ok "removed $PREFIX/$b"
+      removed_bins+=("$b")
+    else
+      log "$PREFIX/$b not present — skipping"
+    fi
+  done
+
+  # --- decide whether to also purge config/state/apps ----------------------
+  local purge=0
+  if [ "$DESTROY_ALL" -eq 1 ]; then
+    purge=1
+  elif [ "$NONINTERACTIVE" -eq 1 ]; then
+    purge=0
+  else
+    local ans=""
+    if [ -t 0 ] || [ -r /dev/tty ]; then
+      printf 'Also remove lwd configuration (/etc/lwd), daemon state (/var/lib/lwd — includes the encrypted secret key + deployment DB), and ALL deployed apps + the lwd-caddy container + the lwd network? [y/N] ' >&2
+      if ! read -r ans </dev/tty 2>/dev/null; then
+        ans=""
+      fi
+    else
+      log "no controlling tty — defaulting to keep config/apps (re-run with --destroy-all to remove them)"
+      ans=""
+    fi
+    case "$ans" in
+      [Yy]*) purge=1 ;;
+      *)     purge=0 ;;
+    esac
+  fi
+
+  # --- purge: docker containers/network + config/state ---------------------
+  local vols_note=0
+  if [ "$purge" -eq 1 ]; then
+    if command -v docker >/dev/null 2>&1; then
+      local ids
+      ids="$(
+        { docker ps -aq --filter 'label=lwd.app' 2>/dev/null
+          docker ps -aq --filter 'label=lwd.role=system' 2>/dev/null
+          docker ps -aq --filter 'name=^/lwd-' 2>/dev/null
+        } | sort -u
+      )"
+      if [ -n "$ids" ]; then
+        log "removing lwd-managed containers"
+        # shellcheck disable=SC2086
+        docker rm -f $ids >/dev/null 2>&1 || true
+        ok "removed lwd-managed containers"
+      else
+        log "no lwd-managed containers found"
+      fi
+      docker network rm lwd >/dev/null 2>&1 || true
+      ok "removed docker network 'lwd' (if it existed)"
+    else
+      warn "docker not found — skipping container/network cleanup"
+    fi
+
+    local data_dir="${LWD_DATA_DIR:-/var/lib/lwd}"
+    asroot rm -rf /etc/lwd
+    ok "removed /etc/lwd"
+    asroot rm -rf "$data_dir"
+    ok "removed $data_dir"
+    vols_note=1
+  fi
+
+  # --- summary ---------------------------------------------------------------
+  cat <<STEPS
+
+${c_green}lwd uninstall complete.${c_off}
+
+  Systemd units: stopped/disabled/removed where present (lwd, lwd-web, lwd-agent).
+  Binaries removed from $PREFIX: ${removed_bins[*]:-none present}.
+STEPS
+  if [ "$purge" -eq 1 ]; then
+    cat <<STEPS
+  Config + apps: PURGED — /etc/lwd, ${LWD_DATA_DIR:-/var/lib/lwd}, deployed
+  app containers, the lwd-caddy container, and the 'lwd' Docker network were
+  all removed.
+STEPS
+  else
+    cat <<STEPS
+  Config + apps: KEPT — /etc/lwd, /var/lib/lwd, and any deployed apps were
+  left untouched. Re-run with --destroy-all to remove them too.
+STEPS
+  fi
+  if [ "$vols_note" -eq 1 ]; then
+    cat <<STEPS
+
+  NOTE: named data volumes (e.g. postgres/minio data) were left intact.
+  List with: docker volume ls
+  Remove manually with: docker volume rm <name>   (if you truly want the data gone)
+STEPS
+  fi
+}
+
 # ---- main -------------------------------------------------------------------
+if [ "$DESTROY" -eq 1 ]; then
+  do_destroy
+  exit 0
+fi
 if [ "$PUBLIC" -eq 1 ]; then
   INSTALL_SYSTEMD=1
   INSTALL_WEB=1
