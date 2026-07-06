@@ -103,6 +103,24 @@ git, curl, and tar. Run `./install.sh --help` for all options. Docker itself is
 a **runtime** dependency (lwd drives a Docker daemon); pass `--docker` or install
 it yourself. WireGuard is only needed for multi-node fleets.
 
+**Updating an existing install.** From a git checkout, pull and re-run with
+`--update`:
+
+```bash
+cd lwd && git pull && sudo ./install.sh --update
+```
+
+`--update` also works standalone — from inside a checkout it fast-forward
+pulls the latest commit first (non-fatal if that fails, e.g. local changes;
+it just builds the checkout as-is), then rebuilds and reinstalls the four
+binaries over the existing ones, then restarts whichever of
+`lwd`/`lwd-web`/`lwd-agent` are currently running under systemd so the new
+binaries take effect. It never touches `/etc/lwd/*.env` or any other config.
+Services that are installed but not running are left stopped (start them
+yourself). Compose it with other flags, e.g. `sudo ./install.sh --update --web`
+updates the binaries/restarts running services *and* installs the `lwd-web`
+unit if it isn't already present.
+
 ### Or build manually
 
 ```bash

@@ -26,6 +26,10 @@
 #   --repo URL      Git URL to clone when not run from inside a checkout
 #                   (default: https://github.com/EObrien60/lwd).
 #   --ref REF       Git ref to build when cloning (default: main).
+#   --update        Update an existing install: pull latest (if run from a
+#                   git checkout), rebuild, reinstall the binaries, and
+#                   restart any running lwd/lwd-web/lwd-agent services.
+#                   Does not touch /etc/lwd env files or any config.
 #   -h, --help      Show this help.
 #
 # It never uses cgo (CGO_ENABLED=0, pure-Go SQLite), so no C toolchain is
@@ -43,6 +47,7 @@ INSTALL_AGENT=0
 GO_VERSION=""
 REPO_URL="https://github.com/EObrien60/lwd"
 REPO_REF="main"
+UPDATE=0
 GOROOT_DL="/usr/local/go"          # where a downloaded Go toolchain lands
 BINS=(lwd lwd-web lwd-mcp lwd-agent)
 
@@ -66,6 +71,7 @@ while [ $# -gt 0 ]; do
     --go-version) GO_VERSION="${2:?--go-version needs a version}"; shift ;;
     --repo)     REPO_URL="${2:?--repo needs a URL}"; shift ;;
     --ref)      REPO_REF="${2:?--ref needs a git ref}"; shift ;;
+    --update)   UPDATE=1 ;;
     -h|--help)  usage 0 ;;
     *)          die "unknown option: $1 (see --help)" ;;
   esac
@@ -182,7 +188,23 @@ locate_source() {
     self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   fi
   if [ -n "$self_dir" ] && [ -f "$self_dir/go.mod" ] && grep -q '^module lwd$' "$self_dir/go.mod" 2>/dev/null; then
-    SRC="$self_dir"; ok "building from checkout at $SRC"; return
+    SRC="$self_dir"; ok "building from checkout at $SRC"
+    if [ "$UPDATE" -eq 1 ] && command -v git >/dev/null 2>&1 && git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1; then
+      local before after
+      before="$(git -C "$SRC" rev-parse --short HEAD)"
+      log "pulling latest (git pull --ff-only)"
+      if git -C "$SRC" pull --ff-only; then
+        after="$(git -C "$SRC" rev-parse --short HEAD)"
+        if [ "$before" = "$after" ]; then
+          ok "already up to date ($after)"
+        else
+          ok "updated source $before → $after"
+        fi
+      else
+        warn "git pull --ff-only failed (local changes or diverged?) — building the current checkout as-is"
+      fi
+    fi
+    return
   fi
   # Not inside a checkout (e.g. curl|bash) — clone it.
   command -v git >/dev/null 2>&1 || pkg_install git
@@ -215,6 +237,26 @@ maybe_docker() {
   curl -fsSL https://get.docker.com | asroot sh
   asroot systemctl enable --now docker 2>/dev/null || true
   ok "docker installed"
+}
+
+# ---- update: restart any running lwd services ------------------------------
+restart_services() {
+  command -v systemctl >/dev/null 2>&1 || { warn "systemctl not found — restart services manually"; return 0; }
+  local restarted=0 u
+  for u in lwd lwd-web lwd-agent; do
+    if [ -f "/etc/systemd/system/${u}.service" ]; then
+      if asroot systemctl is-active --quiet "${u}.service"; then
+        log "restarting ${u}.service"
+        asroot systemctl restart "${u}.service" \
+          && ok "${u}.service restarted (now running the new binary)" \
+          || warn "failed to restart ${u}.service — check: journalctl -u ${u}"
+        restarted=1
+      else
+        log "${u}.service installed but not active — start it with: systemctl start ${u}"
+      fi
+    fi
+  done
+  [ "$restarted" -eq 1 ] || log "no running lwd services were restarted (start them with systemctl start <unit>)"
 }
 
 # ---- optional: systemd unit for the daemon ---------------------------------
@@ -338,6 +380,27 @@ UNIT
 
 # ---- next steps -------------------------------------------------------------
 next_steps() {
+  if [ "$UPDATE" -eq 1 ]; then
+    cat <<STEPS
+
+${c_green}lwd updated.${c_off}
+
+  Binaries rebuilt and reinstalled to $PREFIX.
+  Running services were restarted to pick up the new binaries (see log above);
+  services that exist but weren't running were left stopped.
+
+  Check status:
+       systemctl status lwd lwd-web lwd-agent
+       journalctl -u lwd -f
+
+  Note: /etc/lwd/*.env config files were left untouched.
+
+  Installed version:
+STEPS
+    "$PREFIX/lwd" version 2>/dev/null || true
+    return 0
+  fi
+
   cat <<STEPS
 
 ${c_green}lwd installed.${c_off}
@@ -406,6 +469,7 @@ pkg_install "${DEPS[@]}"
 ensure_go
 locate_source
 build_install
+[ "$UPDATE" -eq 1 ] && restart_services
 maybe_docker
 maybe_systemd
 maybe_web
