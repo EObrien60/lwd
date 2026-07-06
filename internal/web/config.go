@@ -7,8 +7,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"os"
-
-	"lwd/internal/config"
 )
 
 // defaultAddr is the listen address used when LWD_WEB_ADDR is unset.
@@ -18,7 +16,6 @@ const defaultAddr = "127.0.0.1:8079"
 type Config struct {
 	Addr       string
 	Password   string
-	SocketPath string
 	SigningKey []byte
 }
 
@@ -29,7 +26,11 @@ type Config struct {
 //   - LWD_WEB_SECRET: cookie signing key; if unset, 32 random bytes are
 //     generated (sessions reset on restart). If set, it must be at least
 //     16 bytes.
-//   - LWD_SOCKET: overrides the daemon socket path from internal/config.
+//
+// The daemon target itself (local unix socket vs. remote TCP) is NOT part of
+// this config: it's resolved by client.FromEnv (LWD_DAEMON/LWD_API_TOKEN,
+// falling back to LWD_SOCKET/the default socket path) when lwd-web builds
+// its daemon client.
 func LoadConfig() (Config, error) {
 	password := os.Getenv("LWD_WEB_PASSWORD")
 	if password == "" {
@@ -39,11 +40,6 @@ func LoadConfig() (Config, error) {
 	addr := os.Getenv("LWD_WEB_ADDR")
 	if addr == "" {
 		addr = defaultAddr
-	}
-
-	socketPath := os.Getenv("LWD_SOCKET")
-	if socketPath == "" {
-		socketPath = config.SocketPath()
 	}
 
 	var key []byte
@@ -62,7 +58,6 @@ func LoadConfig() (Config, error) {
 	return Config{
 		Addr:       addr,
 		Password:   password,
-		SocketPath: socketPath,
 		SigningKey: key,
 	}, nil
 }

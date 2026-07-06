@@ -322,7 +322,7 @@ func buildInitialRoutes(ctx context.Context, n node.Node, s *store.Store) ([]rou
 	return out, nil
 }
 
-func newClient() *client.Client { return client.New(config.SocketPath()) }
+func newClient() *client.Client { return client.FromEnv() }
 
 func runApply(args []string) int {
 	dir := "."
