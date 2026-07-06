@@ -68,6 +68,35 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, dep)
 }
 
+// scaleRequest is the wire body for POST /api/apps/{name}/scale.
+type scaleRequest struct {
+	Replicas int `json:"replicas"`
+}
+
+// handleScale proxies the daemon's POST /apps/{name}/scale (Phase 12 Task
+// 7): change a running app's replica count, redeploying it set-based via
+// client.Scale, and render the resulting store.Deployment — the same shape
+// as rollback/redeploy. It is gated by the session Middleware like every
+// other /api route; replicas-count validation (>= 1, <= 50, and the
+// compose/backing-services guards) all live in the daemon (internal/api's
+// own handleScale), so this handler is a thin, unvalidated-body pass-through.
+func (s *Server) handleScale(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	var req scaleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	dep, err := s.client.Scale(r.Context(), name, req.Replicas)
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, dep)
+}
+
 // handleRedeploy re-applies the newest recorded deployment's spec snapshot
 // for the app (e.g. after a config change on the daemon host, or simply to
 // restart it). 404 if the app has no deployment history.
@@ -88,6 +117,20 @@ func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal([]byte(history[0].Spec), &app); err != nil {
 		writeErr(w, http.StatusInternalServerError, fmt.Errorf("decode stored spec: %w", err))
 		return
+	}
+	// history[0] is the exact deployment whose Spec we just decoded, so its
+	// Scheduled field is that deployment's own placement provenance. A
+	// scheduler-placed (unpinned) app's snapshot has a CONCRETE Node baked in
+	// (applyImageProvenance sets app.Node = chosen before recording it), so
+	// replaying it as-is through client.Apply -> daemon POST /apply would
+	// make resolvePlacement see a non-empty Node and misclassify it as
+	// pinned — collapsing every replica onto one node and recording
+	// Scheduled=false, disabling node-loss failover going forward. Clearing
+	// Node when Scheduled re-invokes the scheduler on redeploy, exactly like
+	// handleScale's (internal/api) same fix for `lwd scale`. A pinned app
+	// (Scheduled == false) is left with its snapshot's Node untouched.
+	if history[0].Scheduled {
+		app.Node = ""
 	}
 
 	dep, err := s.client.Apply(r.Context(), &app)

@@ -75,6 +75,7 @@ var expectedToolNames = []string{
 	"lwd_apply",
 	"lwd_deploy_git",
 	"lwd_rollback",
+	"lwd_scale",
 	"lwd_remove",
 	"lwd_secret_set",
 	"lwd_secret_list",

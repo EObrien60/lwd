@@ -91,6 +91,31 @@ func (c *Client) Rollback(ctx context.Context, name string) (*store.Deployment, 
 	return &dep, nil
 }
 
+// Scale changes name's replica count and redeploys it set-based, returning
+// the resulting deployment. It reuses the app's current spec snapshot
+// (image/domain/port/etc unchanged) — only Replicas changes.
+func (c *Client) Scale(ctx context.Context, name string, replicas int) (*store.Deployment, error) {
+	body, err := json.Marshal(map[string]int{"replicas": replicas})
+	if err != nil {
+		return nil, err
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.url("/apps/"+name+"/scale"), bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, decodeErr(resp)
+	}
+	var dep store.Deployment
+	if err := json.NewDecoder(resp.Body).Decode(&dep); err != nil {
+		return nil, err
+	}
+	return &dep, nil
+}
+
 // Apps lists apps and their statuses.
 func (c *Client) Apps(ctx context.Context) ([]api.AppStatus, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/apps"), nil)

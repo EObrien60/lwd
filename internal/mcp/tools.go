@@ -221,6 +221,11 @@ type lwdApplyInput struct {
 	// explicit zero-valued {}) is distinguishable: only a non-nil
 	// Requirements sets app.Requirements at all.
 	Requirements *lwdRequirementsInput `json:"requirements,omitempty" jsonschema:"optional resource requirements (cpu, memory) the scheduler uses when node is omitted"`
+	// Replicas is a pointer so an omitted argument leaves the toml's own
+	// Replicas value (defaulted to 1 by spec.Parse if unset there) untouched
+	// — distinct from an explicit 0, which spec.Validate treats as "unset"
+	// too but which a caller should never need to pass deliberately.
+	Replicas *int `json:"replicas,omitempty" jsonschema:"optional surface replica count (1-50, load-balanced by the router); omitted keeps the toml's own value (default 1)"`
 }
 
 // registerLwdApply adds the lwd_apply tool: deploy an app from either a
@@ -259,6 +264,9 @@ func (s *Server) registerLwdApply(srv *sdk.Server) {
 		if in.Requirements != nil {
 			app.Requirements = &spec.Requirements{CPU: in.Requirements.CPU, Memory: in.Requirements.Memory}
 		}
+		if in.Replicas != nil {
+			app.Replicas = *in.Replicas
+		}
 		if err := app.Validate(); err != nil {
 			return nil, lwdDeploymentOutput{}, err
 		}
@@ -294,6 +302,7 @@ type lwdDeployGitInput struct {
 	Node         string                     `json:"node,omitempty" jsonschema:"name of a registered node to place this app on; omitted lets lwd schedule it (or pins to \"local\" for the controller)"`
 	Pool         string                     `json:"pool,omitempty" jsonschema:"name of a node pool to schedule into when node is omitted; omitted means the \"default\" pool"`
 	Requirements *lwdRequirementsInput      `json:"requirements,omitempty" jsonschema:"optional resource requirements (cpu, memory) the scheduler uses when node is omitted"`
+	Replicas     int                        `json:"replicas,omitempty" jsonschema:"optional surface replica count (1-50, load-balanced by the router); omitted means 1"`
 }
 
 const (
@@ -333,9 +342,10 @@ func (s *Server) registerLwdDeployGit(srv *sdk.Server) {
 		}
 
 		app := &spec.App{
-			Name:   in.Name,
-			Domain: in.Domain,
-			Port:   in.Port,
+			Name:     in.Name,
+			Domain:   in.Domain,
+			Port:     in.Port,
+			Replicas: 1,
 			Git: &spec.Git{
 				URL: in.URL,
 				Ref: ref,
@@ -353,6 +363,9 @@ func (s *Server) registerLwdDeployGit(srv *sdk.Server) {
 		}
 		if in.Requirements != nil {
 			app.Requirements = &spec.Requirements{CPU: in.Requirements.CPU, Memory: in.Requirements.Memory}
+		}
+		if in.Replicas != 0 {
+			app.Replicas = in.Replicas
 		}
 		if err := app.Validate(); err != nil {
 			return nil, lwdDeploymentOutput{}, err
@@ -385,6 +398,60 @@ func (s *Server) registerLwdRollback(srv *sdk.Server) {
 			return nil, lwdDeploymentOutput{}, err
 		}
 		return nil, deploymentOutput(dep), nil
+	})
+}
+
+// lwdScaleInput is the input of lwd_scale.
+type lwdScaleInput struct {
+	App      string `json:"app" jsonschema:"the app name"`
+	Replicas int    `json:"replicas" jsonschema:"the target replica count (1-50); the router load-balances across all of them"`
+}
+
+// lwdScaleOutput is the structured result of lwd_scale: the same essentials
+// as lwdDeploymentOutput plus the resulting replica count, which is the
+// whole point of the call. Mirrors api.AppStatus.Replicas's own fallback: a
+// legacy (pre-Phase-12) deployment with an empty Replicas slice reports 1,
+// since that's still exactly one running container.
+type lwdScaleOutput struct {
+	Name        string `json:"name"`
+	Image       string `json:"image"`
+	Status      string `json:"status"`
+	ContainerID string `json:"container_id"`
+	Replicas    int    `json:"replicas"`
+}
+
+func scaleOutput(d *store.Deployment) lwdScaleOutput {
+	n := len(d.Replicas)
+	if n == 0 {
+		n = 1
+	}
+	return lwdScaleOutput{
+		Name:        d.App,
+		Image:       d.Image,
+		Status:      d.Status,
+		ContainerID: d.ContainerID,
+		Replicas:    n,
+	}
+}
+
+// registerLwdScale adds the lwd_scale tool: change a running app's replica
+// count, redeploying it set-based via the daemon's Scale (Phase 12 Task 7) —
+// the router load-balances across the resulting set. Annotated
+// destructiveHint, consistent with lwd_node_drain/lwd_node_evacuate: it tears
+// down and recreates containers, so the MCP host should confirm with the
+// user before invoking it.
+func (s *Server) registerLwdScale(srv *sdk.Server) {
+	destructive := true
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "lwd_scale",
+		Description: "Change a lwd-managed app's replica count. The router load-balances across every healthy replica; a redeploy replaces the whole set via the same zero-downtime blue-green path as apply.",
+		Annotations: &sdk.ToolAnnotations{DestructiveHint: &destructive},
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in lwdScaleInput) (*sdk.CallToolResult, lwdScaleOutput, error) {
+		dep, err := s.client.Scale(ctx, in.App, in.Replicas)
+		if err != nil {
+			return nil, lwdScaleOutput{}, err
+		}
+		return nil, scaleOutput(dep), nil
 	})
 }
 

@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,7 +84,7 @@ func TestValidateRejectsUnsupportedFeatures(t *testing.T) {
 }
 
 func TestValidateAcceptsGoodSpec(t *testing.T) {
-	a := &App{Name: "x", Image: "y", Port: 80, Node: "local"}
+	a := &App{Name: "x", Image: "y", Port: 80, Node: "local", Replicas: 1}
 	if err := a.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
@@ -100,11 +101,12 @@ func TestValidateRejectsBadName(t *testing.T) {
 
 func TestValidateComposeApp(t *testing.T) {
 	a := &App{
-		Name:    "webapp",
-		Compose: "docker-compose.yml",
-		Service: "web",
-		Domain:  "x.example.com",
-		Port:    8080,
+		Name:     "webapp",
+		Compose:  "docker-compose.yml",
+		Service:  "web",
+		Domain:   "x.example.com",
+		Port:     8080,
+		Replicas: 1,
 	}
 	if err := a.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
@@ -182,12 +184,13 @@ func TestComposeRejectsRemoteNode(t *testing.T) {
 func TestComposeAcceptsLocalNode(t *testing.T) {
 	for _, node := range []string{"", "local"} {
 		a := &App{
-			Name:    "webapp",
-			Compose: "docker-compose.yml",
-			Service: "web",
-			Domain:  "x.example.com",
-			Port:    8080,
-			Node:    node,
+			Name:     "webapp",
+			Compose:  "docker-compose.yml",
+			Service:  "web",
+			Domain:   "x.example.com",
+			Port:     8080,
+			Node:     node,
+			Replicas: 1,
 		}
 		if err := a.Validate(); err != nil {
 			t.Fatalf("Validate (node=%q): %v", node, err)
@@ -275,11 +278,12 @@ port = 8080
 
 func TestGitAppValid(t *testing.T) {
 	a := &App{
-		Name:   "myapp",
-		Git:    &Git{URL: "https://github.com/me/myapp"},
-		Build:  &Build{Dockerfile: "Dockerfile"},
-		Domain: "myapp.example.com",
-		Port:   8080,
+		Name:     "myapp",
+		Git:      &Git{URL: "https://github.com/me/myapp"},
+		Build:    &Build{Dockerfile: "Dockerfile"},
+		Domain:   "myapp.example.com",
+		Port:     8080,
+		Replicas: 1,
 	}
 	if err := a.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
@@ -421,9 +425,10 @@ func TestComposeRejectsServices(t *testing.T) {
 
 func TestImageAppWithService(t *testing.T) {
 	a := &App{
-		Name:  "myapp",
-		Image: "myimage:latest",
-		Port:  8080,
+		Name:     "myapp",
+		Image:    "myimage:latest",
+		Port:     8080,
+		Replicas: 1,
 		Services: []Service{
 			{Name: "db", Image: "postgres:16"},
 		},
@@ -525,7 +530,7 @@ func TestValidateRejectsBadSecretName(t *testing.T) {
 	})
 
 	t.Run("normal secret name is accepted", func(t *testing.T) {
-		a := &App{Name: "myapp", Image: "y", Port: 80, Secrets: []string{"DATABASE_URL"}}
+		a := &App{Name: "myapp", Image: "y", Port: 80, Replicas: 1, Secrets: []string{"DATABASE_URL"}}
 		if err := a.Validate(); err != nil {
 			t.Fatalf("Validate: %v", err)
 		}
@@ -579,11 +584,12 @@ command = "redis-server --appendonly yes"
 
 func gitApp(overrides func(*App)) *App {
 	a := &App{
-		Name:   "myapp",
-		Git:    &Git{URL: "https://github.com/me/myapp", Ref: "main"},
-		Build:  &Build{Dockerfile: "Dockerfile"},
-		Domain: "myapp.example.com",
-		Port:   8080,
+		Name:     "myapp",
+		Git:      &Git{URL: "https://github.com/me/myapp", Ref: "main"},
+		Build:    &Build{Dockerfile: "Dockerfile"},
+		Domain:   "myapp.example.com",
+		Port:     8080,
+		Replicas: 1,
 	}
 	if overrides != nil {
 		overrides(a)
@@ -800,7 +806,7 @@ func TestValidateBadRequirements(t *testing.T) {
 		}
 	})
 	t.Run("valid requirements accepted", func(t *testing.T) {
-		a := &App{Name: "x", Image: "y", Port: 80, Requirements: &Requirements{CPU: 1.5, Memory: "1G"}}
+		a := &App{Name: "x", Image: "y", Port: 80, Replicas: 1, Requirements: &Requirements{CPU: 1.5, Memory: "1G"}}
 		if err := a.Validate(); err != nil {
 			t.Fatalf("Validate: unexpected error: %v", err)
 		}
@@ -808,12 +814,150 @@ func TestValidateBadRequirements(t *testing.T) {
 }
 
 func TestValidateBadPool(t *testing.T) {
-	a := &App{Name: "x", Image: "y", Port: 80, Pool: "bad pool!"}
+	a := &App{Name: "x", Image: "y", Port: 80, Pool: "bad pool!", Replicas: 1}
 	if err := a.Validate(); err == nil {
 		t.Fatal("want error for invalid pool name")
 	}
-	a2 := &App{Name: "x", Image: "y", Port: 80, Pool: "web-1"}
+	a2 := &App{Name: "x", Image: "y", Port: 80, Pool: "web-1", Replicas: 1}
 	if err := a2.Validate(); err != nil {
 		t.Fatalf("Validate: unexpected error for valid pool: %v", err)
 	}
+}
+
+// TestParseDefaultsReplicasToOne covers Phase 12 Task 2: an lwd.toml that
+// doesn't declare replicas defaults to 1 (today's single-container
+// behavior).
+func TestParseDefaultsReplicasToOne(t *testing.T) {
+	a, err := Parse([]byte(singleService))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.Replicas != 1 {
+		t.Errorf("Replicas = %d, want 1 (default)", a.Replicas)
+	}
+}
+
+// TestParseReplicas covers Phase 12 Task 2: an explicit replicas value is
+// parsed through unchanged.
+func TestParseReplicas(t *testing.T) {
+	toml := `
+name = "blog"
+image = "ghcr.io/me/blog:latest"
+domain = "blog.example.com"
+port = 8080
+replicas = 3
+`
+	a, err := Parse([]byte(toml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.Replicas != 3 {
+		t.Errorf("Replicas = %d, want 3", a.Replicas)
+	}
+}
+
+// TestValidateReplicasMin covers Phase 12 Task 2: a negative Replicas is
+// rejected. Zero is NOT rejected here (see TestValidateReplicasZeroIsUnset)
+// — 0 means "unset", which a spec.App reconstructed from a pre-Phase-12
+// snapshot legitimately has.
+func TestValidateReplicasMin(t *testing.T) {
+	a := &App{Name: "x", Image: "y", Port: 80, Replicas: -1}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for negative replicas")
+	}
+}
+
+// TestValidateReplicasZeroIsUnset covers Phase 12 Task 2's backward-compat
+// rule: Replicas == 0 ("unset") is VALID. Parse normalizes a fresh spec's 0
+// to 1, but heal/rollback re-validate a spec.App reconstructed from a
+// pre-Phase-12 snapshot that has no replicas field (so Replicas == 0) —
+// rejecting 0 would make healing/rolling back any existing deployment fail
+// after upgrade.
+func TestValidateReplicasZeroIsUnset(t *testing.T) {
+	a := &App{Name: "x", Image: "y", Port: 80, Replicas: 0}
+	if err := a.Validate(); err != nil {
+		t.Fatalf("Validate: replicas=0 (unset) must be valid, got: %v", err)
+	}
+}
+
+// TestValidatePreV12SnapshotReplicasZero proves the upgrade path: a spec.App
+// unmarshaled from a JSON deployment snapshot that predates Phase 12 (no
+// "replicas" key → Replicas defaults to 0) validates cleanly, so heal
+// (healSurfaceLocked) and rollback (rollbackGit/rollbackImage), which
+// reconstruct and re-Validate such snapshots, are not broken by this
+// upgrade.
+func TestValidatePreV12SnapshotReplicasZero(t *testing.T) {
+	snapshot := []byte(`{"Name":"blog","Image":"img:1","Domain":"blog.example.com","Port":8080,"Node":"local"}`)
+	var a App
+	if err := json.Unmarshal(snapshot, &a); err != nil {
+		t.Fatalf("unmarshal pre-12 snapshot: %v", err)
+	}
+	if a.Replicas != 0 {
+		t.Fatalf("pre-12 snapshot Replicas = %d, want 0 (no field in JSON)", a.Replicas)
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatalf("Validate of reconstructed pre-12 snapshot must succeed, got: %v", err)
+	}
+}
+
+// TestValidateReplicasMax covers Phase 12 Task 2: Replicas above the 50 cap
+// is rejected.
+func TestValidateReplicasMax(t *testing.T) {
+	a := &App{Name: "x", Image: "y", Port: 80, Replicas: 51}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for replicas > 50")
+	}
+}
+
+// TestValidateReplicasCompose covers Phase 12 Task 2: replicas > 1 is not
+// supported for compose apps (compose's Up/routing path doesn't have a
+// replica-set notion).
+func TestValidateReplicasCompose(t *testing.T) {
+	a := &App{
+		Name:     "webapp",
+		Compose:  "docker-compose.yml",
+		Service:  "web",
+		Domain:   "x.example.com",
+		Port:     8080,
+		Replicas: 2,
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("want error for replicas > 1 with compose")
+	}
+}
+
+// TestValidateReplicasWithBackingRejected covers Phase 12 Task 5's guard: a
+// multi-replica app declaring backing [[services]] is rejected, since backing
+// services run PINNED on a single node's per-app network and a replica spread
+// across other nodes has no way to reach it. replicas=1 with services is
+// still valid — backing is only a problem once there's more than one node in
+// play.
+func TestValidateReplicasWithBackingRejected(t *testing.T) {
+	base := App{
+		Name:     "webapp",
+		Image:    "img:1",
+		Domain:   "x.example.com",
+		Port:     8080,
+		Services: []Service{{Name: "db", Image: "postgres:16"}},
+	}
+
+	t.Run("replicas > 1 with services is rejected", func(t *testing.T) {
+		a := base
+		a.Replicas = 2
+		err := a.Validate()
+		if err == nil {
+			t.Fatal("want error for replicas > 1 with backing services")
+		}
+		if !strings.Contains(err.Error(), "backing") {
+			t.Errorf("error = %q, want it to mention backing services", err.Error())
+		}
+	})
+
+	t.Run("replicas = 1 with services is OK", func(t *testing.T) {
+		a := base
+		a.Replicas = 1
+		if err := a.Validate(); err != nil {
+			t.Errorf("want no error for replicas=1 with backing services, got %v", err)
+		}
+	})
 }

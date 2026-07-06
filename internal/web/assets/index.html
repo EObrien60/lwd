@@ -132,6 +132,7 @@
             </div>
             <div class="card__meta">
               <span class="tag" x-text="shortImage(app.image)" :title="app.image"></span>
+              <span class="tag tag-replicas" x-show="app.replicas > 1" x-text="'×' + app.replicas" title="replicas"></span>
             </div>
           </div>
         </template>
@@ -150,6 +151,8 @@
               <span class="dot" :class="'dot-' + statusKind(detail && detail.status ? detail.status.status : '')"></span>
               <span x-text="detail && detail.status ? detail.status.status : ''"></span>
             </span>
+            <span class="tag tag-replicas" x-show="detail && detail.status && detail.status.replicas > 1" x-cloak
+                  x-text="(detail && detail.status ? detail.status.replicas : 0) + ' replicas'" title="load-balanced replica count"></span>
           </h1>
           <a class="card__domain" x-show="detail && detail.status && detail.status.domain"
              :href="'https://' + (detail && detail.status ? detail.status.domain : '')" target="_blank" rel="noopener">
@@ -181,6 +184,11 @@
             <button type="button" class="tab" :class="{ active: activeTab === 'deployments' }" @click="setTab('deployments')">
               <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4v6l4 2"/><circle cx="10" cy="10" r="7"/></svg>
               Deployments
+            </button>
+            <button type="button" class="tab" :class="{ active: activeTab === 'replicas' }" @click="setTab('replicas')">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.3"/><rect x="10.5" y="3" width="6.5" height="7" rx="1.3" opacity=".55"/><rect x="3" y="10.5" width="7" height="6.5" rx="1.3" opacity=".55"/><rect x="10.5" y="10.5" width="6.5" height="6.5" rx="1.3" opacity=".3"/></svg>
+              Replicas
+              <span class="tab-badge" x-show="detail && detail.status && detail.status.replicas > 1" x-text="detail.status.replicas"></span>
             </button>
             <button type="button" class="tab" :class="{ active: activeTab === 'secrets' }" @click="setTab('secrets')">
               <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="13" r="3"/><path d="M9.1 10.9 15 5M13 7l2 2M15.5 4.5l2 2"/></svg>
@@ -253,6 +261,52 @@
                           <span x-text="rollbackBusyId === dep.ID ? 'Rolling back…' : 'Roll back'"></span>
                         </button>
                       </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <!-- Replicas -->
+          <section class="panel" x-show="activeTab === 'replicas'" x-cloak>
+            <h2>Replicas &amp; load balancing</h2>
+            <p class="hint">Caddy round-robins across every healthy replica below and pulls a failing one from rotation while it heals in place, on its own node — see <a href="#" @click.prevent="openHealth()">Health</a>. Not available for compose apps or apps with backing services.</p>
+
+            <div class="scale-panel">
+              <div class="scale-control">
+                <button type="button" class="scale-btn" @click="scaleBy(-1)" :disabled="scaleBusy || currentReplicas <= 1" aria-label="Scale down by one replica" title="Scale down by one replica">
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 10h10"/></svg>
+                </button>
+                <div class="scale-control__count">
+                  <span x-text="currentReplicas"></span>
+                  <span class="scale-control__label" x-text="currentReplicas === 1 ? 'replica' : 'replicas'"></span>
+                </div>
+                <button type="button" class="scale-btn" @click="scaleBy(1)" :disabled="scaleBusy || currentReplicas >= 50" aria-label="Scale up by one replica" title="Scale up by one replica">
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10 5v10M5 10h10"/></svg>
+                </button>
+              </div>
+              <span class="hint" x-show="scaleBusy" x-cloak>Scaling…</span>
+            </div>
+
+            <template x-if="!currentReplicaList.length">
+              <div class="state" style="padding: 30px 20px;">
+                <strong>No per-replica detail on record</strong>
+                <p>This deployment predates per-replica tracking, or this app has no deployment history yet — the count above still works.</p>
+              </div>
+            </template>
+
+            <div class="table-wrap" x-show="currentReplicaList.length">
+              <table class="table">
+                <thead>
+                  <tr><th>Node</th><th>Container</th><th>Upstream</th></tr>
+                </thead>
+                <tbody>
+                  <template x-for="(rep, i) in currentReplicaList" :key="i">
+                    <tr>
+                      <td><span class="tag" x-text="rep.node || 'local'"></span></td>
+                      <td class="mono" :title="rep.container_id" x-text="(rep.container_id || '').slice(0, 12) || '—'"></td>
+                      <td class="mono" x-text="rep.upstream || '—'"></td>
                     </tr>
                   </template>
                 </tbody>
@@ -773,6 +827,13 @@
                   <input id="git-req-mem" x-model="deploy.git.reqMemory" placeholder="512M" autocomplete="off" :disabled="deploy.busy">
                 </div>
               </div>
+              <div class="form-row">
+                <div class="field">
+                  <label for="git-replicas">Replicas (optional)</label>
+                  <input id="git-replicas" type="number" min="1" max="50" x-model="deploy.git.replicas" placeholder="1" autocomplete="off" :disabled="deploy.busy">
+                </div>
+              </div>
+              <p class="hint" style="margin:2px 0 0;" x-show="deploy.git.replicas > 1">Load-balanced across replicas spread onto distinct nodes; not available with backing services or compose apps.</p>
 
               <div class="subhead">Environment</div>
               <template x-for="(row, i) in deploy.git.env" :key="i">
@@ -907,6 +968,13 @@
                   <input id="builder-req-mem" x-model="deploy.builder.reqMemory" placeholder="512M" autocomplete="off" :disabled="deploy.busy">
                 </div>
               </div>
+              <div class="form-row">
+                <div class="field">
+                  <label for="builder-replicas">Replicas (optional)</label>
+                  <input id="builder-replicas" type="number" min="1" max="50" x-model="deploy.builder.replicas" placeholder="1" autocomplete="off" :disabled="deploy.busy">
+                </div>
+              </div>
+              <p class="hint" style="margin:2px 0 0;" x-show="deploy.builder.replicas > 1">Load-balanced across replicas spread onto distinct nodes; not available with backing services or compose apps.</p>
 
               <div class="subhead">Environment</div>
               <template x-for="(row, i) in deploy.builder.env" :key="i">

@@ -27,6 +27,10 @@ type fakeDaemon struct {
 	rollbackResult *store.Deployment
 	rollbackErr    error
 
+	scaleResult *store.Deployment
+	scaleErr    error
+	scaleCalls  []scaleCall
+
 	removed   []string
 	removeErr error
 
@@ -71,6 +75,13 @@ type fakeDaemon struct {
 // on them (including agent_url) without a real daemon.
 type nodeAddCall struct {
 	Name, SSHHost, MeshAddr, AgentURL, Pool string
+}
+
+// scaleCall captures the arguments of one Scale call, so tests can assert on
+// them without a real daemon.
+type scaleCall struct {
+	Name     string
+	Replicas int
 }
 
 func newFakeDaemon() *fakeDaemon {
@@ -123,6 +134,17 @@ func (f *fakeDaemon) Rollback(ctx context.Context, name string) (*store.Deployme
 		return f.rollbackResult, nil
 	}
 	return &store.Deployment{App: name, Status: store.StatusRunning}, nil
+}
+
+func (f *fakeDaemon) Scale(ctx context.Context, name string, replicas int) (*store.Deployment, error) {
+	f.scaleCalls = append(f.scaleCalls, scaleCall{Name: name, Replicas: replicas})
+	if f.scaleErr != nil {
+		return nil, f.scaleErr
+	}
+	if f.scaleResult != nil {
+		return f.scaleResult, nil
+	}
+	return &store.Deployment{App: name, Status: store.StatusRunning, Replicas: make([]store.Replica, replicas)}, nil
 }
 
 func (f *fakeDaemon) Remove(ctx context.Context, name string) error {

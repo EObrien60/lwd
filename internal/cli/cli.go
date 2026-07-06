@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -48,6 +49,10 @@ func Run(args []string) int {
 		return runRm(args[1:])
 	case "rollback":
 		return runRollback(args[1:])
+	case "scale":
+		return runScale(args[1:])
+	case "status":
+		return runStatus(args[1:])
 	case "history":
 		return runHistory(args[1:])
 	case "secret":
@@ -188,38 +193,51 @@ func runDaemon() int {
 // buildInitialRoutes reconstructs the route set that should already be live
 // in a still-running Caddy container, from persisted deployment state, so a
 // restarting daemon can seed its in-memory Router (see Router.SeedRoutes)
-// before its startup reload runs. It considers every running "surface"
-// container, keeping only the one that matches the store's recorded current
-// (StatusRunning) deployment for its app — by container ID, not name, since
-// that's the durable link between a container and the deployment row that
-// produced it. Containers left over from an old, superseded deployment (e.g.
-// one the reconciler failed to remove) are skipped, as are apps with no
-// current deployment or no Domain configured. Routes are deduped by domain
-// (a domain can only have one current deployment at a time, so this is
-// mostly defensive).
+// before its startup reload runs. Apps with no current (StatusRunning)
+// deployment or no Domain configured are skipped. Routes are deduped by
+// domain (a domain can only have one current deployment at a time, so this
+// is mostly defensive).
+//
+// A Phase 12 deployment (cur.Replicas populated) seeds its route directly
+// from those recorded replicas: one router.Upstream per entry, using each
+// Replica's own Upstream/Port — already the exact value Caddy was told to
+// reverse_proxy to when the replica set went live (container name for a
+// local replica, the node's mesh address + published host port for a remote
+// one — see deployReplicaSet). This works even for a replica running on a
+// REMOTE node, which n (the local node) can never see via ListContainers,
+// and reproduces every upstream in a multi-replica set, not just one.
+//
+// A legacy (pre-Phase-12) row with no recorded Replicas falls back to the
+// original behavior: find a running local "surface" container whose ID
+// matches cur.ContainerID (the durable link between a container and the
+// deployment row that produced it) and seed a single upstream from its
+// container name. Containers left over from an old, superseded deployment
+// (e.g. one the reconciler failed to remove) are skipped this way. This
+// fallback path still only sees LOCAL containers — a pre-existing gap for a
+// legacy remote pin, left as-is here since every P12 row (any deployment
+// made after replica sets shipped) now goes through the Replicas-based path
+// above instead.
 func buildInitialRoutes(ctx context.Context, n node.Node, s *store.Store) ([]router.Route, error) {
 	containers, err := n.ListContainers(ctx, map[string]string{"lwd.role": "surface"})
 	if err != nil {
 		return nil, fmt.Errorf("list surface containers: %w", err)
 	}
+	runningByID := make(map[string]node.Container, len(containers))
+	for _, c := range containers {
+		if c.State == "running" {
+			runningByID[c.ID] = c
+		}
+	}
+
+	apps, err := s.ListApps()
+	if err != nil {
+		return nil, fmt.Errorf("list apps: %w", err)
+	}
 
 	routes := make(map[string]router.Route)
-	for _, c := range containers {
-		if c.State != "running" {
-			continue
-		}
-		app := c.Labels["lwd.app"]
-		if app == "" {
-			continue
-		}
-		cur, err := s.CurrentDeployment(app)
+	for _, appName := range apps {
+		cur, err := s.CurrentDeployment(appName)
 		if err != nil || cur == nil {
-			continue
-		}
-		if c.ID != cur.ContainerID {
-			// Not the current deployment's container (e.g. a stale surface
-			// left over from a failed swap) — skip it so we never seed a
-			// route pointing at the wrong container.
 			continue
 		}
 
@@ -231,10 +249,32 @@ func buildInitialRoutes(ctx context.Context, n node.Node, s *store.Store) ([]rou
 			continue
 		}
 
+		if len(cur.Replicas) > 0 {
+			upstreams := make([]router.Upstream, 0, len(cur.Replicas))
+			for _, rep := range cur.Replicas {
+				upstreams = append(upstreams, router.Upstream{Host: rep.Upstream, Port: rep.Port})
+			}
+			routes[a.Domain] = router.Route{
+				Domain:      a.Domain,
+				Upstreams:   upstreams,
+				TLSInternal: router.UseInternalTLS(a.Domain),
+			}
+			continue
+		}
+
+		// Legacy row: no recorded Replicas, so fall back to matching a
+		// running local surface container by ContainerID, exactly as before
+		// Phase 12.
+		c, ok := runningByID[cur.ContainerID]
+		if !ok {
+			// Not currently running locally (e.g. a stale/removed container,
+			// or a legacy remote pin this fallback can't see) — skip it so
+			// we never seed a route pointing at nothing.
+			continue
+		}
 		routes[a.Domain] = router.Route{
 			Domain:      a.Domain,
-			Upstream:    c.Name,
-			Port:        a.Port,
+			Upstreams:   []router.Upstream{{Host: c.Name, Port: a.Port}},
 			TLSInternal: router.UseInternalTLS(a.Domain),
 		}
 	}
@@ -273,9 +313,83 @@ func runLs() int {
 		fmt.Fprintln(os.Stderr, "ls:", err)
 		return 1
 	}
-	fmt.Printf("%-20s %-10s %-30s %s\n", "APP", "STATUS", "DOMAIN", "IMAGE")
+	fmt.Printf("%-20s %-10s %-30s %-9s %s\n", "APP", "STATUS", "DOMAIN", "REPLICAS", "IMAGE")
 	for _, a := range apps {
-		fmt.Printf("%-20s %-10s %-30s %s\n", a.Name, a.Status, a.Domain, a.Image)
+		fmt.Printf("%-20s %-10s %-30s %-9d %s\n", a.Name, a.Status, a.Domain, a.Replicas, a.Image)
+	}
+	return 0
+}
+
+// runScale implements `lwd scale <app> <replicas>`: it parses replicas as a
+// positive integer (rejecting anything else client-side, before ever calling
+// the daemon) and asks the daemon to redeploy the app set-based at that
+// count, preserving its current image/config exactly (see client.Scale).
+func runScale(args []string) int {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: lwd scale <app> <replicas>")
+		return 2
+	}
+	name := args[0]
+	n, err := strconv.Atoi(args[1])
+	if err != nil || n < 1 {
+		fmt.Fprintf(os.Stderr, "scale: replicas must be a positive integer, got %q\n", args[1])
+		return 2
+	}
+	dep, err := newClient().Scale(context.Background(), name, n)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "scale:", err)
+		return 1
+	}
+	fmt.Printf("scaled %s to %d replicas\n", dep.App, len(dep.Replicas))
+	return 0
+}
+
+// runStatus implements `lwd status <app>`: a single-app summary including
+// the current replica count and, when available from the app's history, the
+// node each replica currently runs on.
+func runStatus(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: lwd status <app>")
+		return 2
+	}
+	name := args[0]
+	apps, err := newClient().Apps(context.Background())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "status:", err)
+		return 1
+	}
+	var st *api.AppStatus
+	for i := range apps {
+		if apps[i].Name == name {
+			st = &apps[i]
+			break
+		}
+	}
+	if st == nil {
+		fmt.Fprintf(os.Stderr, "status: app %q not found\n", name)
+		return 1
+	}
+	fmt.Printf("app:      %s\n", st.Name)
+	fmt.Printf("status:   %s\n", st.Status)
+	fmt.Printf("image:    %s\n", st.Image)
+	fmt.Printf("domain:   %s\n", st.Domain)
+	fmt.Printf("replicas: %d\n", st.Replicas)
+
+	// Best-effort: per-replica node detail comes from the current
+	// deployment's Replicas slice, fetched via History. A failure here (or
+	// a legacy deployment with no recorded Replicas) just means the extra
+	// detail is skipped — the summary above already answered the question.
+	if deps, err := newClient().History(context.Background(), name); err == nil {
+		for _, d := range deps {
+			if d.Status != store.StatusRunning || len(d.Replicas) == 0 {
+				continue
+			}
+			fmt.Println("nodes:")
+			for _, rep := range d.Replicas {
+				fmt.Printf("  %-20s %s\n", rep.Node, rep.ContainerID)
+			}
+			break
+		}
 	}
 	return 0
 }

@@ -509,6 +509,74 @@ button { cursor: pointer; }
   white-space: nowrap;
 }
 
+/* tag-replicas flags a load-balanced (N>1) surface wherever the plain .tag
+   image/version chip appears (overview card, detail header) — tinted with
+   the same amber "signal" used for in-progress/attention states elsewhere,
+   since more than one replica is the interesting, above-baseline case. */
+.tag-replicas {
+  color: var(--signal);
+  border-color: color-mix(in srgb, var(--signal) 35%, var(--line-soft));
+  background: var(--signal-pill-bg);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Replicas & scale control (Phase 12)                                    */
+/* ---------------------------------------------------------------------- */
+
+.scale-panel {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.scale-control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg-1);
+}
+
+.scale-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--bg-3);
+  color: var(--ink-1);
+  transition: transform 0.15s var(--ease), border-color 0.15s var(--ease), color 0.15s var(--ease);
+}
+.scale-btn:hover { border-color: var(--signal); color: var(--signal); transform: translateY(-1px); }
+.scale-btn:active { transform: translateY(0); }
+.scale-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; border-color: var(--line); color: var(--ink-1); }
+.scale-btn svg { width: 14px; height: 14px; }
+
+.scale-control__count {
+  min-width: 6ch;
+  text-align: center;
+  font-family: var(--font-mono);
+}
+.scale-control__count > span:first-child {
+  display: block;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--ink-0);
+  line-height: 1;
+}
+.scale-control__label {
+  display: block;
+  margin-top: 2px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-3);
+}
+
 /* ---------------------------------------------------------------------- */
 /* Node lifecycle (drain / evacuate / uncordon)                           */
 /* ---------------------------------------------------------------------- */
@@ -626,6 +694,17 @@ button { cursor: pointer; }
 .tab.active { color: var(--signal); border-color: var(--signal); }
 .tab svg { width: 14px; height: 14px; }
 
+.tab-badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 3px 5px;
+  border-radius: 5px;
+  background: var(--signal-pill-bg);
+  color: var(--signal);
+}
+
 .panel {
   background: var(--bg-2);
   border: 1px solid var(--line);
@@ -641,6 +720,7 @@ button { cursor: pointer; }
   color: var(--ink-0);
 }
 .panel .hint { margin: 0 0 16px; color: var(--ink-3); font-size: 13px; }
+.panel .hint a { color: var(--signal); text-decoration: underline; text-underline-offset: 2px; }
 
 /* ---------------------------------------------------------------------- */
 /* Logs                                                                    */

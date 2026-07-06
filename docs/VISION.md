@@ -184,9 +184,36 @@ Everything on plain Linux. WireGuard mesh. No custom kernel/init/fs, no service 
   node installs are completely unaffected (nothing registered to fail over).
   See `README.md`'s [Node maintenance &
   failover](../README.md#node-maintenance--failover) section.
-- **P12 — next — Surface replicas + LB:** `lwd scale api N`; Caddy load-balances across healthy
-  replicas; blue/green across the replica set. Human scaling only (no autoscaler).
-- **P13 — Multi-edge routing:** N Caddy edges + DNS round-robin; edge-failure resilience.
+- **P12 — DONE (merged) — Surface replicas + LB:** `spec.App.Replicas`
+  (1-50, image/git apps only — rejected together with `compose` or
+  `[[services]]`, since backing services run pinned on a single node) +
+  `store.Deployment.Replicas`/`store.Replica` (per-replica node/container/
+  upstream); a multi-upstream `router.Route` (round-robin + passive
+  `fail_duration` health across every replica for N>1, byte-identical
+  Caddyfile for N=1 — the non-regression contract holds throughout); a
+  set-based blue-green deploy (`deployReplicaSet`) that spreads replicas one
+  per node (falling back to sharing nodes if there aren't enough) via the
+  same `placeReplicas`/`placeExcludingSet` scheduler primitives P11a/P11b
+  already established, gates the WHOLE new set on every replica healthy
+  before flipping the route, and retires every old replica on ITS OWN node;
+  per-replica self-heal (`tryHealReplicas` — a dead replica is recreated in
+  place on its own node, the others untouched) and per-replica failover
+  (`EvacuateNode` moves only the replicas actually on the lost node); human
+  scaling only (no autoscaler) via `lwd scale <app> <replicas>` + `POST
+  /apps/{name}/scale` + `client.Scale` (reuses the current deployment's spec
+  snapshot — only `Replicas` changes) — surfaced in `lwd-web`'s app detail
+  (a **Replicas** tab: live count, per-replica node/container/upstream
+  table, a scale up/down control) and the Deploy modal (an optional
+  `replicas` field), and `lwd-mcp`'s `lwd_scale` tool plus an optional
+  `replicas` argument on `lwd_apply`/`lwd_deploy_git`
+  (`lwd_status`/`lwd_list` already carried `api.AppStatus.Replicas`).
+  Legacy pre-Phase-12 deployment rows (empty `Replicas`) fall back to the
+  original single-container heal/remove/rollback paths unchanged.
+  Single-node, N=1 behavior is a byte-identical no-op throughout. See
+  `README.md`'s [Replicas & load
+  balancing](../README.md#replicas--load-balancing) section.
+- **P13 — next — Multi-edge routing:** N Caddy edges + DNS round-robin;
+  edge-failure resilience.
 - **P14 — Resource drivers (single-mode):** postgres/valkey/minio/volume/backup as
   first-class drivers with lifecycle; single node, local disk.
 - **P15 — Resource HA + backups:** Patroni Postgres, driver-level failover, scheduled

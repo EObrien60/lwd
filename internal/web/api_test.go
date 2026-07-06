@@ -58,6 +58,26 @@ func TestApiApps(t *testing.T) {
 	}
 }
 
+// TestApiAppsIncludesReplicas covers Phase 12 Task 8: GET /api/apps passes
+// api.AppStatus.Replicas straight through (no web-layer transformation), so
+// the frontend's replica count/scale control has something to render.
+func TestApiAppsIncludesReplicas(t *testing.T) {
+	fd := newFakeDaemon()
+	fd.apps = []api.AppStatus{
+		{Name: "blog", Image: "img:1", Status: store.StatusRunning, Domain: "blog.example.com", Replicas: 3},
+	}
+	srv, auth := testServer(fd)
+
+	rec := do(srv, authedRequest(t, auth, http.MethodGet, "/api/apps", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"replicas":3`) {
+		t.Fatalf("body = %s, want it to contain \"replicas\":3", rec.Body)
+	}
+}
+
 func TestApiAppDetail(t *testing.T) {
 	fd := newFakeDaemon()
 	fd.apps = []api.AppStatus{
@@ -289,6 +309,63 @@ func TestApiRollbackError(t *testing.T) {
 	}
 }
 
+// TestApiScale covers POST /api/apps/{name}/scale: it decodes the JSON
+// {"replicas": N} body, proxies client.Scale, and renders the resulting
+// store.Deployment — mirroring rollback/redeploy's shape.
+func TestApiScale(t *testing.T) {
+	fd := newFakeDaemon()
+	fd.scaleResult = &store.Deployment{App: "blog", Image: "img:1", Status: store.StatusRunning, Replicas: make([]store.Replica, 3)}
+	srv, auth := testServer(fd)
+
+	body := strings.NewReader(`{"replicas": 3}`)
+	req := authedRequest(t, auth, http.MethodPost, "/api/apps/blog/scale", body)
+	rec := do(srv, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+	var dep store.Deployment
+	if err := json.Unmarshal(rec.Body.Bytes(), &dep); err != nil {
+		t.Fatalf("unmarshal: %v (body %s)", err, rec.Body)
+	}
+	if len(dep.Replicas) != 3 {
+		t.Fatalf("dep.Replicas = %+v, want len 3", dep.Replicas)
+	}
+	if len(fd.scaleCalls) != 1 || fd.scaleCalls[0].Name != "blog" || fd.scaleCalls[0].Replicas != 3 {
+		t.Fatalf("scaleCalls = %+v, want one call for blog with replicas=3", fd.scaleCalls)
+	}
+}
+
+func TestApiScaleError(t *testing.T) {
+	fd := newFakeDaemon()
+	fd.scaleErr = errString("replicas must be >= 1")
+	srv, auth := testServer(fd)
+
+	req := authedRequest(t, auth, http.MethodPost, "/api/apps/blog/scale", strings.NewReader(`{"replicas": 0}`))
+	rec := do(srv, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+}
+
+// TestApiScaleRequiresAuth covers that POST /api/apps/{name}/scale, like
+// every other /api route, 401s without a valid session cookie.
+func TestApiScaleRequiresAuth(t *testing.T) {
+	fd := newFakeDaemon()
+	srv, _ := testServer(fd)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/apps/blog/scale", strings.NewReader(`{"replicas": 3}`))
+	rec := do(srv, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+	if len(fd.scaleCalls) != 0 {
+		t.Fatalf("want Scale never called when unauthed, got %+v", fd.scaleCalls)
+	}
+}
+
 func TestApiRedeploy(t *testing.T) {
 	appJSON, err := json.Marshal(&spec.App{Name: "foo", Image: "img:2", Port: 80})
 	if err != nil {
@@ -312,6 +389,68 @@ func TestApiRedeploy(t *testing.T) {
 	}
 	if fd.applied[0].Image != "img:2" {
 		t.Fatalf("applied = %+v, want newest (img:2)", fd.applied[0])
+	}
+}
+
+// TestApiRedeployScheduledAppClearsNode covers the P12 final-review FIX 3:
+// redeploying a SCHEDULER-PLACED app must not replay the stored snapshot's
+// concrete Node verbatim. The newest deployment's Spec already carries the
+// concrete node the scheduler chose at deploy time (applyImageProvenance
+// sets app.Node = chosen before recording it) — replaying it as-is would
+// make the daemon's resolvePlacement see a non-empty Node and misclassify a
+// scheduled app as pinned, collapsing it onto one node and losing
+// Scheduled=true (disabling node-loss failover). handleRedeploy must clear
+// Node before calling Apply when history[0].Scheduled is true.
+func TestApiRedeployScheduledAppClearsNode(t *testing.T) {
+	appJSON, err := json.Marshal(&spec.App{Name: "foo", Image: "img:2", Port: 80, Node: "web1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd := newFakeDaemon()
+	fd.history["foo"] = []store.Deployment{
+		{ID: 2, App: "foo", Image: "img:2", Spec: string(appJSON), Scheduled: true},
+	}
+	srv, auth := testServer(fd)
+
+	req := authedRequest(t, auth, http.MethodPost, "/api/apps/foo/redeploy", nil)
+	rec := do(srv, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+	if len(fd.applied) != 1 {
+		t.Fatalf("applied count = %d, want 1", len(fd.applied))
+	}
+	if fd.applied[0].Node != "" {
+		t.Fatalf("applied Node = %q, want cleared (scheduled app must re-invoke the scheduler on redeploy)", fd.applied[0].Node)
+	}
+}
+
+// TestApiRedeployPinnedAppKeepsNode covers FIX 3's other branch: a PINNED
+// app's newest deployment has Scheduled == false, so handleRedeploy must
+// leave the snapshot's explicit Node untouched.
+func TestApiRedeployPinnedAppKeepsNode(t *testing.T) {
+	appJSON, err := json.Marshal(&spec.App{Name: "foo", Image: "img:2", Port: 80, Node: "web1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd := newFakeDaemon()
+	fd.history["foo"] = []store.Deployment{
+		{ID: 2, App: "foo", Image: "img:2", Spec: string(appJSON), Scheduled: false},
+	}
+	srv, auth := testServer(fd)
+
+	req := authedRequest(t, auth, http.MethodPost, "/api/apps/foo/redeploy", nil)
+	rec := do(srv, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+	if len(fd.applied) != 1 {
+		t.Fatalf("applied count = %d, want 1", len(fd.applied))
+	}
+	if fd.applied[0].Node != "web1" {
+		t.Fatalf("applied Node = %q, want web1 (pinned app must stay pinned)", fd.applied[0].Node)
 	}
 }
 

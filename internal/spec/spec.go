@@ -79,6 +79,14 @@ type App struct {
 	Secrets []string          `toml:"secrets"`
 	Health  Health            `toml:"health"`
 
+	// Replicas is the number of surface replicas to run for this app (Phase
+	// 12). Parse defaults an unset (0) value to 1, so a bare struct literal
+	// built without going through Parse must set this explicitly to pass
+	// Validate. Load-balanced across replicas via the router (N=1 degrades
+	// to today's single-container behavior byte-for-byte). Not supported for
+	// compose apps.
+	Replicas int `toml:"replicas"`
+
 	// Requirements declares resource needs used by the scheduler to pick a
 	// node/pool when Node is unset. Nil means no requirements declared.
 	Requirements *Requirements `toml:"requirements"`
@@ -184,6 +192,9 @@ func Parse(data []byte) (*App, error) {
 	}
 	if a.Health.Timeout == 0 {
 		a.Health.Timeout = 30 * time.Second
+	}
+	if a.Replicas == 0 {
+		a.Replicas = 1
 	}
 	return &a, nil
 }
@@ -322,6 +333,37 @@ func (a *App) Validate() error {
 		if a.Port == 0 {
 			return fmt.Errorf("port is required")
 		}
+	}
+
+	// Replicas validation applies to all app types, checked after the
+	// shape-specific block above so a compose app that's already invalid for
+	// another reason (missing service/domain/port, remote node, ...) reports
+	// that error rather than a replicas one. Replicas == 0 means "unset" and
+	// is VALID here (not an error): Parse normalizes a fresh spec's 0 to 1,
+	// but a spec.App reconstructed from a pre-Phase-12 deployment snapshot
+	// (which had no "replicas" field, so it JSON-unmarshals to 0) is
+	// re-validated by heal (healSurfaceLocked) and rollback
+	// (rollbackGit/rollbackImage) — rejecting 0 would make healing or
+	// rolling back any existing pre-12 deployment fail after this upgrade.
+	// Only a negative count is a real error. Consumers that USE Replicas as
+	// a count must treat <= 0 as 1 (Phase 12 Task 4's deployReplicaSet).
+	if a.Replicas < 0 {
+		return fmt.Errorf("replicas must be >= 0")
+	}
+	if a.Replicas > 50 {
+		return fmt.Errorf("replicas must be <= 50")
+	}
+	if a.Replicas > 1 && a.Compose != "" {
+		return fmt.Errorf("replicas not supported for compose apps")
+	}
+	// Phase 12 Task 5's backing guard: backing [[services]] run PINNED on a
+	// single node's per-app network (RenderBackingCompose/ensureBacking), so
+	// a multi-node replica set has no way to reach it from every node — only
+	// the anchor replica's node would ever be on that network. Checked here
+	// (rather than folded into the Services validation block below) so it
+	// fires regardless of Services ordering/validity.
+	if a.Replicas > 1 && len(a.Services) > 0 {
+		return fmt.Errorf("replicas not supported with backing [[services]] (backing runs on a single node; use replicas=1)")
 	}
 
 	// Services validation (allowed on image and git apps, not on compose)

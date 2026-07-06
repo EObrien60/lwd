@@ -1049,6 +1049,206 @@ func TestMigrationFromPreScheduledSchema(t *testing.T) {
 	}
 }
 
+// TestDeploymentReplicasRoundTrip covers Phase 12 Task 2: RecordDeployment
+// with a multi-Replica slice persists it, and CurrentDeployment/
+// PreviousDeployment/DeploymentsForApp all decode it back intact; a
+// deployment recorded with no Replicas round-trips to nil (not an empty
+// non-nil slice).
+func TestDeploymentReplicasRoundTrip(t *testing.T) {
+	s := openTemp(t)
+
+	replicas := []Replica{
+		{ContainerID: "c1", Node: "local", Upstream: "10.0.0.1:8080", Port: 8080},
+		{ContainerID: "c2", Node: "web1", Upstream: "10.0.0.2:8080", Port: 8080},
+		{ContainerID: "c3", Node: "web2", Upstream: "10.0.0.3:8080", Port: 8080},
+	}
+	if _, err := s.RecordDeployment(Deployment{
+		App: "blog", Image: "img:1", ContainerID: "c1",
+		Status: StatusRunning, CreatedAt: time.Now(), Replicas: replicas,
+	}); err != nil {
+		t.Fatalf("RecordDeployment: %v", err)
+	}
+
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil {
+		t.Fatal("CurrentDeployment returned nil")
+	}
+	if len(cur.Replicas) != 3 {
+		t.Fatalf("CurrentDeployment.Replicas len = %d, want 3", len(cur.Replicas))
+	}
+	for i, want := range replicas {
+		if cur.Replicas[i] != want {
+			t.Errorf("CurrentDeployment.Replicas[%d] = %+v, want %+v", i, cur.Replicas[i], want)
+		}
+	}
+
+	if err := s.SetStatus(cur.ID, StatusRetired); err != nil {
+		t.Fatalf("SetStatus: %v", err)
+	}
+	prev, err := s.PreviousDeployment("blog")
+	if err != nil {
+		t.Fatalf("PreviousDeployment: %v", err)
+	}
+	if prev == nil || len(prev.Replicas) != 3 {
+		t.Fatalf("PreviousDeployment.Replicas = %+v, want 3 replicas", prev)
+	}
+
+	// A deployment recorded with no Replicas round-trips to nil.
+	if _, err := s.RecordDeployment(Deployment{
+		App: "blog", Image: "img:2", ContainerID: "c4",
+		Status: StatusRunning, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("RecordDeployment (no replicas): %v", err)
+	}
+	cur2, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment (no replicas): %v", err)
+	}
+	if cur2 == nil {
+		t.Fatal("CurrentDeployment (no replicas) returned nil")
+	}
+	if cur2.Replicas != nil {
+		t.Errorf("CurrentDeployment.Replicas = %+v, want nil", cur2.Replicas)
+	}
+
+	all, err := s.DeploymentsForApp("blog")
+	if err != nil {
+		t.Fatalf("DeploymentsForApp: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("DeploymentsForApp len = %d, want 2", len(all))
+	}
+	// Newest first: all[0] is the just-recorded no-replicas row, all[1] the
+	// original 3-replica row.
+	if all[0].Replicas != nil {
+		t.Errorf("DeploymentsForApp[0].Replicas = %+v, want nil", all[0].Replicas)
+	}
+	if len(all[1].Replicas) != 3 {
+		t.Errorf("DeploymentsForApp[1].Replicas len = %d, want 3", len(all[1].Replicas))
+	}
+}
+
+// TestUpdateReplicas covers Phase 12 Task 5's per-replica self-heal
+// persistence primitive: UpdateReplicas overwrites an existing row's
+// Replicas and ContainerID IN PLACE — same row id, same status — rather than
+// inserting a new generation, so a heal that only replaced one dead replica
+// doesn't touch the deployment's history the way a fresh
+// RecordDeployment+SetStatus(retired) pair would.
+func TestUpdateReplicas(t *testing.T) {
+	s := openTemp(t)
+
+	original := []Replica{
+		{ContainerID: "c1", Node: "local", Upstream: "lwd-blog-1-0", Port: 8080},
+		{ContainerID: "c2", Node: "web1", Upstream: "10.0.0.2:30001", Port: 30001},
+	}
+	id, err := s.RecordDeployment(Deployment{
+		App: "blog", Image: "img:1", ContainerID: "c1",
+		Status: StatusRunning, CreatedAt: time.Now(), Replicas: original,
+	})
+	if err != nil {
+		t.Fatalf("RecordDeployment: %v", err)
+	}
+
+	healed := []Replica{
+		original[0],
+		{ContainerID: "c2-healed", Node: "web1", Upstream: "10.0.0.2:30099", Port: 30099},
+	}
+	if err := s.UpdateReplicas(id, healed, healed[0].ContainerID); err != nil {
+		t.Fatalf("UpdateReplicas: %v", err)
+	}
+
+	cur, err := s.CurrentDeployment("blog")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil || cur.ID != id {
+		t.Fatalf("want the SAME row (id %d) still current, got %+v", id, cur)
+	}
+	if cur.Status != StatusRunning {
+		t.Errorf("Status = %q, want unchanged running", cur.Status)
+	}
+	if cur.ContainerID != "c1" {
+		t.Errorf("ContainerID = %q, want unchanged c1 (kept in sync with Replicas[0])", cur.ContainerID)
+	}
+	if len(cur.Replicas) != 2 || cur.Replicas[1].ContainerID != "c2-healed" {
+		t.Fatalf("Replicas = %+v, want index 1 healed to c2-healed", cur.Replicas)
+	}
+	if cur.Replicas[0] != original[0] {
+		t.Errorf("Replicas[0] = %+v, want untouched %+v", cur.Replicas[0], original[0])
+	}
+
+	all, err := s.DeploymentsForApp("blog")
+	if err != nil {
+		t.Fatalf("DeploymentsForApp: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("DeploymentsForApp len = %d, want 1 (heal must not insert a new row)", len(all))
+	}
+}
+
+// TestMigrationFromPreReplicasSchema covers Phase 12 Task 2: a pre-12
+// deployments table (no replicas column) migrates cleanly on Open, and an
+// existing row decodes to a nil Replicas.
+func TestMigrationFromPreReplicasSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lwd.db")
+
+	rawDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+
+	oldSchema := `
+	CREATE TABLE deployments (
+		id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		app          TEXT    NOT NULL,
+		image        TEXT    NOT NULL,
+		container_id TEXT    NOT NULL,
+		status       TEXT    NOT NULL,
+		created_at   INTEGER NOT NULL,
+		spec         TEXT    NOT NULL DEFAULT '',
+		compose      TEXT    NOT NULL DEFAULT '',
+		scheduled    INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE INDEX idx_deployments_app ON deployments(app);
+	`
+	if _, err := rawDB.Exec(oldSchema); err != nil {
+		rawDB.Close()
+		t.Fatalf("create old schema: %v", err)
+	}
+
+	if _, err := rawDB.Exec(
+		`INSERT INTO deployments (app, image, container_id, status, created_at, spec, compose, scheduled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"legacy", "img:0", "c0", StatusRunning, time.Now().Unix(), "", "", 0,
+	); err != nil {
+		rawDB.Close()
+		t.Fatalf("insert legacy row: %v", err)
+	}
+
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close raw DB: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (migrated): %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	cur, err := s.CurrentDeployment("legacy")
+	if err != nil {
+		t.Fatalf("CurrentDeployment: %v", err)
+	}
+	if cur == nil {
+		t.Fatalf("CurrentDeployment returned nil, want legacy row")
+	}
+	if cur.Replicas != nil {
+		t.Fatalf("CurrentDeployment.Replicas = %+v, want nil for migrated row", cur.Replicas)
+	}
+}
+
 func TestDeleteNode(t *testing.T) {
 	s := openTemp(t)
 	n := Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", CreatedAt: time.Now()}

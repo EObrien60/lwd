@@ -442,7 +442,7 @@ func (r *Reconciler) applyImageProvenance(ctx context.Context, app *spec.App, sc
 		return nil, fmt.Errorf("ensure backing: %w", err)
 	}
 
-	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr, scheduled)
+	return r.deployReplicaSet(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr, scheduled)
 }
 
 // applyGit deploys a git-built app: clone the declared ref with the box's
@@ -588,7 +588,7 @@ func (r *Reconciler) applyGit(ctx context.Context, app *spec.App) (*store.Deploy
 		}
 	}
 
-	return r.deployBlueGreenSurface(ctx, n, app, tag, env, network, composeContent, specJSON, isLocal, meshAddr, scheduled)
+	return r.deployReplicaSet(ctx, n, app, tag, env, network, composeContent, specJSON, isLocal, meshAddr, scheduled)
 }
 
 // rollbackGit redeploys app (a git-built app's spec snapshot, with Image
@@ -703,7 +703,7 @@ func (r *Reconciler) rollbackGitLocked(ctx context.Context, app *spec.App, sched
 		}
 	}
 
-	return r.deployBlueGreenSurface(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr, scheduled)
+	return r.deployReplicaSet(ctx, n, app, app.Image, env, network, composeContent, specJSON, isLocal, meshAddr, scheduled)
 }
 
 // rollbackImage redeploys app (a restored plain image app's spec snapshot —
@@ -856,129 +856,274 @@ func (r *Reconciler) ensureBacking(ctx context.Context, n node.Node, app *spec.A
 	return net, yamlContent, nil
 }
 
-// deployBlueGreenSurface runs the shared back half of an image or git deploy:
-// start a new surface container under image, connect it to backingNetwork
-// (if non-empty), stage it behind a throwaway host, health-check it, flip
-// the live route, retire the old surface, and record a StatusRunning
-// deployment (with composeContent, if any, so Remove/Rollback know a backing
-// project exists). On any failure, the attempt is torn down and recorded
-// StatusFailed; the live route and any previously-running deployment are
-// left completely untouched (blue-green's isolation guarantee). Callers must
-// hold r.mu, have already validated the spec, ensured the router/lwd network,
-// resolved secrets into env, and ensured backing services.
+// replicaTarget is the resolved placement of one replica in a set-based
+// deploy (deployReplicaSet): the node name ("local" or a registered node
+// name, matching store.Replica.Node), its node.Node handle, and the
+// ResolveMeta metadata deployReplicaSet needs to expose it to Caddy exactly
+// like the single-surface path always has (see deployReplicaSet's doc).
+type replicaTarget struct {
+	name     string
+	n        node.Node
+	meshAddr string
+	isLocal  bool
+}
+
+// deployReplicaSet runs the shared back half of an image or git deploy,
+// generalized (Phase 12 Task 4) from a single container to a SET of
+// max(1, app.Replicas) replica containers behind one multi-upstream Caddy
+// route: start every replica, connect each to backingNetwork (if non-empty),
+// stage the WHOLE new set behind a throwaway host, health-gate EVERY
+// replica, flip the live route to the new set's upstreams, retire the OLD
+// set's containers (each on its own node — see below), and record a
+// StatusRunning deployment carrying the new Replicas (with composeContent,
+// if any, so Remove/Rollback know a backing project exists). On any failure,
+// whatever new containers were already started this generation are torn
+// down (each on its own node) and the attempt is recorded StatusFailed; the
+// live route and any previously-running deployment are left completely
+// untouched (blue-green's isolation guarantee, now set-wide). Callers must
+// hold r.mu, have already validated the spec, ensured the router/lwd network
+// on n, resolved secrets into env, and ensured backing services.
 //
-// isLocal and meshAddr (from the same ResolveMeta call that produced n)
-// decide how the surface is exposed to the central Caddy: a local surface
-// publishes no host port at all — Caddy reaches it by container name on the
-// shared lwd network, exactly as before Phase 9a. A remote surface instead
-// publishes an ephemeral host port bound to the node's mesh address (the
-// only address Caddy, running on the controller, can reach across nodes),
-// and Caddy's upstream becomes that meshAddr:port instead of the container
-// name.
+// n, isLocal, and meshAddr describe the FIRST ("anchor") replica's node —
+// resolved by the caller via the same ResolveMeta call it already uses for
+// ensureImage/ensureBacking/secrets, exactly as the pre-Phase-12
+// single-container deploy required. This is also how app.Node's snapshot
+// value (recorded in specJSON by the caller BEFORE this call) stays
+// consistent with Replicas[0].Node: both name the anchor.
+//
+// For app.Replicas <= 1 this is byte-identical to the old
+// deployBlueGreenSurface: exactly one container, named containerName(app,
+// deployID) with NO index suffix (so existing name-based test assertions
+// and any operational tooling keep working unchanged), one upstream.
+//
+// For app.Replicas > 1, replicas beyond the anchor are placed with the same
+// pinned/scheduled distinction resolvePlacement/placeReplicas already make:
+// scheduled (the anchor's OWN placement provenance, passed through
+// unchanged by the caller — see resolvePlacement) decides whether the extra
+// replicas spread across distinct OTHER nodes (via placeExcludingSet,
+// excluding the anchor and every node already chosen for an earlier
+// replica — falling back to the most-free node again if fewer schedulable
+// nodes than replicas remain, exactly like placeReplicas's own fallback) or
+// simply stack onto the anchor's own node (a pinned app's explicit "no
+// spread" — see placeReplicas's doc comment). Requirements (CPU/memory)
+// apply per replica, matching Phase 11a's single-container behavior.
+//
+// This is a deliberate, hand-kept-in-sync duplicate of placeReplicas's
+// replicas-1..n-1 loop, NOT a call to it — see placeReplicas's doc comment
+// (P12 final-review FIX 4) for why: the anchor (index 0) is already resolved
+// by the time this runs, so re-deriving it via placeReplicas would risk a
+// second, later scheduler.Place call picking a different node than the one
+// already ensured/recorded as app.Node.
 //
 // scheduled is placement provenance (Phase 11b): recorded verbatim as
-// Scheduled on the StatusRunning deployment this call produces. Callers pass
-// whatever resolvePlacement determined (applyImage/applyGit), or the
-// provenance carried forward from a restored snapshot (rollbackGitLocked).
-func (r *Reconciler) deployBlueGreenSurface(ctx context.Context, n node.Node, app *spec.App, image string, env map[string]string, backingNetwork, composeContent string, specJSON []byte, isLocal bool, meshAddr string, scheduled bool) (*store.Deployment, error) {
+// Scheduled on the StatusRunning deployment this call produces, and used
+// (as described above) to decide how replicas beyond the anchor are placed.
+// Callers pass whatever resolvePlacement determined (applyImage/applyGit),
+// or the provenance carried forward from a restored snapshot
+// (rollbackGitLocked).
+func (r *Reconciler) deployReplicaSet(ctx context.Context, n node.Node, app *spec.App, image string, env map[string]string, backingNetwork, composeContent string, specJSON []byte, isLocal bool, meshAddr string, scheduled bool) (*store.Deployment, error) {
 	deployID, err := r.store.NextDeployID()
 	if err != nil {
 		return nil, fmt.Errorf("next deploy id: %w", err)
 	}
-	name := containerName(app, deployID)
 	stageHost := stagingHost(deployID)
 
-	runSpec := node.RunSpec{
-		Name:  name,
-		Image: image,
-		Env:   env,
-		Labels: map[string]string{
-			"lwd.app":    app.Name,
-			"lwd.role":   "surface",
-			"lwd.deploy": strconv.FormatInt(deployID, 10),
-		},
-		Port:        app.Port,
-		Network:     lwdNetwork,
-		CPUs:        reqCPU(app),
-		MemoryBytes: reqMem(app),
-	}
-	if !isLocal {
-		// HostPort 0 asks the node to assign an ephemeral port; the actual
-		// bound port comes back on Container.HostPort below.
-		runSpec.Publish = []node.PortMapping{{HostIP: meshAddr, HostPort: 0, ContainerPort: app.Port}}
+	count := app.Replicas
+	if count < 1 {
+		count = 1
 	}
 
-	c, err := n.RunContainer(ctx, runSpec)
-	if err != nil {
-		return nil, fmt.Errorf("run container: %w", err)
-	}
+	// Resolve every replica's target node up front, before running any
+	// container: the anchor (index 0) is whatever the caller already
+	// resolved; replicas 1..count-1 (only reached when count > 1) are placed
+	// by the same spread-vs-stack rule placeReplicas uses, seeded with the
+	// anchor's node so they never double back onto it while spreading.
+	targets := make([]replicaTarget, 0, count)
+	targets = append(targets, replicaTarget{name: app.Node, n: n, meshAddr: meshAddr, isLocal: isLocal})
 
-	// upstream/upstreamPort are what Caddy is told to reverse_proxy to, for
-	// both the staging probe below and the live route on success: the
-	// container's name+declared port for a local surface (Caddy resolves the
-	// name on the shared network), or the node's mesh address + the
-	// container's freshly published host port for a remote one.
-	upstream := name
-	upstreamPort := app.Port
-	if !isLocal {
-		upstream = meshAddr
-		upstreamPort = c.HostPort
-	}
-
-	if backingNetwork != "" {
-		if err := n.ConnectContainerToNetwork(ctx, c.ID, backingNetwork); err != nil {
-			_ = n.RemoveContainer(ctx, c.ID)
-			return nil, fmt.Errorf("connect container to backing network: %w", err)
+	if count > 1 {
+		exclude := []string{app.Node}
+		for i := 1; i < count; i++ {
+			nodeName := app.Node
+			if scheduled {
+				next, perr := r.placeExcludingSet(ctx, app, exclude)
+				if perr != nil {
+					// Fewer schedulable nodes than replicas: stack this
+					// replica onto the most-free node overall rather than
+					// failing the whole deploy, exactly like placeReplicas.
+					next, perr = r.placeExcludingSet(ctx, app, nil)
+					if perr != nil {
+						return nil, fmt.Errorf("place replica %d: %w", i, perr)
+					}
+				}
+				nodeName = next
+				exclude = append(exclude, nodeName)
+			}
+			tn, tMeshAddr, _, tIsLocal, rerr := r.resolver.ResolveMeta(nodeName)
+			if rerr != nil {
+				return nil, fmt.Errorf("resolve node %q for replica %d: %w", nodeName, i, rerr)
+			}
+			if err := tn.EnsureNetwork(ctx, lwdNetwork); err != nil {
+				return nil, fmt.Errorf("ensure network on %q: %w", nodeName, err)
+			}
+			targets = append(targets, replicaTarget{name: nodeName, n: tn, meshAddr: tMeshAddr, isLocal: tIsLocal})
 		}
 	}
 
-	if err := r.router.SetStaging(ctx, stageHost, upstream, upstreamPort); err != nil {
-		_ = n.RemoveContainer(ctx, c.ID)
+	containers := make([]node.Container, 0, count)
+	replicas := make([]store.Replica, 0, count)
+	upstreams := make([]router.Upstream, 0, count)
+
+	for i, target := range targets {
+		// The anchor's image was already ensured by the caller (same
+		// rationale as EnsureNetwork above); every other replica's node is
+		// new to this deploy attempt and needs it ensured here.
+		if i > 0 {
+			if target.isLocal {
+				if err := target.n.EnsureImage(ctx, image); err != nil {
+					r.recordFailedReplicaSet(ctx, stageHost, targets, containers, app, image, specJSON, composeContent)
+					return nil, fmt.Errorf("ensure image on replica %d: %w", i, err)
+				}
+			} else {
+				if err := r.ensureImageOnNode(ctx, target.n, image); err != nil {
+					r.recordFailedReplicaSet(ctx, stageHost, targets, containers, app, image, specJSON, composeContent)
+					return nil, fmt.Errorf("ensure image on replica %d: %w", i, err)
+				}
+			}
+		}
+
+		name := containerName(app, deployID)
+		if count > 1 {
+			name = fmt.Sprintf("%s-%d", name, i)
+		}
+
+		runSpec := node.RunSpec{
+			Name:  name,
+			Image: image,
+			Env:   env,
+			Labels: map[string]string{
+				"lwd.app":     app.Name,
+				"lwd.role":    "surface",
+				"lwd.deploy":  strconv.FormatInt(deployID, 10),
+				"lwd.replica": strconv.Itoa(i),
+			},
+			Port:        app.Port,
+			Network:     lwdNetwork,
+			CPUs:        reqCPU(app),
+			MemoryBytes: reqMem(app),
+		}
+		if !target.isLocal {
+			// HostPort 0 asks the node to assign an ephemeral port; the
+			// actual bound port comes back on Container.HostPort below.
+			runSpec.Publish = []node.PortMapping{{HostIP: target.meshAddr, HostPort: 0, ContainerPort: app.Port}}
+		}
+
+		c, err := target.n.RunContainer(ctx, runSpec)
+		if err != nil {
+			r.recordFailedReplicaSet(ctx, stageHost, targets, containers, app, image, specJSON, composeContent)
+			return nil, fmt.Errorf("run container for replica %d: %w", i, err)
+		}
+		containers = append(containers, c)
+
+		// upstream/upstreamPort are what Caddy is told to reverse_proxy to,
+		// for both the staging probe below and the live route on success:
+		// the container's name+declared port for a local replica (Caddy
+		// resolves the name on the shared network), or the node's mesh
+		// address + the container's freshly published host port for a
+		// remote one — exactly today's single-surface upstream rule, per
+		// replica.
+		upstream := name
+		upstreamPort := app.Port
+		if !target.isLocal {
+			upstream = target.meshAddr
+			upstreamPort = c.HostPort
+		}
+
+		if backingNetwork != "" {
+			if err := target.n.ConnectContainerToNetwork(ctx, c.ID, backingNetwork); err != nil {
+				r.recordFailedReplicaSet(ctx, stageHost, targets, containers, app, image, specJSON, composeContent)
+				return nil, fmt.Errorf("connect replica %d to backing network: %w", i, err)
+			}
+		}
+
+		replicas = append(replicas, store.Replica{ContainerID: c.ID, Node: target.name, Upstream: upstream, Port: upstreamPort})
+		upstreams = append(upstreams, router.Upstream{Host: upstream, Port: upstreamPort})
+	}
+
+	if err := r.router.SetStaging(ctx, stageHost, upstreams); err != nil {
+		r.recordFailedReplicaSet(ctx, stageHost, targets, containers, app, image, specJSON, composeContent)
 		return nil, fmt.Errorf("set staging route: %w", err)
 	}
 
-	if healthErr := r.checkHealth(ctx, n, app, stageHost, c.ID); healthErr != nil {
-		// The prior running deployment (if any) is left completely untouched:
-		// its container keeps running and the live domain/route still points
-		// at it. Blue-green means a failed candidate never affects what's
-		// currently serving traffic, so we must not retire or otherwise mutate
-		// that row here.
-		r.recordFailedSurface(ctx, n, app, stageHost, c.ID, image, specJSON, composeContent)
-		return nil, fmt.Errorf("health check failed: %w", healthErr)
+	// All replicas must pass health-gating for the generation to go live: a
+	// partially-healthy set is a failed deploy, same isolation guarantee as
+	// the single-surface path, now applied set-wide. The prior running
+	// deployment (if any) is left completely untouched: its containers keep
+	// running and the live domain/route still points at them.
+	for i, target := range targets {
+		if healthErr := r.checkHealth(ctx, target.n, app, stageHost, containers[i].ID); healthErr != nil {
+			r.recordFailedReplicaSet(ctx, stageHost, targets, containers, app, image, specJSON, composeContent)
+			return nil, fmt.Errorf("health check failed for replica %d: %w", i, healthErr)
+		}
 	}
 
 	if err := r.router.SetRoute(ctx, router.Route{
 		Domain:      app.Domain,
-		Upstream:    upstream,
-		Port:        upstreamPort,
+		Upstreams:   upstreams,
 		TLSInternal: router.UseInternalTLS(app.Domain),
 	}); err != nil {
-		// The flip itself failed: undo the staging state and the new
+		// The flip itself failed: undo the staging state and every new
 		// container, and record the attempt as failed (same isolation
-		// guarantee as the health-failure branch above — the live domain,
-		// still pointing at the old container or unset if this is the first
-		// deploy, is unaffected, and the prior running deployment row is left
-		// untouched).
-		r.recordFailedSurface(ctx, n, app, stageHost, c.ID, image, specJSON, composeContent)
+		// guarantee as the health-failure branch above).
+		r.recordFailedReplicaSet(ctx, stageHost, targets, containers, app, image, specJSON, composeContent)
 		return nil, fmt.Errorf("set route: %w", err)
 	}
 	_ = r.router.RemoveStaging(ctx, stageHost)
 
-	// Retire and remove the old surface, if any, now that the new one is live.
+	// Retire and remove the OLD set, if any, now that the new one is live —
+	// each old replica removed on ITS OWN node (P11b's cross-node lesson,
+	// generalized to a set): a legacy pre-Phase-12 row (Replicas empty)
+	// falls back to its single ContainerID on the node its spec snapshot
+	// recorded. Best-effort, same rationale as retireOldSurfaceLocked
+	// (evacuate.go): an old replica's node that r.reach already knows is
+	// unreachable, or that no longer resolves at all (deregistered), is
+	// skipped — its container either dies with the node or doesn't exist to
+	// remove — rather than risk a hung remote call; the deployment row is
+	// still retired regardless.
 	if prev, perr := r.store.CurrentDeployment(app.Name); perr == nil && prev != nil {
-		_ = n.RemoveContainer(ctx, prev.ContainerID)
+		oldReplicas := prev.Replicas
+		if len(oldReplicas) == 0 && prev.ContainerID != "" {
+			oldReplicas = []store.Replica{{ContainerID: prev.ContainerID, Node: nodeFromSpec(prev.Spec)}}
+		}
+		for _, old := range oldReplicas {
+			oldNodeName := old.Node
+			if oldNodeName == "" {
+				oldNodeName = "local"
+			}
+			if r.reach != nil {
+				if _, ok := r.reach.Reachable(ctx, oldNodeName); !ok {
+					continue
+				}
+			}
+			oldNode, _, _, _, rerr := r.resolver.ResolveMeta(oldNodeName)
+			if rerr != nil {
+				continue
+			}
+			_ = oldNode.RemoveContainer(ctx, old.ContainerID)
+		}
 		_ = r.store.SetStatus(prev.ID, store.StatusRetired)
 	}
 
 	dep := store.Deployment{
 		App:         app.Name,
 		Image:       image,
-		ContainerID: c.ID,
+		ContainerID: replicas[0].ContainerID,
 		Status:      store.StatusRunning,
 		CreatedAt:   time.Now(),
 		Spec:        string(specJSON),
 		Compose:     composeContent,
 		Scheduled:   scheduled,
+		Replicas:    replicas,
 	}
 	id, err := r.store.RecordDeployment(dep)
 	if err != nil {
@@ -1003,23 +1148,35 @@ func (r *Reconciler) resetHeal(app string) {
 	delete(r.heal, app)
 }
 
-// recordFailedSurface tears down a failed blue-green candidate: it removes
-// the staging route (a no-op if already removed) and the new container, then
-// records a StatusFailed deployment carrying the attempt's Spec (and, if the
-// app declares backing services, its rendered Compose) snapshot. Errors from
-// cleanup and from recording are intentionally swallowed here — the caller
-// always returns its own wrapped error for the actual failure cause. The
-// prior running deployment/route is never touched by this helper, preserving
-// blue-green's isolation guarantee: a failed candidate, however it failed,
-// never affects what's currently serving traffic.
-func (r *Reconciler) recordFailedSurface(ctx context.Context, n node.Node, app *spec.App, stageHost, containerID, image string, specJSON []byte, composeContent string) {
+// recordFailedReplicaSet tears down a failed blue-green candidate generation:
+// it removes the staging route (a no-op if already removed) and every
+// already-started replica container, each on its OWN node (targets[i] pairs
+// with containers[i] by index — containers may be a prefix of targets if the
+// failure happened partway through starting the set), then records a
+// StatusFailed deployment carrying the attempt's Spec (and, if the app
+// declares backing services, its rendered Compose) snapshot, with
+// ContainerID set to the first replica that made it up (if any), for
+// debugging. Errors from cleanup and from recording are intentionally
+// swallowed here — the caller always returns its own wrapped error for the
+// actual failure cause. The prior running deployment/route is never touched
+// by this helper, preserving blue-green's isolation guarantee: a failed
+// candidate, however it failed, never affects what's currently serving
+// traffic.
+func (r *Reconciler) recordFailedReplicaSet(ctx context.Context, stageHost string, targets []replicaTarget, containers []node.Container, app *spec.App, image string, specJSON []byte, composeContent string) {
 	_ = r.router.RemoveStaging(ctx, stageHost)
-	_ = n.RemoveContainer(ctx, containerID)
+
+	var firstID string
+	for i, c := range containers {
+		_ = targets[i].n.RemoveContainer(ctx, c.ID)
+		if i == 0 {
+			firstID = c.ID
+		}
+	}
 
 	_, _ = r.store.RecordDeployment(store.Deployment{
 		App:         app.Name,
 		Image:       image,
-		ContainerID: containerID,
+		ContainerID: firstID,
 		Status:      store.StatusFailed,
 		CreatedAt:   time.Now(),
 		Spec:        string(specJSON),
@@ -1104,8 +1261,7 @@ func (r *Reconciler) applyCompose(ctx context.Context, app *spec.App) (*store.De
 	// flips to the freshly (re)created service before it's been proven ready.
 	if err := r.router.SetRoute(ctx, router.Route{
 		Domain:      app.Domain,
-		Upstream:    name,
-		Port:        app.Port,
+		Upstreams:   []router.Upstream{{Host: name, Port: app.Port}},
 		TLSInternal: router.UseInternalTLS(app.Domain),
 	}); err != nil {
 		r.recordComposeFailed(app, id, specJSON, string(content))
@@ -1293,52 +1449,64 @@ func (r *Reconciler) removeCompose(ctx context.Context, appName string, cur *sto
 	return r.store.SetStatus(cur.ID, store.StatusRetired)
 }
 
-// removeSingleService removes every container labeled lwd.app=appName, downs
-// the app's PINNED backing project if it had one (cur.Compose non-empty —
-// named volumes are intentionally left in place, data is not auto-destroyed),
-// removes the app's Caddy route (resolved from cur's Spec snapshot, if any),
-// and retires cur, if present. cur may be nil (nothing recorded for appName
-// yet) — removal still runs as a defensive cleanup of any stray containers.
-// The node it operates against is resolved from cur's Spec snapshot's Node
-// field (the node the app was actually placed on), defaulting to "local"
-// when cur is nil or carries no snapshot.
+// removeSingleService removes every container labeled lwd.app=appName on
+// EVERY node the app's current replica set actually runs on (Phase 12 Task
+// 5 — a multi-replica app spreads its containers across distinct nodes, and
+// removing by label only on the anchor node, as this used to do, would leave
+// every OTHER replica's container running and orphaned), downs the app's
+// PINNED backing project if it had one (cur.Compose non-empty — named
+// volumes are intentionally left in place, data is not auto-destroyed; a
+// backing project only ever runs on the anchor node, so it's downed there
+// exactly once), removes the app's Caddy route (resolved from cur's Spec
+// snapshot, if any), and retires cur, if present. cur may be nil (nothing
+// recorded for appName yet) — removal still runs as a defensive cleanup of
+// any stray containers on the local node.
 //
-// If that node no longer resolves (e.g. it was deregistered via `lwd node
+// The node(s) to operate against come from cur.Replicas — one per DISTINCT
+// node a replica is recorded on, anchor (Replicas[0]'s node) first. A
+// genuinely legacy pre-Phase-12 row (Replicas empty) falls back to
+// nodeFromSpec(cur.Spec), exactly as this used to work unconditionally;
+// "local" is the final fallback for a nil cur or a snapshot recording no
+// node at all.
+//
+// If a given node no longer resolves (e.g. it was deregistered via `lwd node
 // rm` after the app was deployed to it), remote container/backing teardown
-// is impossible — there is nothing left to talk to — but the app must still
-// be removable: the controller-side Caddy route is removed and the
-// deployment row is retired regardless, with only the node-side cleanup
-// skipped (logged, not failed). This mirrors removeCompose's and
+// on THAT node is impossible — there is nothing left to talk to — but this
+// must not stop the other nodes' containers from being removed, nor stop the
+// app from being removed overall: the controller-side Caddy route is removed
+// and the deployment row is retired regardless, with only that node's
+// cleanup skipped (logged, not failed). This mirrors removeCompose's and
 // RemoveRoute's own best-effort rationale below: an app should never be
 // stuck un-removable because of state that outlived its backing node.
 func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cur *store.Deployment) error {
 	var domain string
-	nodeName := "local"
+	nodeNames := replicaNodeNames(cur)
 	if cur != nil {
 		domain = domainFromSpec(cur.Spec)
-		if nn := nodeFromSpec(cur.Spec); nn != "" {
-			nodeName = nn
-		}
 	}
+	anchorNode := nodeNames[0]
 
-	// ResolveMeta (not plain Resolve): a PINNED backing project's teardown
-	// below needs the node's DOCKER_HOST too, to target the same remote
-	// daemon its Up originally ran against.
-	n, _, dockerHost, _, err := r.resolver.ResolveMeta(nodeName)
-	if err != nil {
-		log.Printf("remove %s: node %q no longer resolves (%v); skipping remote container/backing teardown, still removing route and retiring", appName, nodeName, err)
-	} else {
+	for _, nodeName := range nodeNames {
+		// ResolveMeta (not plain Resolve): a PINNED backing project's
+		// teardown below needs the node's DOCKER_HOST too, to target the
+		// same remote daemon its Up originally ran against.
+		n, _, dockerHost, _, err := r.resolver.ResolveMeta(nodeName)
+		if err != nil {
+			log.Printf("remove %s: node %q no longer resolves (%v); skipping container/backing teardown on it, still removing route and retiring", appName, nodeName, err)
+			continue
+		}
+
 		containers, err := n.ListContainers(ctx, map[string]string{"lwd.app": appName})
 		if err != nil {
-			return fmt.Errorf("list containers: %w", err)
+			return fmt.Errorf("list containers on %q: %w", nodeName, err)
 		}
 		for _, c := range containers {
 			if err := n.RemoveContainer(ctx, c.ID); err != nil {
-				return fmt.Errorf("remove container %s: %w", c.ID, err)
+				return fmt.Errorf("remove container %s on %q: %w", c.ID, nodeName, err)
 			}
 		}
 
-		if cur != nil && cur.Compose != "" {
+		if cur != nil && cur.Compose != "" && nodeName == anchorNode {
 			if err := r.downBacking(ctx, appName, cur.Compose, dockerHost); err != nil {
 				return err
 			}
@@ -1354,6 +1522,38 @@ func (r *Reconciler) removeSingleService(ctx context.Context, appName string, cu
 		return r.store.SetStatus(cur.ID, store.StatusRetired)
 	}
 	return nil
+}
+
+// replicaNodeNames returns the distinct node names cur's current replica set
+// actually runs on, anchor (Replicas[0]'s node, or nodeFromSpec for a legacy
+// row) always first: used by removeSingleService to remove every replica's
+// containers across however many nodes they're spread over, rather than only
+// the anchor's. cur may be nil (never recorded) — returns ["local"].
+func replicaNodeNames(cur *store.Deployment) []string {
+	if cur == nil {
+		return []string{"local"}
+	}
+
+	var names []string
+	seen := map[string]bool{}
+	add := func(n string) {
+		if n == "" {
+			n = "local"
+		}
+		if !seen[n] {
+			seen[n] = true
+			names = append(names, n)
+		}
+	}
+
+	if len(cur.Replicas) > 0 {
+		for _, rep := range cur.Replicas {
+			add(rep.Node)
+		}
+	} else {
+		add(nodeFromSpec(cur.Spec))
+	}
+	return names
 }
 
 // downBacking tears down a git/image app's PINNED backing project via

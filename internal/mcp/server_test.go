@@ -488,6 +488,132 @@ func TestToolRollback(t *testing.T) {
 	}
 }
 
+// TestToolScale covers Phase 12 Task 8's lwd_scale tool: {app, replicas} ->
+// client.Scale, annotated destructiveHint (it tears down and recreates
+// containers), and NOT readOnlyHint.
+func TestToolScale(t *testing.T) {
+	fc := newFakeClient()
+	fc.scaleResult = &store.Deployment{
+		App: "web", Image: "nginx:1.24", Status: store.StatusRunning,
+		ContainerID: "abc123", Replicas: []store.Replica{{}, {}, {}},
+	}
+	cs := connectTestServer(t, fc)
+
+	lr, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	tool := findTool(lr.Tools, "lwd_scale")
+	if tool == nil {
+		t.Fatalf("lwd_scale tool not registered; got %+v", lr.Tools)
+	}
+	if tool.Annotations == nil || tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint {
+		t.Errorf("lwd_scale should be annotated destructiveHint=true, got %+v", tool.Annotations)
+	}
+	if tool.Annotations.ReadOnlyHint {
+		t.Errorf("lwd_scale must not be annotated readOnlyHint=true, got %+v", tool.Annotations)
+	}
+
+	res := callTool(t, cs, "lwd_scale", map[string]any{"app": "web", "replicas": 3})
+	if res.IsError {
+		t.Fatalf("lwd_scale(web, 3) returned tool error: %+v", res.Content)
+	}
+	var out lwdScaleOutput
+	decodeStructured(t, res, &out)
+	if out.Name != "web" || out.Status != store.StatusRunning || out.Replicas != 3 {
+		t.Errorf("unexpected scale output: %+v", out)
+	}
+	if len(fc.scaleCalls) != 1 || fc.scaleCalls[0].Name != "web" || fc.scaleCalls[0].Replicas != 3 {
+		t.Fatalf("scaleCalls = %+v, want one call for web with replicas=3", fc.scaleCalls)
+	}
+
+	fc.scaleErr = fmt.Errorf("scale failed")
+	res = callTool(t, cs, "lwd_scale", map[string]any{"app": "web", "replicas": 1})
+	if !res.IsError {
+		t.Errorf("lwd_scale should surface a daemon error as a tool error, got %+v", res)
+	}
+}
+
+// TestToolApplyWithReplicas covers Phase 12 Task 8: lwd_apply's optional
+// replicas argument sets app.Replicas before Validate/Apply, alongside
+// node/pool/requirements.
+func TestToolApplyWithReplicas(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	res := callTool(t, cs, "lwd_apply", map[string]any{"toml": validSingleServiceToml, "replicas": 3})
+	if res.IsError {
+		t.Fatalf("lwd_apply(replicas) returned tool error: %+v", res.Content)
+	}
+	if len(fc.applied) != 1 {
+		t.Fatalf("expected Apply called once, got %d", len(fc.applied))
+	}
+	if fc.applied[0].Replicas != 3 {
+		t.Errorf("expected applied App.Replicas = 3, got %d", fc.applied[0].Replicas)
+	}
+
+	// Omitting replicas leaves the toml's own value (defaulted to 1 by
+	// spec.Parse) untouched.
+	res = callTool(t, cs, "lwd_apply", map[string]any{"toml": validSingleServiceToml})
+	if res.IsError {
+		t.Fatalf("lwd_apply(no replicas) returned tool error: %+v", res.Content)
+	}
+	if fc.applied[1].Replicas != 1 {
+		t.Errorf("expected applied App.Replicas = 1 (toml default) when omitted, got %d", fc.applied[1].Replicas)
+	}
+}
+
+// TestToolDeployGitWithReplicas covers Phase 12 Task 8: lwd_deploy_git's
+// optional replicas argument sets app.Replicas before Validate/Apply.
+func TestToolDeployGitWithReplicas(t *testing.T) {
+	fc := newFakeClient()
+	cs := connectTestServer(t, fc)
+
+	res := callTool(t, cs, "lwd_deploy_git", map[string]any{
+		"url": "https://github.com/example/app.git", "name": "app", "domain": "app.example.com", "port": 3000, "replicas": 3,
+	})
+	if res.IsError {
+		t.Fatalf("lwd_deploy_git(replicas) returned tool error: %+v", res.Content)
+	}
+	if len(fc.applied) != 1 {
+		t.Fatalf("expected Apply called once, got %d", len(fc.applied))
+	}
+	if fc.applied[0].Replicas != 3 {
+		t.Errorf("expected applied App.Replicas = 3, got %d", fc.applied[0].Replicas)
+	}
+}
+
+// TestToolStatusAndListIncludeReplicas covers Phase 12 Task 8: lwd_status
+// and lwd_list surface api.AppStatus.Replicas untouched — no mcp-layer
+// transformation needed, since it already rides through client.Apps/Status.
+func TestToolStatusAndListIncludeReplicas(t *testing.T) {
+	fc := newFakeClient()
+	fc.apps = []api.AppStatus{
+		{Name: "web", Image: "nginx:latest", Status: "running", Domain: "web.example.com", Replicas: 3},
+	}
+	cs := connectTestServer(t, fc)
+
+	res := callTool(t, cs, "lwd_list", map[string]any{})
+	if res.IsError {
+		t.Fatalf("lwd_list returned tool error: %+v", res.Content)
+	}
+	var listOut lwdListOutput
+	decodeStructured(t, res, &listOut)
+	if len(listOut.Apps) != 1 || listOut.Apps[0].Replicas != 3 {
+		t.Fatalf("lwd_list Apps = %+v, want one app with Replicas=3", listOut.Apps)
+	}
+
+	res = callTool(t, cs, "lwd_status", map[string]any{"name": "web"})
+	if res.IsError {
+		t.Fatalf("lwd_status returned tool error: %+v", res.Content)
+	}
+	var statusOut lwdStatusOutput
+	decodeStructured(t, res, &statusOut)
+	if statusOut.Status == nil || statusOut.Status.Replicas != 3 {
+		t.Fatalf("lwd_status Status = %+v, want Replicas=3", statusOut.Status)
+	}
+}
+
 func TestToolRemove(t *testing.T) {
 	fc := newFakeClient()
 	cs := connectTestServer(t, fc)

@@ -3,6 +3,7 @@ package reconciler
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -118,7 +119,7 @@ func TestReconcileHealsDeadSurface(t *testing.T) {
 	if !ok {
 		t.Fatalf("want a live route for %q after heal", app.Domain)
 	}
-	if route.Upstream == "" {
+	if len(route.Upstreams) == 0 || route.Upstreams[0].Host == "" {
 		t.Errorf("want live route upstream set, got %+v", route)
 	}
 
@@ -166,7 +167,7 @@ func TestReconcileHealthyNoop(t *testing.T) {
 	if postRun != preRun {
 		t.Errorf("want no new RunContainer call on healthy noop, pre=%d post=%d calls=%v", preRun, postRun, f.Calls)
 	}
-	if fr.Routes[app.Domain] != preRoute {
+	if !reflect.DeepEqual(fr.Routes[app.Domain], preRoute) {
 		t.Errorf("want route unchanged on healthy noop, got %+v want %+v", fr.Routes[app.Domain], preRoute)
 	}
 

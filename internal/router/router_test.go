@@ -14,14 +14,14 @@ func TestFakeRouterSetAndRemoveRoute(t *testing.T) {
 	ctx := context.Background()
 	fr := NewFakeRouter()
 
-	if err := fr.SetRoute(ctx, Route{Domain: "app.example.com", Upstream: "lwd-app-1", Port: 8080}); err != nil {
+	if err := fr.SetRoute(ctx, Route{Domain: "app.example.com", Upstreams: []Upstream{{Host: "lwd-app-1", Port: 8080}}}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 	r, ok := fr.Routes["app.example.com"]
 	if !ok {
 		t.Fatal("expected route to be recorded")
 	}
-	if r.Upstream != "lwd-app-1" || r.Port != 8080 {
+	if len(r.Upstreams) != 1 || r.Upstreams[0].Host != "lwd-app-1" || r.Upstreams[0].Port != 8080 {
 		t.Fatalf("unexpected route: %+v", r)
 	}
 
@@ -37,7 +37,7 @@ func TestFakeRouterSetAndRemoveStaging(t *testing.T) {
 	ctx := context.Background()
 	fr := NewFakeRouter()
 
-	if err := fr.SetStaging(ctx, "staging.local", "lwd-app-2", 3000); err != nil {
+	if err := fr.SetStaging(ctx, "staging.local", []Upstream{{Host: "lwd-app-2", Port: 3000}}); err != nil {
 		t.Fatalf("SetStaging: %v", err)
 	}
 	if !fr.Staging["staging.local"] {
@@ -86,7 +86,7 @@ func TestFakeRouterRecordsCalls(t *testing.T) {
 	fr := NewFakeRouter()
 
 	_ = fr.EnsureUp(ctx)
-	_ = fr.SetRoute(ctx, Route{Domain: "a.example.com", Upstream: "lwd-a-1", Port: 80})
+	_ = fr.SetRoute(ctx, Route{Domain: "a.example.com", Upstreams: []Upstream{{Host: "lwd-a-1", Port: 80}}})
 	_ = fr.Reload(ctx)
 
 	if len(fr.Calls) != 3 {
@@ -112,7 +112,7 @@ func TestCaddyRouterSetRouteRollsBackOnReloadFailure(t *testing.T) {
 	c := NewCaddyRouter(node.NewFake(), t.TempDir())
 	c.adminBaseURL = admin.URL
 
-	err := c.SetRoute(ctx, Route{Domain: "bad.example.com", Upstream: "lwd-bad-1", Port: 8080})
+	err := c.SetRoute(ctx, Route{Domain: "bad.example.com", Upstreams: []Upstream{{Host: "lwd-bad-1", Port: 8080}}})
 	if err == nil {
 		t.Fatal("expected SetRoute to fail when admin API returns 400")
 	}
@@ -126,7 +126,7 @@ func TestCaddyRouterSetRouteRollsBackOnReloadFailure(t *testing.T) {
 	defer good.Close()
 	c.adminBaseURL = good.URL
 
-	if err := c.SetRoute(ctx, Route{Domain: "good.example.com", Upstream: "lwd-good-1", Port: 9090}); err != nil {
+	if err := c.SetRoute(ctx, Route{Domain: "good.example.com", Upstreams: []Upstream{{Host: "lwd-good-1", Port: 9090}}}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 	if len(c.routes) != 1 {
@@ -189,14 +189,14 @@ func TestCaddyRouterSetAndRemoveRouteCommitOnSuccess(t *testing.T) {
 	c := NewCaddyRouter(node.NewFake(), t.TempDir())
 	c.adminBaseURL = admin.URL
 
-	if err := c.SetRoute(ctx, Route{Domain: "app.example.com", Upstream: "lwd-app-1", Port: 8080}); err != nil {
+	if err := c.SetRoute(ctx, Route{Domain: "app.example.com", Upstreams: []Upstream{{Host: "lwd-app-1", Port: 8080}}}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 	r, ok := c.routes["app.example.com"]
 	if !ok {
 		t.Fatal("expected route to be committed")
 	}
-	if r.Upstream != "lwd-app-1" || r.Port != 8080 {
+	if len(r.Upstreams) != 1 || r.Upstreams[0].Host != "lwd-app-1" || r.Upstreams[0].Port != 8080 {
 		t.Fatalf("unexpected route: %+v", r)
 	}
 
@@ -206,4 +206,54 @@ func TestCaddyRouterSetAndRemoveRouteCommitOnSuccess(t *testing.T) {
 	if _, ok := c.routes["app.example.com"]; ok {
 		t.Fatal("expected route to be removed after successful reload")
 	}
+}
+
+// TestRouteUpstreamsRoundTrip verifies that a multi-element Upstreams set
+// survives SetRoute -> committed-route lookup unchanged, in order, for both
+// the FakeRouter and the real CaddyRouter — proving Route.Upstreams is
+// treated as a set, not collapsed/reordered/truncated anywhere in the path.
+func TestRouteUpstreamsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	want := []Upstream{
+		{Host: "lwd-app-1", Port: 8080},
+		{Host: "lwd-app-2", Port: 8081},
+		{Host: "lwd-app-3", Port: 8082},
+	}
+
+	t.Run("FakeRouter", func(t *testing.T) {
+		fr := NewFakeRouter()
+		if err := fr.SetRoute(ctx, Route{Domain: "multi.example.com", Upstreams: want}); err != nil {
+			t.Fatalf("SetRoute: %v", err)
+		}
+		got := fr.Routes["multi.example.com"].Upstreams
+		if len(got) != len(want) {
+			t.Fatalf("got %d upstreams, want %d: %+v", len(got), len(want), got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("upstream[%d] = %+v, want %+v", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("CaddyRouter", func(t *testing.T) {
+		admin := stubAdminStatus(http.StatusOK)
+		defer admin.Close()
+
+		c := NewCaddyRouter(node.NewFake(), t.TempDir())
+		c.adminBaseURL = admin.URL
+
+		if err := c.SetRoute(ctx, Route{Domain: "multi.example.com", Upstreams: want}); err != nil {
+			t.Fatalf("SetRoute: %v", err)
+		}
+		got := c.routes["multi.example.com"].Upstreams
+		if len(got) != len(want) {
+			t.Fatalf("got %d upstreams, want %d: %+v", len(got), len(want), got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("upstream[%d] = %+v, want %+v", i, got[i], want[i])
+			}
+		}
+	})
 }

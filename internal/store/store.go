@@ -4,6 +4,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -40,6 +41,57 @@ type Deployment struct {
 	// the scheduler placed — an explicit pin is honored and never touched —
 	// so this is recorded at deploy time rather than re-derived later.
 	Scheduled bool
+	// Replicas is the set of containers backing this deployment generation
+	// (Phase 12). Persisted as a JSON-encoded slice in the "replicas"
+	// column; nil (or an empty slice) round-trips to nil, both when never
+	// set (a legacy pre-Phase-12 row) and when explicitly recorded empty —
+	// RecordDeployment/CurrentDeployment/PreviousDeployment/
+	// DeploymentsForApp all treat "" in the column as nil, not []Replica{}.
+	// ContainerID above is kept in sync with Replicas[0].ContainerID by
+	// callers (Phase 12 Task 4); it is not derived from Replicas here.
+	Replicas []Replica
+}
+
+// Replica is one running container backing a deployment's surface (Phase
+// 12's replica set). Node is the node it runs on ("local" or a registered
+// node name); Upstream is the host:port the router load-balances to; Port is
+// the container's published/mapped port.
+type Replica struct {
+	ContainerID string `json:"container_id"`
+	Node        string `json:"node"`
+	Upstream    string `json:"upstream"`
+	Port        int    `json:"port"`
+}
+
+// replicasJSON JSON-encodes d.Replicas for storage: a nil or empty slice
+// encodes to "" (not "null" or "[]"), matching how the "replicas" column's
+// NOT NULL DEFAULT "" is interpreted as "no replicas recorded" on read.
+func (d *Deployment) replicasJSON() (string, error) {
+	if len(d.Replicas) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(d.Replicas)
+	if err != nil {
+		return "", fmt.Errorf("marshal replicas: %w", err)
+	}
+	return string(b), nil
+}
+
+// decodeReplicas parses a "replicas" column value (as produced by
+// replicasJSON) back into a []Replica. An empty string decodes to nil, not
+// an empty non-nil slice — this is the counterpart to replicasJSON's "" for
+// empty/nil, and is what makes a legacy (pre-Phase-12) row or a deployment
+// recorded with no replicas indistinguishable on read, both surfacing as a
+// nil Replicas.
+func decodeReplicas(s string) ([]Replica, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var out []Replica
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		return nil, fmt.Errorf("unmarshal replicas: %w", err)
+	}
+	return out, nil
 }
 
 // Node represents a registered cluster node (remote or local).
@@ -73,7 +125,8 @@ CREATE TABLE IF NOT EXISTS deployments (
 	created_at   INTEGER NOT NULL,
 	spec         TEXT    NOT NULL DEFAULT '',
 	compose      TEXT    NOT NULL DEFAULT '',
-	scheduled    INTEGER NOT NULL DEFAULT 0
+	scheduled    INTEGER NOT NULL DEFAULT 0,
+	replicas     TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_deployments_app ON deployments(app);
 CREATE TABLE IF NOT EXISTS secrets (
@@ -129,6 +182,10 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	if err := migrateAddScheduledColumn(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	if err := migrateAddReplicasColumn(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -422,14 +479,70 @@ func migrateAddScheduledColumn(db *sql.DB) error {
 	return nil
 }
 
+// migrateAddReplicasColumn adds the "replicas" column to a pre-Phase-12
+// deployments table that predates it. Safe to call on every Open: it first
+// checks PRAGMA table_info for the column and only issues ALTER TABLE if
+// missing, and additionally tolerates a concurrent/duplicate "add column"
+// error (e.g. "duplicate column name: replicas") so it never fails on a DB
+// that already has the column, including one created by the base schema
+// above. Existing rows default to replicas="" (decoded as nil by
+// decodeReplicas): placement/container detail for deployments recorded
+// before this column existed is unknown, and reconciler heal/remove code
+// (Phase 12 Task 4/5) falls back to the pre-existing ContainerID column for
+// such rows.
+func migrateAddReplicasColumn(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(deployments)`)
+	if err != nil {
+		return fmt.Errorf("table_info: %w", err)
+	}
+	hasReplicas := false
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			ctype     string
+			notnull   int
+			dfltValue any
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan table_info: %w", err)
+		}
+		if name == "replicas" {
+			hasReplicas = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("table_info rows: %w", err)
+	}
+	rows.Close()
+	if hasReplicas {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE deployments ADD COLUMN replicas TEXT NOT NULL DEFAULT ''`); err != nil {
+		// Tolerate a race/duplicate add: some other process (or a prior
+		// partial run) already added it between our check and this call.
+		if strings.Contains(err.Error(), "duplicate column name") {
+			return nil
+		}
+		return fmt.Errorf("add replicas column: %w", err)
+	}
+	return nil
+}
+
 // Close closes the underlying database.
 func (s *Store) Close() error { return s.db.Close() }
 
 // RecordDeployment inserts a deployment row and returns its id.
 func (s *Store) RecordDeployment(d Deployment) (int64, error) {
+	replicas, err := d.replicasJSON()
+	if err != nil {
+		return 0, err
+	}
 	res, err := s.db.Exec(
-		`INSERT INTO deployments (app, image, container_id, status, created_at, spec, compose, scheduled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		d.App, d.Image, d.ContainerID, d.Status, d.CreatedAt.Unix(), d.Spec, d.Compose, d.Scheduled,
+		`INSERT INTO deployments (app, image, container_id, status, created_at, spec, compose, scheduled, replicas) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.App, d.Image, d.ContainerID, d.Status, d.CreatedAt.Unix(), d.Spec, d.Compose, d.Scheduled, replicas,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("insert deployment: %w", err)
@@ -440,16 +553,20 @@ func (s *Store) RecordDeployment(d Deployment) (int64, error) {
 // CurrentDeployment returns the most recent running deployment for app, or nil.
 func (s *Store) CurrentDeployment(app string) (*Deployment, error) {
 	row := s.db.QueryRow(
-		`SELECT id, app, image, container_id, status, created_at, spec, compose, scheduled
+		`SELECT id, app, image, container_id, status, created_at, spec, compose, scheduled, replicas
 		 FROM deployments WHERE app = ? AND status = ?
 		 ORDER BY id DESC LIMIT 1`,
 		app, StatusRunning,
 	)
 	var d Deployment
 	var ts int64
-	switch err := row.Scan(&d.ID, &d.App, &d.Image, &d.ContainerID, &d.Status, &ts, &d.Spec, &d.Compose, &d.Scheduled); err {
+	var replicas string
+	switch err := row.Scan(&d.ID, &d.App, &d.Image, &d.ContainerID, &d.Status, &ts, &d.Spec, &d.Compose, &d.Scheduled, &replicas); err {
 	case nil:
 		d.CreatedAt = time.Unix(ts, 0)
+		if d.Replicas, err = decodeReplicas(replicas); err != nil {
+			return nil, err
+		}
 		return &d, nil
 	case sql.ErrNoRows:
 		return nil, nil
@@ -463,16 +580,20 @@ func (s *Store) CurrentDeployment(app string) (*Deployment, error) {
 // there is none. This is what rollback targets.
 func (s *Store) PreviousDeployment(app string) (*Deployment, error) {
 	row := s.db.QueryRow(
-		`SELECT id, app, image, container_id, status, created_at, spec, compose, scheduled
+		`SELECT id, app, image, container_id, status, created_at, spec, compose, scheduled, replicas
 		 FROM deployments WHERE app = ? AND status = ?
 		 ORDER BY id DESC LIMIT 1`,
 		app, StatusRetired,
 	)
 	var d Deployment
 	var ts int64
-	switch err := row.Scan(&d.ID, &d.App, &d.Image, &d.ContainerID, &d.Status, &ts, &d.Spec, &d.Compose, &d.Scheduled); err {
+	var replicas string
+	switch err := row.Scan(&d.ID, &d.App, &d.Image, &d.ContainerID, &d.Status, &ts, &d.Spec, &d.Compose, &d.Scheduled, &replicas); err {
 	case nil:
 		d.CreatedAt = time.Unix(ts, 0)
+		if d.Replicas, err = decodeReplicas(replicas); err != nil {
+			return nil, err
+		}
 		return &d, nil
 	case sql.ErrNoRows:
 		return nil, nil
@@ -484,7 +605,7 @@ func (s *Store) PreviousDeployment(app string) (*Deployment, error) {
 // DeploymentsForApp returns all deployments for app, newest first.
 func (s *Store) DeploymentsForApp(app string) ([]Deployment, error) {
 	rows, err := s.db.Query(
-		`SELECT id, app, image, container_id, status, created_at, spec, compose, scheduled
+		`SELECT id, app, image, container_id, status, created_at, spec, compose, scheduled, replicas
 		 FROM deployments WHERE app = ?
 		 ORDER BY id DESC`,
 		app,
@@ -497,10 +618,14 @@ func (s *Store) DeploymentsForApp(app string) ([]Deployment, error) {
 	for rows.Next() {
 		var d Deployment
 		var ts int64
-		if err := rows.Scan(&d.ID, &d.App, &d.Image, &d.ContainerID, &d.Status, &ts, &d.Spec, &d.Compose, &d.Scheduled); err != nil {
+		var replicas string
+		if err := rows.Scan(&d.ID, &d.App, &d.Image, &d.ContainerID, &d.Status, &ts, &d.Spec, &d.Compose, &d.Scheduled, &replicas); err != nil {
 			return nil, fmt.Errorf("scan deployment: %w", err)
 		}
 		d.CreatedAt = time.Unix(ts, 0)
+		if d.Replicas, err = decodeReplicas(replicas); err != nil {
+			return nil, err
+		}
 		out = append(out, d)
 	}
 	return out, rows.Err()
@@ -529,6 +654,31 @@ func (s *Store) SetStatus(id int64, status string) error {
 	_, err := s.db.Exec(`UPDATE deployments SET status = ? WHERE id = ?`, status, id)
 	if err != nil {
 		return fmt.Errorf("set status: %w", err)
+	}
+	return nil
+}
+
+// UpdateReplicas overwrites an existing deployment row's Replicas (and, in
+// sync, its ContainerID) IN PLACE — unlike RecordDeployment/SetStatus, which
+// together model a brand-new generation superseding the old one, this is
+// used by the Phase 12 Task 5 per-replica self-heal: recreating one (or a
+// few) dead replicas of an already-running generation must not mint a new
+// deployment row or retire/remove the OTHER, still-healthy replicas the way
+// a fresh deployReplicaSet generation would — it's the same generation,
+// missing a container or two, patched back to whole. containerID is passed
+// separately (rather than derived here from replicas[0].ContainerID) so a
+// caller that already computed it doesn't have to re-derive it, and so an
+// empty replicas slice can still clear ContainerID explicitly if ever
+// needed.
+func (s *Store) UpdateReplicas(id int64, replicas []Replica, containerID string) error {
+	d := Deployment{Replicas: replicas}
+	replicasJSON, err := d.replicasJSON()
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE deployments SET replicas = ?, container_id = ? WHERE id = ?`, replicasJSON, containerID, id)
+	if err != nil {
+		return fmt.Errorf("update replicas: %w", err)
 	}
 	return nil
 }

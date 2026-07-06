@@ -80,7 +80,7 @@ func (f *FakeRouter) RemoveRoute(ctx context.Context, domain string) error {
 }
 
 // SetStaging marks host as staged in Staging.
-func (f *FakeRouter) SetStaging(ctx context.Context, host, upstream string, port int) error {
+func (f *FakeRouter) SetStaging(ctx context.Context, host string, upstreams []Upstream) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("SetStaging:" + host)

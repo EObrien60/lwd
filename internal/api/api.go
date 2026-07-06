@@ -69,6 +69,11 @@ type AppStatus struct {
 	ContainerID string `json:"container_id"`
 	Status      string `json:"status"`
 	Domain      string `json:"domain"`
+	// Replicas is the current deployment's replica count (Phase 12), taken
+	// from len(cur.Replicas). It falls back to 1 for a legacy deployment
+	// (recorded before Phase 12, so its "replicas" column is empty) since
+	// that's still exactly one running container.
+	Replicas int `json:"replicas"`
 }
 
 // New returns a Server. inv may be nil, in which case node registry changes
@@ -88,6 +93,7 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /apps/{name}/logs", srv.handleLogs)
 	mux.HandleFunc("GET /apps/{name}/history", srv.handleHistory)
 	mux.HandleFunc("POST /apps/{name}/rollback", srv.handleRollback)
+	mux.HandleFunc("POST /apps/{name}/scale", srv.handleScale)
 	mux.HandleFunc("DELETE /apps/{name}", srv.handleDelete)
 	mux.HandleFunc("POST /apps/{name}/secrets", srv.handleSecretSet)
 	mux.HandleFunc("GET /apps/{name}/secrets", srv.handleSecretList)
@@ -121,6 +127,13 @@ func (srv *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	// JSON bodies aren't run through spec.Parse (which defaults an unset
+	// Replicas to 1 for TOML-authored apps) — apply the same default here so
+	// a request that omits "replicas" gets today's single-container
+	// behavior instead of failing Validate's Replicas>=1 check.
+	if app.Replicas == 0 {
+		app.Replicas = 1
+	}
 	if err := app.Validate(); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -147,6 +160,77 @@ func (srv *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, dep)
 }
 
+// scaleRequest is the wire body for POST /apps/{name}/scale.
+type scaleRequest struct {
+	Replicas int `json:"replicas"`
+}
+
+// handleScale changes a running app's replica count and redeploys it
+// set-based via the reconciler (Phase 12 Task 7). It reuses the CURRENT
+// deployment's spec snapshot rather than re-resolving lwd.toml — like
+// rollback, this preserves the exact running image/config, only changing
+// Replicas — so scaling never accidentally picks up an unrelated lwd.toml
+// edit. Unlike spec.Validate's own Replicas==0 rule (which treats 0 as
+// "unset" for pre-Phase-12 snapshot compatibility), a scale request must
+// name a concrete positive count: 0 or negative is rejected here, before the
+// snapshot is even touched. Above 1 it also runs the full app.Validate (400
+// on >50, or on a compose/backing-services app that can't run multiple
+// replicas — the Phase 12 Task 5 guard). An app with no current deployment
+// 404s rather than silently creating one.
+func (srv *Server) handleScale(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var req scaleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Replicas < 1 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("replicas must be >= 1"))
+		return
+	}
+	cur, err := srv.store.CurrentDeployment(name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if cur == nil {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("app %q not found", name))
+		return
+	}
+	var app spec.App
+	if err := json.Unmarshal([]byte(cur.Spec), &app); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	// The snapshot's Node is whatever concrete node the ORIGINAL deploy
+	// resolved to (applyImageProvenance sets app.Node = chosen before
+	// marshaling), even for a scheduler-placed app whose spec declared Node
+	// == "". Replaying that snapshot as-is would make resolvePlacement see a
+	// non-empty Node and misclassify a scheduled app as pinned — collapsing
+	// every replica onto that one node and recording Scheduled=false, which
+	// disables node-loss failover for it going forward. cur.Scheduled (the
+	// CURRENT deployment's own provenance) is the source of truth: if it was
+	// scheduler-placed, clear Node so Apply re-invokes the scheduler and
+	// spreads the new replica set across nodes again; if it was pinned
+	// (cur.Scheduled == false), leave the snapshot's Node exactly as
+	// recorded so the pin is honored. This mirrors how Rollback threads
+	// prev.Scheduled through rollbackImage/rollbackGit.
+	if cur.Scheduled {
+		app.Node = ""
+	}
+	app.Replicas = req.Replicas
+	if err := app.Validate(); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	dep, err := srv.rec.Apply(r.Context(), &app)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, dep)
+}
+
 func (srv *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 	names, err := srv.store.ListApps()
 	if err != nil {
@@ -160,11 +244,14 @@ func (srv *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
 		}
-		st := AppStatus{Name: name, Status: store.StatusRetired}
+		st := AppStatus{Name: name, Status: store.StatusRetired, Replicas: 1}
 		if cur != nil {
 			st.Image = cur.Image
 			st.ContainerID = cur.ContainerID
 			st.Status = cur.Status
+			if n := len(cur.Replicas); n > 0 {
+				st.Replicas = n
+			}
 			var a spec.App
 			if err := json.Unmarshal([]byte(cur.Spec), &a); err == nil {
 				st.Domain = a.Domain

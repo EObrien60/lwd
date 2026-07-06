@@ -23,6 +23,7 @@ mirrors that code; if they ever disagree, the Go source wins.
 | `compose` | string | compose apps | path to a `docker-compose.yml`, relative to the app dir or absolute |
 | `service` | string | compose apps | the compose service Caddy fronts; required when `compose` is set |
 | `[[services]]` | array of tables | image or git apps only | pinned backing services: `name`, `image`, `command` (optional), `env`, `secrets`, `volume` (`name:path`) |
+| `replicas` | int | image or git apps only | number of load-balanced surface instances (Phase 12); omit (or `1`) for today's single-container behavior. `2`-`50` spreads one replica per node (falling back to sharing nodes if there aren't enough); Caddy round-robins across all healthy replicas, and a failed one is healed in place on its own node. **Not supported** with `compose` or with `[[services]]` (backing services run pinned on a single node, unreachable from every replica's node) |
 | `surfaces` | []string | — | **parsed but always rejected** ("surfaces are not supported yet") — never emit this field |
 
 ## Shape rules (mutually exclusive)
@@ -77,6 +78,11 @@ Exactly one of these three shapes per app:
   CPU requirement.
 - `requirements.memory`: must parse as a size (see the `pool`/`[requirements]`
   row above); empty (or omitting `memory`) means no memory requirement.
+- `replicas`: `0` (or omitting the field) means "unset", which Parse
+  normalizes to `1` — a fresh `lwd.toml` never needs to write `replicas = 1`
+  explicitly. A negative value is rejected; `1`-`50` is the valid range
+  (`51`+ is rejected). `replicas > 1` is rejected together with `compose`
+  (non-empty) or any `[[services]]` entries.
 
 ## Worked examples
 
@@ -191,3 +197,33 @@ install, or a pool with just `local` in it, it simply lands on `local` — the
 same as every other example. Never write `node = "local"` and expect
 scheduling to still apply: an explicit `node` (including `"local"`) always
 bypasses the scheduler.
+
+### (e) Load-balanced image app with 3 replicas (Phase 12)
+
+`references/examples/replicated-app.toml`:
+
+```toml
+name     = "worker"
+image    = "ghcr.io/me/worker:latest"
+domain   = "worker.example.com"
+port     = 8080
+replicas = 3
+
+[health]
+path = "/healthz"
+```
+
+Notes: `node` is left unset, same as (d) — on a fleet with 3+ nodes
+registered, the scheduler spreads one replica per node (most-free-first);
+on a single-node install all 3 containers land on `local`, still
+load-balanced by Caddy across them. Every replica is health-gated the same
+way a single-container app is (`[health]`, then a Docker `HEALTHCHECK`, then
+plain liveness) before it's added to the live route's round-robin set; a
+replica whose container later dies is healed **in place, on its own node**
+without touching the others. Scale it up or down after deploy with `lwd
+scale worker 5` (see `README.md`'s [Replicas &
+load balancing](../../../README.md#replicas--load-balancing) section) rather
+than re-editing and re-applying this file, since a running app's replica
+count is meant to be adjusted live. `replicas` cannot be combined with
+`compose` or `[[services]]` — see the `replicas` row in the field table
+above.

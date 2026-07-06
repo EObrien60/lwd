@@ -136,11 +136,12 @@ func TestEndToEndBlueGreenRollback(t *testing.T) {
 	}
 
 	app := &spec.App{
-		Name:   appLabel,
-		Image:  "traefik/whoami:latest",
-		Domain: domain,
-		Port:   80, // whoami listens on :80; Caddy reaches it at <container>:80 on the lwd network
-		Node:   "local",
+		Name:     appLabel,
+		Image:    "traefik/whoami:latest",
+		Domain:   domain,
+		Port:     80, // whoami listens on :80; Caddy reaches it at <container>:80 on the lwd network
+		Node:     "local",
+		Replicas: 1,
 	}
 	app.Health.Path = "/"
 	app.Health.Timeout = 30 * time.Second
@@ -290,12 +291,13 @@ func TestEndToEndSecretInjection(t *testing.T) {
 	}
 
 	app := &spec.App{
-		Name:    secretAppLabel,
-		Image:   "traefik/whoami:latest",
-		Domain:  secretDomain,
-		Port:    80,
-		Node:    "local",
-		Secrets: []string{"LWD_TEST_SECRET"},
+		Name:     secretAppLabel,
+		Image:    "traefik/whoami:latest",
+		Domain:   secretDomain,
+		Port:     80,
+		Node:     "local",
+		Replicas: 1,
+		Secrets:  []string{"LWD_TEST_SECRET"},
 	}
 	app.Health.Path = "/"
 	app.Health.Timeout = 30 * time.Second
@@ -323,12 +325,13 @@ func TestEndToEndSecretInjection(t *testing.T) {
 
 	// --- Scenario 2: fail-closed on an unset secret ---
 	failApp := &spec.App{
-		Name:    failClosedAppLabel,
-		Image:   "traefik/whoami:latest",
-		Domain:  failClosedDomain,
-		Port:    80,
-		Node:    "local",
-		Secrets: []string{"UNSET_SECRET"},
+		Name:     failClosedAppLabel,
+		Image:    "traefik/whoami:latest",
+		Domain:   failClosedDomain,
+		Port:     80,
+		Node:     "local",
+		Replicas: 1,
+		Secrets:  []string{"UNSET_SECRET"},
 	}
 	failApp.Health.Path = "/"
 	failApp.Health.Timeout = 30 * time.Second
@@ -426,12 +429,13 @@ func TestEndToEndComposeApp(t *testing.T) {
 	}
 
 	app := &spec.App{
-		Name:    composeAppLabel,
-		Compose: composeFile,
-		Service: "web",
-		Domain:  composeDomain,
-		Port:    80, // whoami listens on :80
-		Node:    "local",
+		Name:     composeAppLabel,
+		Compose:  composeFile,
+		Service:  "web",
+		Domain:   composeDomain,
+		Port:     80, // whoami listens on :80
+		Node:     "local",
+		Replicas: 1,
 	}
 	app.Health.Path = "/"
 	app.Health.Timeout = 30 * time.Second
@@ -553,12 +557,13 @@ func TestEndToEndGitDeploy(t *testing.T) {
 	}
 
 	app := &spec.App{
-		Name:   gitAppLabel,
-		Git:    &spec.Git{URL: "file://" + repoDir, Ref: branch},
-		Build:  &spec.Build{Dockerfile: "Dockerfile"},
-		Domain: gitDomain,
-		Port:   80, // whoami listens on :80
-		Node:   "local",
+		Name:     gitAppLabel,
+		Git:      &spec.Git{URL: "file://" + repoDir, Ref: branch},
+		Build:    &spec.Build{Dockerfile: "Dockerfile"},
+		Domain:   gitDomain,
+		Port:     80, // whoami listens on :80
+		Node:     "local",
+		Replicas: 1,
 		Services: []spec.Service{
 			{Name: "cache", Image: "redis:7-alpine"},
 		},
@@ -843,11 +848,12 @@ func TestEndToEndRemoteNode(t *testing.T) {
 
 	// --- Deploy pinned to the registered "remote" node ---
 	remoteApp := &spec.App{
-		Name:   remoteNodeAppLabel,
-		Image:  "traefik/whoami:latest",
-		Domain: remoteNodeDomain,
-		Port:   80,
-		Node:   remoteNodeName,
+		Name:     remoteNodeAppLabel,
+		Image:    "traefik/whoami:latest",
+		Domain:   remoteNodeDomain,
+		Port:     80,
+		Node:     remoteNodeName,
+		Replicas: 1,
 	}
 	remoteApp.Health.Path = "/"
 	remoteApp.Health.Timeout = 30 * time.Second
@@ -884,11 +890,12 @@ func TestEndToEndRemoteNode(t *testing.T) {
 
 	// --- A LOCAL app deployed in the same run still works unchanged ---
 	localApp := &spec.App{
-		Name:   remoteNodeLocalAppLabel,
-		Image:  "traefik/whoami:latest",
-		Domain: remoteNodeLocalDomain,
-		Port:   80,
-		Node:   "local",
+		Name:     remoteNodeLocalAppLabel,
+		Image:    "traefik/whoami:latest",
+		Domain:   remoteNodeLocalDomain,
+		Port:     80,
+		Node:     "local",
+		Replicas: 1,
 	}
 	localApp.Health.Path = "/"
 	localApp.Health.Timeout = 30 * time.Second
@@ -1163,11 +1170,12 @@ func TestEndToEndAgentNodeDeploy(t *testing.T) {
 	}
 
 	app := &spec.App{
-		Name:   agentDeployAppLabel,
-		Image:  "traefik/whoami:latest",
-		Domain: agentDeployDomain,
-		Port:   80,
-		Node:   agentDeployNodeName,
+		Name:     agentDeployAppLabel,
+		Image:    "traefik/whoami:latest",
+		Domain:   agentDeployDomain,
+		Port:     80,
+		Node:     agentDeployNodeName,
+		Replicas: 1,
 	}
 	app.Health.Path = "/"
 	app.Health.Timeout = 30 * time.Second
@@ -1540,11 +1548,12 @@ func TestEndToEndSelfHeal(t *testing.T) {
 	rec := reconciler.New(node.FakeResolver{"local": fn}, fr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
 
 	app := &spec.App{
-		Name:   selfHealAppLabel,
-		Image:  "whoami:fake",
-		Domain: selfHealDomain,
-		Port:   8080,
-		Node:   "local",
+		Name:     selfHealAppLabel,
+		Image:    "whoami:fake",
+		Domain:   selfHealDomain,
+		Port:     8080,
+		Node:     "local",
+		Replicas: 1,
 	}
 	app.Health.Timeout = 150 * time.Millisecond
 
@@ -1596,7 +1605,7 @@ func TestEndToEndSelfHeal(t *testing.T) {
 	if !ok {
 		t.Fatalf("want a live route for %q after self-heal", app.Domain)
 	}
-	if route.Upstream == "" {
+	if len(route.Upstreams) == 0 || route.Upstreams[0].Host == "" {
 		t.Errorf("want a live route upstream set after self-heal, got %+v", route)
 	}
 
@@ -1704,10 +1713,11 @@ func TestEndToEndScheduling(t *testing.T) {
 	rec.SetReachability(reach)
 
 	app := &spec.App{
-		Name:   schedAppLabel,
-		Image:  "whoami:fake",
-		Domain: schedDomain,
-		Port:   8080,
+		Name:     schedAppLabel,
+		Image:    "whoami:fake",
+		Domain:   schedDomain,
+		Port:     8080,
+		Replicas: 1,
 		// Node is deliberately left unset: this is the scheduling case under
 		// test. Pool is also unset, meaning "default" — the pool both
 		// registered nodes (and the implicit local node) live in.
@@ -1770,7 +1780,7 @@ func TestEndToEndScheduling(t *testing.T) {
 	if !ok {
 		t.Fatalf("want a live route for %q", app.Domain)
 	}
-	if route.Upstream == "" {
+	if len(route.Upstreams) == 0 || route.Upstreams[0].Host == "" {
 		t.Errorf("want a live route upstream set, got %+v", route)
 	}
 }
@@ -1867,10 +1877,11 @@ func TestEndToEndNodeDrain(t *testing.T) {
 	rec.SetReachability(reach)
 
 	app := &spec.App{
-		Name:   drainAppLabel,
-		Image:  "whoami:fake",
-		Domain: drainDomain,
-		Port:   8080,
+		Name:     drainAppLabel,
+		Image:    "whoami:fake",
+		Domain:   drainDomain,
+		Port:     8080,
+		Replicas: 1,
 		// Node/Pool left unset: the scheduler places it.
 	}
 	app.Health.Timeout = 150 * time.Millisecond
@@ -1980,7 +1991,7 @@ func TestEndToEndNodeDrain(t *testing.T) {
 	if !ok {
 		t.Fatalf("want a live route for %q", app.Domain)
 	}
-	if route.Upstream == "" {
+	if len(route.Upstreams) == 0 || route.Upstreams[0].Host == "" {
 		t.Errorf("want a live route upstream set, got %+v", route)
 	}
 }
@@ -2059,10 +2070,11 @@ func TestEndToEndNodeLossFailover(t *testing.T) {
 
 	// Unpinned: the scheduler places it on nodeA (most free memory).
 	scheduledApp := &spec.App{
-		Name:   failoverAppLabel,
-		Image:  "whoami:fake",
-		Domain: failoverDomain,
-		Port:   8080,
+		Name:     failoverAppLabel,
+		Image:    "whoami:fake",
+		Domain:   failoverDomain,
+		Port:     8080,
+		Replicas: 1,
 	}
 	scheduledApp.Health.Timeout = 150 * time.Millisecond
 	if _, err := rec.Apply(ctx, scheduledApp); err != nil {
@@ -2083,11 +2095,12 @@ func TestEndToEndNodeLossFailover(t *testing.T) {
 	// Pinned explicitly to nodeA: must never move, no matter what happens to
 	// nodeA.
 	pinnedApp := &spec.App{
-		Name:   failoverPinnedAppLabel,
-		Image:  "whoami:fake",
-		Domain: failoverPinnedDomain,
-		Port:   8080,
-		Node:   failoverNodeAName,
+		Name:     failoverPinnedAppLabel,
+		Image:    "whoami:fake",
+		Domain:   failoverPinnedDomain,
+		Port:     8080,
+		Node:     failoverNodeAName,
+		Replicas: 1,
 	}
 	pinnedApp.Health.Timeout = 150 * time.Millisecond
 	pinnedDep, err := rec.Apply(ctx, pinnedApp)
@@ -2161,6 +2174,242 @@ func TestEndToEndNodeLossFailover(t *testing.T) {
 	}
 	if pinnedHealth == nil || pinnedHealth.State != reconciler.SurfaceDegraded {
 		t.Errorf("pinned app on unreachable node: health = %+v, want state %q", pinnedHealth, reconciler.SurfaceDegraded)
+	}
+}
+
+// replicasAppLabel/replicasDomain and the three node names are used by
+// TestEndToEndReplicas, kept distinct from every other test's labels so
+// assertions never collide.
+const replicasAppLabel = "e2e-replicas-whoami"
+const replicasDomain = "replicas-whoami.localhost"
+const replicasNodeAName = "e2e-replicas-node-a"
+const replicasNodeBName = "e2e-replicas-node-b"
+const replicasNodeCName = "e2e-replicas-node-c"
+
+// e2eCountPrefix counts how many of calls start with prefix — the e2e-local
+// stand-in for the internal reconciler test suite's unexported countPrefix
+// helper (test/e2e_test.go is a separate package and can't reach it; see
+// callsContain/e2eRanOn's own comments for the same reason).
+func e2eCountPrefix(calls []string, prefix string) int {
+	n := 0
+	for _, c := range calls {
+		if strings.HasPrefix(c, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestEndToEndReplicas covers Phase 12 end to end: deploying an unpinned
+// image app with Replicas: 3 across three registered nodes spreads one
+// replica per node and flips the live route to a 3-upstream set; scaling it
+// down to 1 (exactly what the daemon's POST /apps/{name}/scale handler
+// does — re-apply the current spec snapshot with Replicas overridden, see
+// internal/api's handleScale) tears the other two replicas' containers down
+// on their own nodes and leaves a single-upstream route; and, after scaling
+// back up to 3, killing ONE replica's container and calling Reconcile heals
+// ONLY that one, in place, on its own node — the other two (and the
+// deployment row itself) are never touched. This is the black-box,
+// real-store counterpart of internal/reconciler's own
+// TestDeployThreeReplicasAllHealthy/TestHealRecreatesOneDeadReplica tests,
+// driven here through the real store/reconciler like
+// TestEndToEndScheduling/TestEndToEndNodeDrain/TestEndToEndNodeLossFailover.
+//
+// Deliberately NOT gated by LWD_DOCKER_TEST, for the same reason as those
+// three: everything here runs against fake nodes and a fake router.
+func TestEndToEndReplicas(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := store.Open(filepath.Join(dir, "lwd.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	// local's capacity is left unmeasured (Known: false), so it can never
+	// outrank nodeA/B/C's measured availability — same trick
+	// TestEndToEndScheduling/TestEndToEndNodeDrain/TestEndToEndNodeLossFailover
+	// use to prove placement is deliberate, not by default.
+	local := node.NewFake()
+
+	nodeA := node.NewFake()
+	nodeA.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 3000}
+	nodeA.MeshAddr = "100.64.0.40"
+	nodeB := node.NewFake()
+	nodeB.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 2000}
+	nodeB.MeshAddr = "100.64.0.41"
+	nodeC := node.NewFake()
+	nodeC.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 1000}
+	nodeC.MeshAddr = "100.64.0.42"
+
+	for i, n := range []string{replicasNodeAName, replicasNodeBName, replicasNodeCName} {
+		if err := s.AddNode(store.Node{Name: n, SSHHost: "deploy@" + n, MeshAddr: fmt.Sprintf("100.64.0.%d", 40+i), Pool: store.DefaultPool, CreatedAt: time.Now()}); err != nil {
+			t.Fatalf("AddNode %s: %v", n, err)
+		}
+	}
+	t.Cleanup(func() {
+		_ = s.DeleteNode(replicasNodeAName)
+		_ = s.DeleteNode(replicasNodeBName)
+		_ = s.DeleteNode(replicasNodeCName)
+	})
+
+	resolver := node.FakeResolver{"local": local, replicasNodeAName: nodeA, replicasNodeBName: nodeB, replicasNodeCName: nodeC}
+	reach := schedFakeReach{replicasNodeAName: true, replicasNodeBName: true, replicasNodeCName: true}
+
+	fr := router.NewFakeRouter()
+	fr.ProbeStatus = http.StatusOK
+	cipher, err := secrets.NewCipher(filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher: %v", err)
+	}
+	secStore := secrets.NewStore(cipher, s)
+
+	rec := reconciler.New(resolver, fr, s, secStore, compose.NewFake(), source.NewFake(), build.NewFake())
+	rec.SetReachability(reach)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	app := &spec.App{
+		Name:     replicasAppLabel,
+		Image:    "whoami:fake",
+		Domain:   replicasDomain,
+		Port:     8080,
+		Replicas: 3,
+		// Node/Pool left unset: the scheduler spreads the 3 replicas.
+	}
+	app.Health.Timeout = 150 * time.Millisecond
+
+	dep, err := rec.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("Apply (3 replicas): %v", err)
+	}
+	if dep.Status != store.StatusRunning {
+		t.Fatalf("status = %q, want running", dep.Status)
+	}
+	if len(dep.Replicas) != 3 {
+		t.Fatalf("len(Replicas) = %d, want 3, got %+v", len(dep.Replicas), dep.Replicas)
+	}
+	seenNodes := map[string]bool{}
+	for _, rep := range dep.Replicas {
+		seenNodes[rep.Node] = true
+	}
+	if len(seenNodes) != 3 {
+		t.Fatalf("want 3 replicas spread across 3 distinct nodes, got %+v", dep.Replicas)
+	}
+	for _, n := range []*node.Fake{nodeA, nodeB, nodeC} {
+		if !e2eRanOn(n) {
+			t.Errorf("want every one of the 3 nodes to have run a container, calls: %v", n.Calls)
+		}
+	}
+	if e2eRanOn(local) {
+		t.Errorf("want local (capacity unknown, always loses the ranking) to never run a container, calls: %v", local.Calls)
+	}
+
+	route, ok := fr.Routes[replicasDomain]
+	if !ok {
+		t.Fatalf("want a live route for %q", replicasDomain)
+	}
+	if len(route.Upstreams) != 3 {
+		t.Fatalf("route.Upstreams = %+v, want 3", route.Upstreams)
+	}
+
+	cur, err := s.CurrentDeployment(replicasAppLabel)
+	if err != nil || cur == nil || len(cur.Replicas) != 3 {
+		t.Fatalf("CurrentDeployment: %v / %+v", err, cur)
+	}
+
+	// Scale down to 1.
+	oldReplicas := dep.Replicas
+	app.Replicas = 1
+	scaledDown, err := rec.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("Apply (scale to 1): %v", err)
+	}
+	if len(scaledDown.Replicas) != 1 {
+		t.Fatalf("len(Replicas) after scale down = %d, want 1, got %+v", len(scaledDown.Replicas), scaledDown.Replicas)
+	}
+	for _, old := range oldReplicas {
+		fake := resolver[old.Node].(*node.Fake)
+		if !callsContain(fake.Calls, "RemoveContainer:"+old.ContainerID) {
+			t.Errorf("want RemoveContainer:%s on node %s after scale down, calls: %v", old.ContainerID, old.Node, fake.Calls)
+		}
+	}
+	route, ok = fr.Routes[replicasDomain]
+	if !ok {
+		t.Fatalf("want a live route for %q after scale down", replicasDomain)
+	}
+	if len(route.Upstreams) != 1 {
+		t.Fatalf("route.Upstreams after scale down = %+v, want 1", route.Upstreams)
+	}
+
+	// Scale back up to 3, then kill exactly one replica's container and
+	// reconcile: only that one replica must be healed, in place, on its own
+	// node — the others (and the deployment row itself) untouched.
+	app.Replicas = 3
+	dep3, err := rec.Apply(ctx, app)
+	if err != nil {
+		t.Fatalf("Apply (scale back to 3): %v", err)
+	}
+	if len(dep3.Replicas) != 3 {
+		t.Fatalf("len(Replicas) after re-scale = %d, want 3, got %+v", len(dep3.Replicas), dep3.Replicas)
+	}
+
+	dead := dep3.Replicas[1]
+	deadNode := resolver[dead.Node].(*node.Fake)
+	if err := deadNode.RemoveContainer(ctx, dead.ContainerID); err != nil {
+		t.Fatalf("RemoveContainer (simulate death): %v", err)
+	}
+
+	preRun := map[string]int{}
+	for _, name := range []string{replicasNodeAName, replicasNodeBName, replicasNodeCName} {
+		preRun[name] = e2eCountPrefix(resolver[name].(*node.Fake).Calls, "RunContainer:")
+	}
+
+	if err := rec.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile (heal one dead replica): %v", err)
+	}
+
+	for _, name := range []string{replicasNodeAName, replicasNodeBName, replicasNodeCName} {
+		post := e2eCountPrefix(resolver[name].(*node.Fake).Calls, "RunContainer:")
+		if name == dead.Node {
+			if post != preRun[name]+1 {
+				t.Errorf("node %s: RunContainer calls = %d, want %d+1 (healed replica)", name, post, preRun[name])
+			}
+		} else if post != preRun[name] {
+			t.Errorf("node %s: RunContainer calls = %d, want unchanged %d (healthy replica untouched)", name, post, preRun[name])
+		}
+	}
+
+	healed, err := s.CurrentDeployment(replicasAppLabel)
+	if err != nil {
+		t.Fatalf("CurrentDeployment after heal: %v", err)
+	}
+	if healed == nil || len(healed.Replicas) != 3 {
+		t.Fatalf("CurrentDeployment after heal mismatch: %+v", healed)
+	}
+	if healed.ID != dep3.ID {
+		t.Errorf("want the SAME deployment row updated in place (id %d) after heal, got %d", dep3.ID, healed.ID)
+	}
+	for i, rep := range healed.Replicas {
+		if i == 1 {
+			if rep.ContainerID == dead.ContainerID {
+				t.Errorf("replica 1 = %+v, want a NEW container id after heal", rep)
+			}
+			if rep.Node != dead.Node {
+				t.Errorf("replica 1 node = %q, want unchanged %q (recreated IN PLACE)", rep.Node, dead.Node)
+			}
+		} else if rep != dep3.Replicas[i] {
+			t.Errorf("replica %d changed: got %+v, want untouched %+v", i, rep, dep3.Replicas[i])
+		}
+	}
+
+	route, ok = fr.Routes[replicasDomain]
+	if !ok {
+		t.Fatalf("want a live route for %q after heal", replicasDomain)
+	}
+	if len(route.Upstreams) != 3 {
+		t.Errorf("route.Upstreams after heal = %+v, want 3", route.Upstreams)
 	}
 }
 
