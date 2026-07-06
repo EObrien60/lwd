@@ -1053,6 +1053,14 @@ button { cursor: pointer; }
 }
 .add-row-btn:hover { border-color: var(--signal); color: var(--signal); background: transparent; }
 
+/* Backing-service preset picker (select a curated preset, or Custom, to
+   prefill a new service-card) — an .inline-form variant, capped narrower so
+   it reads as "choose, then add" rather than the full-width dashed
+   add-row-btn used for freeform env/secret rows. */
+.preset-picker { margin-top: 4px; }
+.preset-picker .field { flex: 0 1 240px; }
+.preset-picker .btn { flex: none; }
+
 .service-card {
   display: flex;
   flex-direction: column;

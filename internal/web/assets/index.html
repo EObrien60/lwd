@@ -899,9 +899,21 @@
                     </div>
                   </template>
                   <button type="button" class="btn btn-ghost btn-sm add-row-btn" @click="svc.secrets.push('')" :disabled="deploy.busy">+ Add secret</button>
+                  <p class="hint" style="margin:8px 0 0;" x-show="svc.secrets.length > 0" x-text="'Needs secret(s): ' + svc.secrets.join(', ') + ' — set their values in the Secrets tab; the deploy fails closed until every referenced secret exists.'"></p>
                 </div>
               </template>
-              <button type="button" class="btn btn-ghost add-row-btn" @click="deploy.git.services.push(newServiceRow())" :disabled="deploy.busy">+ Add backing service</button>
+              <div class="inline-form preset-picker">
+                <div class="field">
+                  <label for="git-service-preset">Preset</label>
+                  <select id="git-service-preset" x-model="deploy.git.presetChoice" :disabled="deploy.busy">
+                    <template x-for="p in SERVICE_PRESETS" :key="p.key">
+                      <option :value="p.key" x-text="p.label"></option>
+                    </template>
+                    <option value="custom">Custom…</option>
+                  </select>
+                </div>
+                <button type="button" class="btn btn-ghost" @click="deploy.git.services.push(serviceRowFromPreset(deploy.git.presetChoice))" :disabled="deploy.busy">+ Add service</button>
+              </div>
             </div>
             <div class="modal__preview">
               <div class="subhead" style="margin-top:0; padding-top:0; border-top:none;">lwd.toml preview</div>
@@ -1040,9 +1052,21 @@
                     </div>
                   </template>
                   <button type="button" class="btn btn-ghost btn-sm add-row-btn" @click="svc.secrets.push('')" :disabled="deploy.busy">+ Add secret</button>
+                  <p class="hint" style="margin:8px 0 0;" x-show="svc.secrets.length > 0" x-text="'Needs secret(s): ' + svc.secrets.join(', ') + ' — set their values in the Secrets tab; the deploy fails closed until every referenced secret exists.'"></p>
                 </div>
               </template>
-              <button type="button" class="btn btn-ghost add-row-btn" @click="deploy.builder.services.push(newServiceRow())" :disabled="deploy.busy">+ Add backing service</button>
+              <div class="inline-form preset-picker">
+                <div class="field">
+                  <label for="builder-service-preset">Preset</label>
+                  <select id="builder-service-preset" x-model="deploy.builder.presetChoice" :disabled="deploy.busy">
+                    <template x-for="p in SERVICE_PRESETS" :key="p.key">
+                      <option :value="p.key" x-text="p.label"></option>
+                    </template>
+                    <option value="custom">Custom…</option>
+                  </select>
+                </div>
+                <button type="button" class="btn btn-ghost" @click="deploy.builder.services.push(serviceRowFromPreset(deploy.builder.presetChoice))" :disabled="deploy.busy">+ Add service</button>
+              </div>
             </div>
             <div class="modal__preview">
               <div class="subhead" style="margin-top:0; padding-top:0; border-top:none;">lwd.toml preview</div>

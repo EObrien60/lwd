@@ -385,6 +385,108 @@ function durationString(ns) {
   return seconds + 's';
 }
 
+// ---------------------------------------------------------------------------
+// Backing-service presets
+//
+// A curated, client-side-only catalog for the deploy modal's "Backing
+// services" picker. Picking a preset PREFILLS an editable service-card row
+// (same shape newServiceRow() produces) with sensible defaults for a common
+// backing service — the user can still edit or delete any field afterward.
+// "secrets" are env-var KEYS whose VALUES must be set as app secrets (never
+// plaintext env); appendServiceTables already emits both `env = {...}` and
+// `secrets = [...]` for a row, so a preset round-trips into [[services]]
+// with no generation change.
+
+const SERVICE_PRESETS = [
+  {
+    key: 'postgres',
+    label: 'PostgreSQL',
+    name: 'postgres',
+    image: 'postgres:16',
+    command: '',
+    volume: 'pgdata:/var/lib/postgresql/data',
+    env: { POSTGRES_DB: 'app', POSTGRES_USER: 'app' },
+    secrets: ['POSTGRES_PASSWORD'],
+  },
+  {
+    key: 'mariadb',
+    label: 'MySQL / MariaDB',
+    name: 'mariadb',
+    image: 'mariadb:11',
+    command: '',
+    volume: 'mysqldata:/var/lib/mysql',
+    env: { MARIADB_DATABASE: 'app', MARIADB_USER: 'app' },
+    secrets: ['MARIADB_PASSWORD', 'MARIADB_ROOT_PASSWORD'],
+  },
+  {
+    key: 'redis',
+    label: 'Redis',
+    name: 'redis',
+    image: 'redis:7',
+    command: '',
+    volume: 'redisdata:/data',
+    env: {},
+    secrets: [],
+  },
+  {
+    key: 'valkey',
+    label: 'Valkey',
+    name: 'valkey',
+    image: 'valkey/valkey:8',
+    command: '',
+    volume: 'valkeydata:/data',
+    env: {},
+    secrets: [],
+  },
+  {
+    key: 'minio',
+    label: 'MinIO',
+    name: 'minio',
+    image: 'minio/minio',
+    command: 'server /data --console-address :9001',
+    volume: 'miniodata:/data',
+    env: { MINIO_ROOT_USER: 'lwd' },
+    secrets: ['MINIO_ROOT_PASSWORD'],
+  },
+  {
+    key: 'mongo',
+    label: 'MongoDB',
+    name: 'mongo',
+    image: 'mongo:7',
+    command: '',
+    volume: 'mongodata:/data/db',
+    env: { MONGO_INITDB_ROOT_USERNAME: 'lwd' },
+    secrets: ['MONGO_INITDB_ROOT_PASSWORD'],
+  },
+];
+
+// blankServiceRow is the shared "empty backing service" shape — what both
+// the dashboard's newServiceRow() and serviceRowFromPreset('custom') return,
+// so there's exactly one definition of a blank row.
+function blankServiceRow() {
+  return { name: '', image: '', command: '', volume: '', env: [], secrets: [] };
+}
+
+// serviceRowFromPreset returns a newServiceRow()-shaped row for the given
+// SERVICE_PRESETS key. "custom" (and any unrecognized key, e.g. a stale
+// selection) falls back to a blank row — today's "+ Add backing service"
+// behavior. A known key returns a DEEP COPY of that preset (a fresh env-rows
+// array and a fresh secrets array), so editing one pushed row, or pushing
+// the same preset twice, never mutates SERVICE_PRESETS or shares array
+// references across rows.
+function serviceRowFromPreset(key) {
+  const preset = SERVICE_PRESETS.find((p) => p.key === key);
+  if (!preset) return blankServiceRow();
+  return {
+    name: preset.name,
+    image: preset.image,
+    command: preset.command || '',
+    volume: preset.volume || '',
+    env: Object.entries(preset.env || {}).map(([k, v]) => ({ key: k, value: v })),
+    secrets: [...(preset.secrets || [])],
+  };
+}
+
 function dashboard() {
   return {
     // ---- chrome / theme ------------------------------------------------
@@ -1003,14 +1105,20 @@ function dashboard() {
     },
 
     newServiceRow() {
-      return { name: '', image: '', command: '', volume: '', env: [], secrets: [] };
+      return blankServiceRow();
     },
+
+    // SERVICE_PRESETS / serviceRowFromPreset: module-level (see above),
+    // exposed here so the deploy modal's preset <select> and "+ Add" button
+    // can reach them from the Alpine template.
+    SERVICE_PRESETS,
+    serviceRowFromPreset,
 
     newGitForm() {
       return {
         url: '', ref: 'main', subdir: '', dockerfile: 'Dockerfile',
         name: '', domain: '', port: '', node: 'local', pool: '', reqCpu: '', reqMemory: '', replicas: '',
-        env: [], secrets: [], services: [],
+        env: [], secrets: [], services: [], presetChoice: 'postgres',
       };
     },
 
@@ -1018,7 +1126,7 @@ function dashboard() {
       return {
         image: '',
         name: '', domain: '', port: '', node: 'local', pool: '', reqCpu: '', reqMemory: '', replicas: '',
-        env: [], secrets: [], services: [],
+        env: [], secrets: [], services: [], presetChoice: 'postgres',
       };
     },
 
