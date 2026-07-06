@@ -133,6 +133,40 @@ yourself). Compose it with other flags, e.g. `sudo ./install.sh --update --web`
 updates the binaries/restarts running services *and* installs the `lwd-web`
 unit if it isn't already present.
 
+### Uninstall
+
+```bash
+sudo ./install.sh --destroy          # (alias: --remove) uninstall, asks about config/apps
+sudo ./install.sh --destroy-all      # uninstall + wipe config, state, and all deployed apps
+sudo ./install.sh --destroy --no-interactive   # uninstall, keep config/apps, no prompt
+```
+
+`--destroy` (alias `--remove`) never builds or installs anything — it always
+stops/disables/removes the `lwd`/`lwd-web`/`lwd-agent` systemd units (if
+present) and removes the four binaries from `$PREFIX`. It then asks,
+interactively, whether to also remove `/etc/lwd` (config), `/var/lib/lwd`
+(daemon state — the encrypted secret key and deployment DB), and **all**
+deployed apps + the `lwd-caddy` ingress container + the private `lwd` Docker
+network. The prompt defaults to **No** — press Enter or answer anything but
+`y`/`Y` to keep them.
+
+- `--destroy-all` skips the prompt and removes everything above
+  unconditionally (config, daemon state, deployed apps, `lwd-caddy`, the
+  `lwd` network) — use this for a full teardown.
+- `--no-interactive` (with `--destroy`, not `--destroy-all`) skips the prompt
+  and defaults to **keeping** config/apps — an install-only uninstall, safe
+  for scripts.
+- Piped installs (`curl ... | bash -s -- --destroy`) have no controlling
+  terminal to prompt against, so they also default to keeping config/apps
+  rather than hanging on a read — re-run with `--destroy-all` if you want
+  those gone too.
+
+Every step is best-effort and idempotent: a missing unit, binary, container,
+or directory is not an error. **Named Docker volumes (e.g. postgres/minio
+data) are never auto-deleted**, even by `--destroy-all` — list them with
+`docker volume ls` and remove the ones you actually want gone with `docker
+volume rm <name>`.
+
 ### Or build manually
 
 ```bash
