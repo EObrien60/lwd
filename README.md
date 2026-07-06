@@ -1090,6 +1090,13 @@ never values); **redeploy** and **config edit**; a **Nodes** view
 pool + schedulable badge); and a **Health** view (the reconciler's live
 snapshot, auto-refreshing).
 
+The From Git/Builder tabs' backing-service builder includes a **preset
+picker**: pick PostgreSQL, MySQL/MariaDB, Redis, Valkey, MinIO, MongoDB, or
+Custom to prefill a still-editable service row with a sensible image,
+volume, and env. Any password-type env a preset needs is added to that
+row's secrets list rather than as plaintext env — set its actual value in
+the **Secrets** tab.
+
 ## Remote access & running lwd-web as a service
 
 Everything above assumes `lwd-web` and `lwd daemon` on the same box, talking
