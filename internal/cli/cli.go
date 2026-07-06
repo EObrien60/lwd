@@ -71,12 +71,12 @@ func Run(args []string) int {
 
 func runDaemon() int {
 	if err := os.MkdirAll(config.DataDir(), 0o755); err != nil {
-		fmt.Fprintln(os.Stderr, "mkdir data dir:", err)
+		fmt.Fprintf(os.Stderr, "lwd: cannot create data dir %s: %v\n  run as root (sudo lwd daemon) or set LWD_DATA_DIR to a writable directory\n", config.DataDir(), err)
 		return 1
 	}
 	n, err := node.NewLocal()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "docker:", err)
+		fmt.Fprintf(os.Stderr, "lwd: cannot reach Docker: %v\n  make sure Docker is installed and running, and that this user can reach it (root, or a member of the docker group)\n", err)
 		return 1
 	}
 	s, err := store.Open(config.DBPath())

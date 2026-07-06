@@ -23,24 +23,51 @@ import (
 // over TCP with bearer-token auth (NewHTTP) — see FromEnv for how the
 // CLI/web frontends pick between the two.
 type Client struct {
-	http *http.Client
-	base string
+	http   *http.Client
+	base   string
+	target string // human-readable endpoint, for "cannot reach the daemon" errors
 }
 
 // New returns a Client that dials the given unix socket path. The host in URLs
 // is a dummy; the dialer always connects to the socket.
 func New(socketPath string) *Client {
+	target := "unix://" + socketPath
 	return &Client{
 		http: &http.Client{
-			Transport: &http.Transport{
-				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-					var d net.Dialer
-					return d.DialContext(ctx, "unix", socketPath)
+			Transport: &daemonErrTransport{
+				base: &http.Transport{
+					DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+						var d net.Dialer
+						return d.DialContext(ctx, "unix", socketPath)
+					},
 				},
+				target: target,
 			},
 		},
-		base: "http://lwd",
+		base:   "http://lwd",
+		target: target,
 	}
+}
+
+// daemonErrTransport wraps an http.RoundTripper and rewrites connection-level
+// failures (RoundTrip returning a non-nil error — the daemon process isn't
+// there to answer at all) into an actionable message naming the target and
+// suggesting a fix. It never touches a normal HTTP response, including 4xx/5xx
+// status codes: those come back from RoundTrip with a nil error and are left
+// for the caller's own decodeErr to report the daemon's actual error body.
+// Streaming reads (e.g. Logs with follow=true) happen on the response body
+// after RoundTrip returns, so they're unaffected too.
+type daemonErrTransport struct {
+	base   http.RoundTripper
+	target string
+}
+
+func (t *daemonErrTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, fmt.Errorf("cannot reach the lwd daemon at %s — is it running? start it with `sudo lwd daemon` (it needs root for /var/lib/lwd + Docker, or set LWD_DATA_DIR to a writable path); for a remote daemon set LWD_DAEMON=host:port and LWD_API_TOKEN: %w", t.target, err)
+	}
+	return resp, nil
 }
 
 // bearerTransport wraps an http.RoundTripper, adding an Authorization:
@@ -78,10 +105,12 @@ func NewHTTP(baseURL, token string) *Client {
 	if token != "" {
 		transport = &bearerTransport{base: transport, token: token}
 	}
+	transport = &daemonErrTransport{base: transport, target: base}
 
 	return &Client{
-		http: &http.Client{Transport: transport},
-		base: base,
+		http:   &http.Client{Transport: transport},
+		base:   base,
+		target: base,
 	}
 }
 
