@@ -14,6 +14,12 @@
 #                   (via https://get.docker.com; lwd needs a Docker daemon at runtime).
 #   --systemd       Install and enable a systemd unit for `lwd daemon`
 #                   (lwd.service, LWD_DATA_DIR=/var/lib/lwd, root, After=docker).
+#   --web           Install and enable a systemd unit for `lwd-web`
+#                   (lwd-web.service, /etc/lwd/web.env). Won't auto-start until
+#                   you set LWD_WEB_PASSWORD in the env file (no default password).
+#   --agent         Install and enable a systemd unit for `lwd-agent`
+#                   (lwd-agent.service, /etc/lwd/agent.env). Won't auto-start
+#                   until you set LWD_AGENT_TOKEN in the env file.
 #   --prefix DIR    Install binaries to DIR (default: /usr/local/bin).
 #   --go-version V  Force a specific Go toolchain version to download (e.g. 1.25.4);
 #                   default: reuse a system Go >= 1.25, else fetch the latest stable.
@@ -32,6 +38,8 @@ MIN_GO="1.25"
 PREFIX="/usr/local/bin"
 INSTALL_DOCKER=0
 INSTALL_SYSTEMD=0
+INSTALL_WEB=0
+INSTALL_AGENT=0
 GO_VERSION=""
 REPO_URL="https://github.com/EObrien60/lwd"
 REPO_REF="main"
@@ -52,6 +60,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --docker)   INSTALL_DOCKER=1 ;;
     --systemd)  INSTALL_SYSTEMD=1 ;;
+    --web)      INSTALL_WEB=1 ;;
+    --agent)    INSTALL_AGENT=1 ;;
     --prefix)   PREFIX="${2:?--prefix needs a directory}"; shift ;;
     --go-version) GO_VERSION="${2:?--go-version needs a version}"; shift ;;
     --repo)     REPO_URL="${2:?--repo needs a URL}"; shift ;;
@@ -235,6 +245,97 @@ UNIT
   ok "lwd.service enabled and started (LWD_DATA_DIR=/var/lib/lwd)"
 }
 
+# ---- optional: systemd unit for lwd-web ------------------------------------
+maybe_web() {
+  [ "$INSTALL_WEB" -eq 1 ] || return 0
+  command -v systemctl >/dev/null 2>&1 || { warn "systemctl not found — skipping --web"; return; }
+  log "installing systemd unit lwd-web.service"
+  asroot install -d -m 0755 /etc/lwd
+  if [ ! -f /etc/lwd/web.env ]; then
+    asroot tee /etc/lwd/web.env >/dev/null <<'ENV'
+# lwd-web configuration (this file is 0600). Set a strong password.
+LWD_WEB_PASSWORD=CHANGE_ME
+LWD_WEB_ADDR=127.0.0.1:8079          # set 0.0.0.0:8079 to expose (put behind TLS/tunnel!)
+# LWD_WEB_SECRET=<32+ bytes to persist sessions across restarts>
+# If lwd-web is NOT co-located with the daemon socket, point it at the daemon's TCP endpoint:
+# LWD_DAEMON=127.0.0.1:8077
+# LWD_API_TOKEN=<must match the daemon's LWD_API_TOKEN>
+ENV
+    asroot chmod 0600 /etc/lwd/web.env
+    asroot chown root:root /etc/lwd/web.env 2>/dev/null || true
+  else
+    ok "/etc/lwd/web.env already exists — leaving it untouched"
+  fi
+  asroot tee /etc/systemd/system/lwd-web.service >/dev/null <<UNIT
+[Unit]
+Description=lwd web dashboard
+After=lwd.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/lwd/web.env
+ExecStart=$PREFIX/lwd-web
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  asroot systemctl daemon-reload
+  asroot systemctl enable lwd-web
+  if asroot grep -q 'CHANGE_ME' /etc/lwd/web.env; then
+    warn "edit /etc/lwd/web.env (set LWD_WEB_PASSWORD), then: systemctl start lwd-web"
+  else
+    asroot systemctl start lwd-web
+    ok "lwd-web.service enabled and started"
+  fi
+}
+
+# ---- optional: systemd unit for lwd-agent ----------------------------------
+maybe_agent() {
+  [ "$INSTALL_AGENT" -eq 1 ] || return 0
+  command -v systemctl >/dev/null 2>&1 || { warn "systemctl not found — skipping --agent"; return; }
+  log "installing systemd unit lwd-agent.service"
+  asroot install -d -m 0755 /etc/lwd
+  if [ ! -f /etc/lwd/agent.env ]; then
+    asroot tee /etc/lwd/agent.env >/dev/null <<'ENV'
+# lwd-agent configuration (this file is 0600). Set a strong token.
+LWD_AGENT_TOKEN=CHANGE_ME
+LWD_AGENT_ADDR=:8078
+ENV
+    asroot chmod 0600 /etc/lwd/agent.env
+    asroot chown root:root /etc/lwd/agent.env 2>/dev/null || true
+  else
+    ok "/etc/lwd/agent.env already exists — leaving it untouched"
+  fi
+  asroot tee /etc/systemd/system/lwd-agent.service >/dev/null <<UNIT
+[Unit]
+Description=lwd node agent
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/lwd/agent.env
+ExecStart=$PREFIX/lwd-agent
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  asroot systemctl daemon-reload
+  asroot systemctl enable lwd-agent
+  if asroot grep -q 'CHANGE_ME' /etc/lwd/agent.env; then
+    warn "edit /etc/lwd/agent.env (set LWD_AGENT_TOKEN), then: systemctl start lwd-agent"
+  else
+    asroot systemctl start lwd-agent
+    ok "lwd-agent.service enabled and started"
+  fi
+}
+
 # ---- next steps -------------------------------------------------------------
 next_steps() {
   cat <<STEPS
@@ -272,6 +373,25 @@ STEPS
        LWD_WEB_PASSWORD='choose-a-strong-password' lwd-web
      then open http://127.0.0.1:8079 and log in with that password
      (login is password-only; no username).
+     (or re-run this installer with --web to manage it via systemd —
+     edit /etc/lwd/web.env first, it installs with a CHANGE_ME placeholder.)
+
+  5. Node agent (optional, for multi-node fleets) — set a token yourself:
+       LWD_AGENT_TOKEN='choose-a-strong-token' lwd-agent
+     (or re-run this installer with --agent to manage it via systemd —
+     edit /etc/lwd/agent.env first, it installs with a CHANGE_ME placeholder.)
+STEPS
+  if [ "$INSTALL_WEB" -eq 1 ] || [ "$INSTALL_AGENT" -eq 1 ]; then
+    cat <<STEPS
+
+  Note: /etc/lwd/*.env holds the lwd-web/lwd-agent config (mode 0600). Units
+  installed with --web/--agent are enabled but only auto-started once their
+  CHANGE_ME placeholder has been replaced with a real password/token:
+       systemctl status lwd-web lwd-agent
+       journalctl -u lwd-web -u lwd-agent -f
+STEPS
+  fi
+  cat <<STEPS
 
 See the README for multi-node fleets, replicas/scaling, secrets, and the MCP server.
 STEPS
@@ -288,5 +408,7 @@ locate_source
 build_install
 maybe_docker
 maybe_systemd
+maybe_web
+maybe_agent
 [ "$CLEANUP_SRC" -eq 1 ] && rm -rf "$SRC"
 next_steps
