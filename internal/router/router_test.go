@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"lwd/internal/node"
@@ -137,6 +138,95 @@ func TestCaddyRouterSetRouteRollsBackOnReloadFailure(t *testing.T) {
 	}
 	if _, ok := c.routes["bad.example.com"]; ok {
 		t.Fatal("expected bad.example.com to NOT be committed (poisoned entry leaked)")
+	}
+}
+
+// TestEnsureUpAdoptsRunningCaddy verifies that a running lwd-caddy container
+// found by name (regardless of labels) is reused as-is: EnsureUp must not
+// attempt to create a second one (which would race the running container for
+// host ports 80/443/2019 and fail with a confusing "port already allocated"
+// error), and must still proceed to reload it.
+func TestEnsureUpAdoptsRunningCaddy(t *testing.T) {
+	ctx := context.Background()
+
+	admin := stubAdminStatus(http.StatusOK)
+	defer admin.Close()
+
+	n := node.NewFake()
+	n.SeedContainer(node.Container{Name: caddyContainerName, State: "running"})
+
+	c := NewCaddyRouter(n, t.TempDir())
+	c.adminBaseURL = admin.URL
+
+	if err := c.EnsureUp(ctx); err != nil {
+		t.Fatalf("EnsureUp: %v", err)
+	}
+
+	for _, call := range n.Calls {
+		if call == "RunContainer:"+caddyContainerName {
+			t.Fatalf("expected no RunContainer call for an already-running lwd-caddy, got calls: %v", n.Calls)
+		}
+	}
+}
+
+// TestEnsureUpRemovesStaleCaddy verifies that a non-running lwd-caddy (e.g. an
+// exited leftover from a prior run, or an older build's container) is removed
+// before a fresh one is created, so the create doesn't fail with a
+// container-name conflict.
+func TestEnsureUpRemovesStaleCaddy(t *testing.T) {
+	ctx := context.Background()
+
+	admin := stubAdminStatus(http.StatusOK)
+	defer admin.Close()
+
+	n := node.NewFake()
+	stale := n.SeedContainer(node.Container{Name: caddyContainerName, State: "exited"})
+
+	c := NewCaddyRouter(n, t.TempDir())
+	c.adminBaseURL = admin.URL
+
+	if err := c.EnsureUp(ctx); err != nil {
+		t.Fatalf("EnsureUp: %v", err)
+	}
+
+	removeIdx, runIdx := -1, -1
+	for i, call := range n.Calls {
+		if call == "RemoveContainer:"+stale.ID {
+			removeIdx = i
+		}
+		if call == "RunContainer:"+caddyContainerName {
+			runIdx = i
+		}
+	}
+	if removeIdx == -1 {
+		t.Fatalf("expected RemoveContainer call for the stale lwd-caddy, got calls: %v", n.Calls)
+	}
+	if runIdx == -1 {
+		t.Fatalf("expected a RunContainer call to create a fresh lwd-caddy, got calls: %v", n.Calls)
+	}
+	if removeIdx > runIdx {
+		t.Fatalf("expected stale container removal before create, got calls: %v", n.Calls)
+	}
+}
+
+// TestEnsureUpPortConflictFriendlyError verifies that when no lwd-caddy exists
+// yet and Docker's create fails because host port 80/443 is already bound by
+// something else, EnsureUp returns a clear, actionable error instead of
+// leaking Docker's raw bind-failure message.
+func TestEnsureUpPortConflictFriendlyError(t *testing.T) {
+	ctx := context.Background()
+
+	n := node.NewFake()
+	n.RunErr = errors.New(`Bind for 0.0.0.0:80 failed: port is already allocated`)
+
+	c := NewCaddyRouter(n, t.TempDir())
+
+	err := c.EnsureUp(ctx)
+	if err == nil {
+		t.Fatal("expected EnsureUp to return an error on a port conflict")
+	}
+	if !strings.Contains(err.Error(), "host port 80 or 443 is already in use") {
+		t.Fatalf("expected a friendly port-conflict error, got: %v", err)
 	}
 }
 

@@ -162,6 +162,22 @@ func (f *Fake) RunContainer(ctx context.Context, spec RunSpec) (Container, error
 	return c, nil
 }
 
+// SeedContainer adds c directly to the Fake's tracked container set, as if a
+// prior RunContainer call had produced it. It exists so tests can simulate a
+// pre-existing container (e.g. a leftover lwd-caddy from an older build, or a
+// stale exited one) without going through RunContainer's spec-driven
+// Container construction. If c.ID is empty, a fresh fake ID is assigned.
+func (f *Fake) SeedContainer(c Container) Container {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c.ID == "" {
+		f.seq++
+		c.ID = fmt.Sprintf("fake-%d", f.seq)
+	}
+	f.items[c.ID] = c
+	return c
+}
+
 func (f *Fake) RemoveContainer(ctx context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
