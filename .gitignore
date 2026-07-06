@@ -10,3 +10,6 @@
 *.db
 *.db-journal
 secret.key
+
+# Superpowers SDD working dir (task briefs, reports, review diffs, ledgers)
+/.superpowers/
