@@ -912,7 +912,7 @@
                     <option value="custom">Custom…</option>
                   </select>
                 </div>
-                <button type="button" class="btn btn-ghost" @click="deploy.git.services.push(serviceRowFromPreset(deploy.git.presetChoice))" :disabled="deploy.busy">+ Add service</button>
+                <button type="button" class="btn btn-ghost" @click="addServiceRow(deploy.git.services, deploy.git.presetChoice)" :disabled="deploy.busy">+ Add service</button>
               </div>
             </div>
             <div class="modal__preview">
@@ -1065,7 +1065,7 @@
                     <option value="custom">Custom…</option>
                   </select>
                 </div>
-                <button type="button" class="btn btn-ghost" @click="deploy.builder.services.push(serviceRowFromPreset(deploy.builder.presetChoice))" :disabled="deploy.busy">+ Add service</button>
+                <button type="button" class="btn btn-ghost" @click="addServiceRow(deploy.builder.services, deploy.builder.presetChoice)" :disabled="deploy.busy">+ Add service</button>
               </div>
             </div>
             <div class="modal__preview">

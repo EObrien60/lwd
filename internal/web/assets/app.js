@@ -1109,10 +1109,29 @@ function dashboard() {
     },
 
     // SERVICE_PRESETS / serviceRowFromPreset: module-level (see above),
-    // exposed here so the deploy modal's preset <select> and "+ Add" button
-    // can reach them from the Alpine template.
+    // exposed here so the deploy modal's preset <select> can reach them.
     SERVICE_PRESETS,
     serviceRowFromPreset,
+
+    // addServiceRow appends a preset (or blank/custom) row to a tab's services
+    // list, uniquifying the row's name against the names already present so
+    // that clicking "+ Add" twice on the same preset yields postgres /
+    // postgres-2 rather than two [[services]] blocks with an identical name
+    // (which would collide in the rendered backing compose). The name stays
+    // fully editable afterward. `services` is the tab's services array,
+    // `choice` its presetChoice.
+    addServiceRow(services, choice) {
+      const row = serviceRowFromPreset(choice);
+      if (row.name) {
+        const taken = new Set(services.map((s) => s.name));
+        if (taken.has(row.name)) {
+          let n = 2;
+          while (taken.has(`${row.name}-${n}`)) n++;
+          row.name = `${row.name}-${n}`;
+        }
+      }
+      services.push(row);
+    },
 
     newGitForm() {
       return {
