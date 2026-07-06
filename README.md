@@ -962,11 +962,12 @@ LWD_WEB_PASSWORD=changeme ./lwd-web
   16 bytes** if set (`lwd-web` refuses to start with a shorter one). If
   unset, a random 32-byte key is generated at startup and sessions reset on
   restart.
-- `LWD_SOCKET` (optional) — overrides the daemon socket path lwd-web
+- `LWD_SOCKET` (optional) — overrides the daemon unix-socket path lwd-web
   connects to; defaults to `LWD_DATA_DIR` (default `/var/lib/lwd`) +
-  `lwd.sock`, same resolution the daemon itself uses. (Note: this env var is
-  read by `lwd-web` only — the `lwd` CLI and `lwd-mcp` always use
-  `LWD_DATA_DIR`/`lwd.sock` directly and do not consult `LWD_SOCKET`.)
+  `lwd.sock`, same resolution the daemon itself uses. (This is now shared
+  client behavior via `client.FromEnv`: the `lwd` CLI and `lwd-mcp` honor
+  `LWD_SOCKET` too. It is consulted only when `LWD_DAEMON` is unset — a TCP
+  daemon takes precedence.)
 
 **Auth:** a single shared admin password gates the whole dashboard.
 `POST /login` checks it with a constant-time compare and sets an
@@ -1247,7 +1248,7 @@ default and are optional.
 | `LWD_WEB_PASSWORD` | — | `lwd-web` (required to start) | The dashboard's single admin password. |
 | `LWD_WEB_ADDR` | `127.0.0.1:8079` | `lwd-web` | Listen address for the dashboard. A non-loopback value exposes it to the network over **plain HTTP** — put it behind TLS or a tunnel; see [Remote access](#remote-access--running-lwd-web-as-a-service). |
 | `LWD_WEB_SECRET` | random (regenerated per process) | `lwd-web` | Cookie-signing key; must be at least 16 bytes if set. |
-| `LWD_SOCKET` | (falls back to `LWD_DATA_DIR`/`lwd.sock`) | `lwd-web` only | Overrides the daemon socket path. Not consulted by the `lwd` CLI or `lwd-mcp`; superseded by `LWD_DAEMON` when that's set. |
+| `LWD_SOCKET` | (falls back to `LWD_DATA_DIR`/`lwd.sock`) | `lwd` CLI, `lwd-mcp`, `lwd-web` | Overrides the daemon unix-socket path these clients dial. Consulted only when `LWD_DAEMON` is unset (a TCP daemon takes precedence); default behavior is unchanged when both are unset. |
 | `LWD_RECONCILE_INTERVAL` | `15s` | `lwd daemon` | Delay between continuous-reconciler passes (`time.ParseDuration`; a zero/negative/unparseable value falls back to the default). |
 | `LWD_HEAL_MAX_ATTEMPTS` | `5` | `lwd daemon` | Consecutive self-heal attempts on a dead surface before it's reported `failed`. |
 | `LWD_FAILOVER_GRACE` | `60s` | `lwd daemon` | How long a registered node must be continuously unreachable before its scheduled surfaces are automatically evacuated. |

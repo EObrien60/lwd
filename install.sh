@@ -297,7 +297,8 @@ maybe_web() {
     asroot tee /etc/lwd/web.env >/dev/null <<'ENV'
 # lwd-web configuration (this file is 0600). Set a strong password.
 LWD_WEB_PASSWORD=CHANGE_ME
-LWD_WEB_ADDR=127.0.0.1:8079          # set 0.0.0.0:8079 to expose (put behind TLS/tunnel!)
+# Set 0.0.0.0:8079 to expose (put behind TLS/tunnel!)
+LWD_WEB_ADDR=127.0.0.1:8079
 # LWD_WEB_SECRET=<32+ bytes to persist sessions across restarts>
 # If lwd-web is NOT co-located with the daemon socket, point it at the daemon's TCP endpoint:
 # LWD_DAEMON=127.0.0.1:8077
