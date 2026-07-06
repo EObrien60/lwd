@@ -76,6 +76,34 @@ end-to-end against real Docker.
 **Prerequisites:** Go 1.25+, Docker, and (for compose apps only) the `docker
 compose` CLI plugin. No cgo is required — lwd uses a pure-Go SQLite driver.
 
+### Scripted install (Debian / RHEL family)
+
+`install.sh` fetches build dependencies, builds all four binaries, and installs
+them to `/usr/local/bin`. It auto-detects the package manager (**apt** on
+Debian/Ubuntu, **dnf/yum** on Fedora/RHEL/CentOS/Rocky/AlmaLinux) and, if the
+system Go is older than 1.25 (or absent), downloads a private Go toolchain to
+`/usr/local/go` — so it works even on distros whose packaged Go is behind.
+
+```bash
+git clone https://github.com/EObrien60/lwd && cd lwd
+sudo ./install.sh                # build + install the 4 binaries
+# or, in one line (clones for you):
+curl -fsSL https://raw.githubusercontent.com/EObrien60/lwd/main/install.sh | sudo bash
+
+# useful flags:
+sudo ./install.sh --docker       # also install Docker Engine + compose plugin if missing
+sudo ./install.sh --systemd      # also install & enable an lwd.service (daemon under systemd)
+sudo ./install.sh --docker --systemd
+sudo ./install.sh --prefix /opt/bin --go-version 1.25.4
+```
+
+It never uses cgo (pure-Go SQLite), so no C toolchain is installed — only Go,
+git, curl, and tar. Run `./install.sh --help` for all options. Docker itself is
+a **runtime** dependency (lwd drives a Docker daemon); pass `--docker` or install
+it yourself. WireGuard is only needed for multi-node fleets.
+
+### Or build manually
+
 ```bash
 # 1. Build the daemon + CLI (one binary does both)
 CGO_ENABLED=0 go build -o lwd ./cmd/lwd

@@ -1,0 +1,12 @@
+# Build output
+/.dist/
+/lwd
+/lwd-web
+/lwd-mcp
+/lwd-agent
+
+# Local runtime data (if a dev points LWD_DATA_DIR here)
+/var/
+*.db
+*.db-journal
+secret.key
