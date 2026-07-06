@@ -908,6 +908,13 @@ type replicaTarget struct {
 // spread" — see placeReplicas's doc comment). Requirements (CPU/memory)
 // apply per replica, matching Phase 11a's single-container behavior.
 //
+// This is a deliberate, hand-kept-in-sync duplicate of placeReplicas's
+// replicas-1..n-1 loop, NOT a call to it — see placeReplicas's doc comment
+// (P12 final-review FIX 4) for why: the anchor (index 0) is already resolved
+// by the time this runs, so re-deriving it via placeReplicas would risk a
+// second, later scheduler.Place call picking a different node than the one
+// already ensured/recorded as app.Node.
+//
 // scheduled is placement provenance (Phase 11b): recorded verbatim as
 // Scheduled on the StatusRunning deployment this call produces, and used
 // (as described above) to decide how replicas beyond the anchor are placed.

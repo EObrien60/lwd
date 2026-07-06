@@ -202,6 +202,22 @@ func (srv *Server) handleScale(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	// The snapshot's Node is whatever concrete node the ORIGINAL deploy
+	// resolved to (applyImageProvenance sets app.Node = chosen before
+	// marshaling), even for a scheduler-placed app whose spec declared Node
+	// == "". Replaying that snapshot as-is would make resolvePlacement see a
+	// non-empty Node and misclassify a scheduled app as pinned — collapsing
+	// every replica onto that one node and recording Scheduled=false, which
+	// disables node-loss failover for it going forward. cur.Scheduled (the
+	// CURRENT deployment's own provenance) is the source of truth: if it was
+	// scheduler-placed, clear Node so Apply re-invokes the scheduler and
+	// spreads the new replica set across nodes again; if it was pinned
+	// (cur.Scheduled == false), leave the snapshot's Node exactly as
+	// recorded so the pin is honored. This mirrors how Rollback threads
+	// prev.Scheduled through rollbackImage/rollbackGit.
+	if cur.Scheduled {
+		app.Node = ""
+	}
 	app.Replicas = req.Replicas
 	if err := app.Validate(); err != nil {
 		writeErr(w, http.StatusBadRequest, err)

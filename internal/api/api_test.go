@@ -1619,6 +1619,156 @@ func TestScaleUnknownApp(t *testing.T) {
 	}
 }
 
+// TestScaleScheduledAppRestaysSpreadAndScheduled covers the P12 final-review
+// FIX 1: `lwd scale` on a scheduler-placed (unpinned) app must not let the
+// current deployment's now-concrete snapshot Node be replayed as a pin.
+// Before the fix, handleScale unmarshaled cur.Spec verbatim — which already
+// carries the CONCRETE node the scheduler chose (applyImageProvenance sets
+// app.Node = chosen before marshaling) — so resolvePlacement would see a
+// non-empty Node and treat it as pinned: every replica stacked onto that one
+// node, and the new deployment was recorded Scheduled=false, silently
+// disabling node-loss failover for it. This deploys an unpinned 3-replica
+// app across 3 real candidate nodes (so the initial spread is genuine, not
+// an artifact of a single-node fake), scales it down, and asserts the
+// RESULT is still Scheduled=true and still spread across at least 2 distinct
+// nodes rather than collapsed onto one.
+func TestScaleScheduledAppRestaysSpreadAndScheduled(t *testing.T) {
+	ts, resolver, s := newSchedulingTestServer(t, "web1", "web2")
+
+	localFake := resolver["local"].(*node.Fake)
+	localFake.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 9000}
+	web1 := resolver["web1"].(*node.Fake)
+	web1.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 8000}
+	web2 := resolver["web2"].(*node.Fake)
+	web2.Cap = node.Capacity{Known: true, CPUCores: 4, MemAvailable: 7000}
+
+	for i, n := range []string{"web1", "web2"} {
+		if err := s.AddNode(store.Node{Name: n, SSHHost: "deploy@" + n, MeshAddr: fmt.Sprintf("100.64.0.%d", i+2), Pool: "default"}); err != nil {
+			t.Fatalf("AddNode %s: %v", n, err)
+		}
+	}
+
+	app := spec.App{
+		Name:     "blog",
+		Image:    "img:1",
+		Domain:   "blog.example.com",
+		Port:     8080,
+		Replicas: 3,
+		// Node left unset: unpinned, subject to scheduling.
+	}
+	body, _ := json.Marshal(app)
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /apply: %v", err)
+	}
+	var dep store.Deployment
+	if err := json.NewDecoder(resp.Body).Decode(&dep); err != nil {
+		t.Fatalf("decode apply: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("apply status = %d, dep = %+v", resp.StatusCode, dep)
+	}
+	if !dep.Scheduled {
+		t.Fatalf("setup: initial deploy Scheduled = false, want true (unpinned app)")
+	}
+	if len(dep.Replicas) != 3 {
+		t.Fatalf("setup: len(Replicas) = %d, want 3, got %+v", len(dep.Replicas), dep.Replicas)
+	}
+	initialNodes := map[string]bool{}
+	for _, r := range dep.Replicas {
+		initialNodes[r.Node] = true
+	}
+	if len(initialNodes) < 2 {
+		t.Fatalf("setup: replicas = %+v, want spread across >= 2 distinct nodes", dep.Replicas)
+	}
+
+	scaleBody, _ := json.Marshal(map[string]int{"replicas": 2})
+	sresp, err := http.Post(ts.URL+"/apps/blog/scale", "application/json", bytes.NewReader(scaleBody))
+	if err != nil {
+		t.Fatalf("POST scale: %v", err)
+	}
+	defer sresp.Body.Close()
+	if sresp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(sresp.Body)
+		t.Fatalf("status = %d, want 200, body = %s", sresp.StatusCode, b)
+	}
+	var scaled store.Deployment
+	if err := json.NewDecoder(sresp.Body).Decode(&scaled); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !scaled.Scheduled {
+		t.Errorf("scaled deployment Scheduled = false, want true — scaling a scheduler-placed app must preserve its placement provenance")
+	}
+	if len(scaled.Replicas) != 2 {
+		t.Fatalf("len(Replicas) = %d, want 2, got %+v", len(scaled.Replicas), scaled.Replicas)
+	}
+	scaledNodes := map[string]bool{}
+	for _, r := range scaled.Replicas {
+		scaledNodes[r.Node] = true
+	}
+	if len(scaledNodes) < 2 {
+		t.Errorf("scaled replicas = %+v, want spread across >= 2 distinct nodes (not stacked onto one)", scaled.Replicas)
+	}
+}
+
+// TestScalePinnedAppStaysPinned covers FIX 1's other branch: an app pinned
+// to an explicit node (Node: "web1" in its spec) already has cur.Scheduled
+// == false, so handleScale must leave the snapshot's Node exactly as
+// recorded — scaling it stacks every replica on that same node (an
+// operator's explicit placement choice, never spread), and the resulting
+// deployment stays Scheduled == false.
+func TestScalePinnedAppStaysPinned(t *testing.T) {
+	ts, _, s := newSchedulingTestServer(t, "web1")
+	if err := s.AddNode(store.Node{Name: "web1", SSHHost: "deploy@web1", MeshAddr: "100.64.0.2", Pool: "default"}); err != nil {
+		t.Fatalf("AddNode web1: %v", err)
+	}
+
+	app := spec.App{Name: "blog", Image: "img:1", Domain: "blog.example.com", Port: 8080, Node: "web1", Replicas: 3}
+	body, _ := json.Marshal(app)
+	resp, err := http.Post(ts.URL+"/apply", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /apply: %v", err)
+	}
+	var dep store.Deployment
+	if err := json.NewDecoder(resp.Body).Decode(&dep); err != nil {
+		t.Fatalf("decode apply: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("apply status = %d, dep = %+v", resp.StatusCode, dep)
+	}
+	if dep.Scheduled {
+		t.Fatalf("setup: pinned app Scheduled = true, want false")
+	}
+
+	scaleBody, _ := json.Marshal(map[string]int{"replicas": 2})
+	sresp, err := http.Post(ts.URL+"/apps/blog/scale", "application/json", bytes.NewReader(scaleBody))
+	if err != nil {
+		t.Fatalf("POST scale: %v", err)
+	}
+	defer sresp.Body.Close()
+	if sresp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(sresp.Body)
+		t.Fatalf("status = %d, want 200, body = %s", sresp.StatusCode, b)
+	}
+	var scaled store.Deployment
+	if err := json.NewDecoder(sresp.Body).Decode(&scaled); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if scaled.Scheduled {
+		t.Errorf("scaled deployment Scheduled = true, want false — a pinned app must stay pinned")
+	}
+	if len(scaled.Replicas) != 2 {
+		t.Fatalf("len(Replicas) = %d, want 2, got %+v", len(scaled.Replicas), scaled.Replicas)
+	}
+	for _, r := range scaled.Replicas {
+		if r.Node != "web1" {
+			t.Errorf("replica node = %q, want web1 (pinned app, no spread): %+v", r.Node, scaled.Replicas)
+		}
+	}
+}
+
 // TestAppStatusIncludesReplicas covers AppStatus.Replicas: GET /apps must
 // report the current deployment's replica count so `lwd ls` can show it.
 func TestAppStatusIncludesReplicas(t *testing.T) {

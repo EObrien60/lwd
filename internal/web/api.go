@@ -118,6 +118,20 @@ func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, fmt.Errorf("decode stored spec: %w", err))
 		return
 	}
+	// history[0] is the exact deployment whose Spec we just decoded, so its
+	// Scheduled field is that deployment's own placement provenance. A
+	// scheduler-placed (unpinned) app's snapshot has a CONCRETE Node baked in
+	// (applyImageProvenance sets app.Node = chosen before recording it), so
+	// replaying it as-is through client.Apply -> daemon POST /apply would
+	// make resolvePlacement see a non-empty Node and misclassify it as
+	// pinned — collapsing every replica onto one node and recording
+	// Scheduled=false, disabling node-loss failover going forward. Clearing
+	// Node when Scheduled re-invokes the scheduler on redeploy, exactly like
+	// handleScale's (internal/api) same fix for `lwd scale`. A pinned app
+	// (Scheduled == false) is left with its snapshot's Node untouched.
+	if history[0].Scheduled {
+		app.Node = ""
+	}
 
 	dep, err := s.client.Apply(r.Context(), &app)
 	if err != nil {

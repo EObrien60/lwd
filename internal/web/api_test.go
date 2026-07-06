@@ -392,6 +392,68 @@ func TestApiRedeploy(t *testing.T) {
 	}
 }
 
+// TestApiRedeployScheduledAppClearsNode covers the P12 final-review FIX 3:
+// redeploying a SCHEDULER-PLACED app must not replay the stored snapshot's
+// concrete Node verbatim. The newest deployment's Spec already carries the
+// concrete node the scheduler chose at deploy time (applyImageProvenance
+// sets app.Node = chosen before recording it) — replaying it as-is would
+// make the daemon's resolvePlacement see a non-empty Node and misclassify a
+// scheduled app as pinned, collapsing it onto one node and losing
+// Scheduled=true (disabling node-loss failover). handleRedeploy must clear
+// Node before calling Apply when history[0].Scheduled is true.
+func TestApiRedeployScheduledAppClearsNode(t *testing.T) {
+	appJSON, err := json.Marshal(&spec.App{Name: "foo", Image: "img:2", Port: 80, Node: "web1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd := newFakeDaemon()
+	fd.history["foo"] = []store.Deployment{
+		{ID: 2, App: "foo", Image: "img:2", Spec: string(appJSON), Scheduled: true},
+	}
+	srv, auth := testServer(fd)
+
+	req := authedRequest(t, auth, http.MethodPost, "/api/apps/foo/redeploy", nil)
+	rec := do(srv, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+	if len(fd.applied) != 1 {
+		t.Fatalf("applied count = %d, want 1", len(fd.applied))
+	}
+	if fd.applied[0].Node != "" {
+		t.Fatalf("applied Node = %q, want cleared (scheduled app must re-invoke the scheduler on redeploy)", fd.applied[0].Node)
+	}
+}
+
+// TestApiRedeployPinnedAppKeepsNode covers FIX 3's other branch: a PINNED
+// app's newest deployment has Scheduled == false, so handleRedeploy must
+// leave the snapshot's explicit Node untouched.
+func TestApiRedeployPinnedAppKeepsNode(t *testing.T) {
+	appJSON, err := json.Marshal(&spec.App{Name: "foo", Image: "img:2", Port: 80, Node: "web1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd := newFakeDaemon()
+	fd.history["foo"] = []store.Deployment{
+		{ID: 2, App: "foo", Image: "img:2", Spec: string(appJSON), Scheduled: false},
+	}
+	srv, auth := testServer(fd)
+
+	req := authedRequest(t, auth, http.MethodPost, "/api/apps/foo/redeploy", nil)
+	rec := do(srv, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+	if len(fd.applied) != 1 {
+		t.Fatalf("applied count = %d, want 1", len(fd.applied))
+	}
+	if fd.applied[0].Node != "web1" {
+		t.Fatalf("applied Node = %q, want web1 (pinned app must stay pinned)", fd.applied[0].Node)
+	}
+}
+
 func TestApiRedeployEmptyHistory(t *testing.T) {
 	fd := newFakeDaemon()
 	srv, auth := testServer(fd)

@@ -222,6 +222,24 @@ func (r *Reconciler) schedulableCandidates(ctx context.Context, app *spec.App, e
 // goes down, only the replicas on that node are lost. n<=0 is treated as 1
 // (belt-and-suspenders — an old snapshot could carry a zero Replicas).
 //
+// NOTE (P12 final-review FIX 4): deployReplicaSet does NOT call this
+// function — it has its own inline copy of the same spread-vs-stack loop for
+// replicas beyond the anchor (reconciler.go, in deployReplicaSet, guarded by
+// `if scheduled`). That duplication is intentional, not an oversight: by the
+// time deployReplicaSet runs, the caller (applyImageProvenance/applyGit) has
+// ALREADY resolved the anchor's node via resolvePlacement and used it to
+// ensure the image/network/backing services — so deployReplicaSet seeds
+// index 0 from that already-resolved target instead of asking the scheduler
+// again. Calling placeReplicas here would re-run scheduler.Place for index 0
+// a second time, against candidates gathered at a slightly later instant
+// (capacity can shift between calls), risking a DIFFERENT node than the one
+// already ensured/recorded as app.Node — a correctness regression, not a
+// refactor. Only the "replicas 1..n-1" half of the algorithm is shared
+// (verbatim) between the two; keep both in sync by hand if that spread rule
+// ever changes. This means placeReplicas itself has no production caller
+// today — it exists as a directly-testable specification of the spread rule
+// (see schedule_test.go) that deployReplicaSet's inline loop must match.
+//
 // A pinned app (Node set to anything other than "" or "local") places every
 // replica on that same node: a pin is an explicit operator choice with no
 // spread, and scheduled is reported false (Phase 11b placement provenance —
