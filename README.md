@@ -16,6 +16,7 @@ coding agents, and a per-node worker for multi-machine fleets.
 
 - [Status](#status)
 - [Quickstart](#quickstart)
+- [Troubleshooting: cannot reach the daemon / socket not found](#troubleshooting-cannot-reach-the-daemon--socket-not-found)
 - [Concepts](#concepts)
 - [The four binaries](#the-four-binaries)
 - [lwd.toml reference](#lwdtoml-reference)
@@ -163,6 +164,38 @@ From here:
 ./lwd logs app -f       # stream logs
 ./lwd rm app            # stop and deregister
 ```
+
+## Troubleshooting: cannot reach the daemon / socket not found
+
+If `lwd ls` (or any other client command) fails with something like `cannot
+reach the lwd daemon at unix:///var/lib/lwd/lwd.sock — is it running?`, the
+daemon either isn't running or never finished starting:
+
+- **The daemon needs root** — it creates `/var/lib/lwd`, a Docker network,
+  and a managed `lwd-caddy` container, and needs to talk to the Docker
+  socket. Run it with `sudo lwd daemon`, or point it at a directory your
+  user already owns via `LWD_DATA_DIR=<dir> lwd daemon` (no sudo needed, but
+  Docker access is still required — e.g. your user must be in the `docker`
+  group).
+- **A backgrounded daemon may have failed to start.** `lwd daemon &` prints
+  its error and exits silently in the background if, say, `mkdir
+  /var/lib/lwd` or the Docker connection fails — easy to miss. Check its
+  output, or if it's running as a systemd service (see `install.sh
+  --systemd`), check `journalctl -u lwd`.
+- **The CLI and daemon must agree on the socket path.** Both derive it from
+  `LWD_DATA_DIR` (default `/var/lib/lwd`, socket at `<data-dir>/lwd.sock`),
+  or you can pin it directly with `LWD_SOCKET` on the client side. If you
+  started the daemon with a custom `LWD_DATA_DIR` (or `LWD_SOCKET`), set the
+  same variable when running CLI commands, or the client will look for a
+  socket that isn't there.
+- **For a remote daemon**, set `LWD_DAEMON=host:port` (and `LWD_API_TOKEN`
+  if the daemon requires auth) instead of relying on the local socket — see
+  [Remote access & running lwd-web as a service](#remote-access--running-lwd-web-as-a-service).
+
+The friendly error message above is meant to point at these fixes directly;
+if it's still unclear, the three options in order of preference are `sudo
+lwd daemon`, `LWD_DATA_DIR=<writable-dir> lwd daemon`, or `sudo ./install.sh
+--systemd` to run it as a managed service.
 
 ## Concepts
 
