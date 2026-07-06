@@ -53,7 +53,7 @@ ok()   { printf '%s ok%s %s\n' "$c_green" "$c_off" "$*"; }
 warn() { printf '%swarn%s %s\n' "$c_red" "$c_off" "$*" >&2; }
 die()  { printf '%serror%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
 
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit "${1:-0}"; }
 
 # ---- arg parsing ------------------------------------------------------------
 while [ $# -gt 0 ]; do

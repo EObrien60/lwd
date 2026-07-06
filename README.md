@@ -33,6 +33,7 @@ coding agents, and a per-node worker for multi-machine fleets.
 - [Node maintenance & failover](#node-maintenance--failover)
 - [Self-healing & health](#self-healing--health)
 - [Web UI (lwd-web)](#web-ui-lwd-web)
+- [Remote access & running lwd-web as a service](#remote-access--running-lwd-web-as-a-service)
 - [Agent access (lwd-mcp)](#agent-access-lwd-mcp)
 - [Authoring lwd.toml (Claude skill)](#authoring-lwdtoml-claude-skill)
 - [Architecture & networking model](#architecture--networking-model)
@@ -972,6 +973,83 @@ never values); **redeploy** and **config edit**; a **Nodes** view
 pool + schedulable badge); and a **Health** view (the reconciler's live
 snapshot, auto-refreshing).
 
+## Remote access & running lwd-web as a service
+
+Everything above assumes `lwd-web` and `lwd daemon` on the same box, talking
+over the local unix socket. This section covers exposing `lwd-web` beyond
+`127.0.0.1`, giving the daemon its own TCP listener for a remote/tunneled
+client, and running both as systemd services.
+
+**Public `lwd-web`.** Setting `LWD_WEB_ADDR=0.0.0.0:8079` (or any
+non-loopback address) makes the dashboard reachable from other machines —
+but `lwd-web` serves **plain HTTP** with no built-in TLS, so put it behind a
+TLS-terminating proxy (e.g. Caddy) or an SSH tunnel before exposing it
+publicly. The session cookie is only marked `Secure` when the proxy sets
+`X-Forwarded-Proto: https`; over a bare non-loopback HTTP bind it isn't.
+`lwd-web` logs a startup warning whenever it's bound to a non-loopback
+address, as a reminder.
+
+**The daemon's TCP endpoint.** By default `lwd daemon` listens **only** on
+its local unix socket (`0600`, filesystem-permission-gated, no auth needed).
+Setting `LWD_ADDR` (e.g. `127.0.0.1:8077`, or an address on a private/
+WireGuard-mesh interface) makes it *additionally* listen on TCP. Because the
+daemon's API is full control (deploy, secrets, node management — everything),
+this is fail-closed: a **non-loopback** `LWD_ADDR` requires `LWD_API_TOKEN`
+to be set, or the daemon refuses to start at all
+(`LWD_ADDR "..." binds a non-loopback interface but LWD_API_TOKEN is
+unset — refusing to expose an unauthenticated control plane`). A
+**loopback** `LWD_ADDR` (`127.0.0.1`, `::1`, or `localhost`) may run
+token-less, since it's no more exposed than the unix socket — useful for an
+SSH tunnel. Requests to the TCP listener authenticate with a bearer token
+(`Authorization: Bearer <LWD_API_TOKEN>`), checked in constant time; the
+unix socket itself is never token-gated. Recommended topology: bind
+`LWD_ADDR` to loopback or a private mesh address only, and reach it through
+a password-protected `lwd-web` behind TLS or through a tunnel — never bind
+the daemon's TCP listener to a public interface, token or not.
+
+**Connecting a remote or tunneled client.** `lwd-web`, the `lwd` CLI, and
+`lwd-mcp` all resolve their daemon connection the same way
+(`client.FromEnv`): set `LWD_DAEMON=<host:port>` (a bare `host:port`, or a
+full `http://`/`https://` URL) plus `LWD_API_TOKEN` matching the daemon's,
+and they'll dial that TCP endpoint instead of the local socket. Leave
+`LWD_DAEMON` unset and nothing changes — the local unix socket is still the
+default for all three.
+
+**SSH-tunnel example.** If `lwd daemon` and `lwd-web` both run on the
+server and you just want the dashboard on your laptop:
+
+```bash
+ssh -L 8079:127.0.0.1:8079 you@server
+# then open http://127.0.0.1:8079 in a local browser
+```
+
+`lwd-web` on the server still talks to the daemon over the local unix
+socket — no `LWD_DAEMON` needed on either end. If instead you want to run
+`lwd-web` itself on your laptop against a daemon on a remote server, tunnel
+the daemon's TCP port instead and point `lwd-web` at it:
+
+```bash
+ssh -L 8077:127.0.0.1:8077 you@server   # server: LWD_ADDR=127.0.0.1:8077
+LWD_DAEMON=127.0.0.1:8077 LWD_API_TOKEN=... LWD_WEB_PASSWORD=... ./lwd-web
+```
+
+**Running as systemd services.** `sudo ./install.sh --web` installs and
+enables `lwd-web.service`, reading its environment from `/etc/lwd/web.env`
+(`0600`, root-owned). Set `LWD_WEB_PASSWORD` there — the installer writes
+a `CHANGE_ME` placeholder and deliberately does **not** start the service
+while that placeholder is still in place. `sudo ./install.sh --agent` does
+the same for `lwd-agent.service` + `/etc/lwd/agent.env`
+(`LWD_AGENT_TOKEN`). Add `LWD_ADDR`/`LWD_API_TOKEN`/`LWD_DAEMON` to the
+relevant env file the same way if you want a service using this remote-access
+setup.
+
+**Dogfooding note.** It's possible to deploy `lwd-web` itself as an app
+under `lwd` (as a surface pointed at the daemon via `LWD_DAEMON`), but
+running it under systemd instead is recommended — deploying the dashboard
+through the very daemon it depends on creates a restart/bootstrap ordering
+paradox (redeploying `lwd-web` can race with, or depend on, the daemon
+being up).
+
 ## Agent access (lwd-mcp)
 
 `lwd-mcp` is a local [Model Context Protocol](https://modelcontextprotocol.io)
@@ -1143,12 +1221,15 @@ default and are optional.
 | Variable | Default | Read by | Meaning |
 | --- | --- | --- | --- |
 | `LWD_DATA_DIR` | `/var/lib/lwd` | `lwd` (daemon + CLI), `lwd-mcp` | Root directory for the unix socket (`lwd.sock`), SQLite DB (`lwd.db`), generated Caddyfile, and the secret-encryption key (`secret.key`). |
+| `LWD_ADDR` | — (unix socket only) | `lwd daemon` | Additional TCP listen address for the daemon's API (e.g. `127.0.0.1:8077`, or a private/mesh IP). A **non-loopback** value requires `LWD_API_TOKEN` — the daemon refuses to start otherwise (fail-closed); a loopback value may run token-less. See [Remote access](#remote-access--running-lwd-web-as-a-service). |
+| `LWD_API_TOKEN` | — | `lwd daemon` (bearer required by the `LWD_ADDR` TCP listener), any client (`lwd` CLI, `lwd-web`, `lwd-mcp`) connecting via `LWD_DAEMON` | Bearer token for the daemon's TCP listener, checked in constant time. Never consulted for the unix socket. |
+| `LWD_DAEMON` | — (unix socket) | `lwd` (CLI), `lwd-web`, `lwd-mcp` (via `client.FromEnv`) | Remote daemon connect target (`host:port` or `http(s)://host:port`); pairs with `LWD_API_TOKEN`. Unset means dial the local unix socket, unchanged from before this feature. |
 | `LWD_AGENT_TOKEN` | — | `lwd daemon` (as the client credential), `lwd-agent` (required to start) | Shared bearer token authenticating controller ↔ `lwd-agent` traffic. |
 | `LWD_AGENT_ADDR` | `:8078` | `lwd-agent` | Listen address for the agent's HTTP API — bind to the mesh interface. |
 | `LWD_WEB_PASSWORD` | — | `lwd-web` (required to start) | The dashboard's single admin password. |
-| `LWD_WEB_ADDR` | `127.0.0.1:8079` | `lwd-web` | Listen address for the dashboard. |
+| `LWD_WEB_ADDR` | `127.0.0.1:8079` | `lwd-web` | Listen address for the dashboard. A non-loopback value exposes it to the network over **plain HTTP** — put it behind TLS or a tunnel; see [Remote access](#remote-access--running-lwd-web-as-a-service). |
 | `LWD_WEB_SECRET` | random (regenerated per process) | `lwd-web` | Cookie-signing key; must be at least 16 bytes if set. |
-| `LWD_SOCKET` | (falls back to `LWD_DATA_DIR`/`lwd.sock`) | `lwd-web` only | Overrides the daemon socket path. Not consulted by the `lwd` CLI or `lwd-mcp`. |
+| `LWD_SOCKET` | (falls back to `LWD_DATA_DIR`/`lwd.sock`) | `lwd-web` only | Overrides the daemon socket path. Not consulted by the `lwd` CLI or `lwd-mcp`; superseded by `LWD_DAEMON` when that's set. |
 | `LWD_RECONCILE_INTERVAL` | `15s` | `lwd daemon` | Delay between continuous-reconciler passes (`time.ParseDuration`; a zero/negative/unparseable value falls back to the default). |
 | `LWD_HEAL_MAX_ATTEMPTS` | `5` | `lwd daemon` | Consecutive self-heal attempts on a dead surface before it's reported `failed`. |
 | `LWD_FAILOVER_GRACE` | `60s` | `lwd daemon` | How long a registered node must be continuously unreachable before its scheduled surfaces are automatically evacuated. |
