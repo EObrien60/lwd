@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -123,16 +124,38 @@ var _ Router = (*CaddyRouter)(nil)
 
 // EnsureUp ensures the lwd network exists and the lwd-caddy container is
 // running, then reloads Caddy with the current route set.
+//
+// The container-presence check is by NAME alone (see findCaddy), not by name
+// + running + the current build's labels: an lwd-caddy left over from an
+// older build (different or no lwd.role label), or one that exited/crashed,
+// must not cause EnsureUp to blindly attempt to create a second lwd-caddy —
+// that create races the leftover for host ports 80/443/2019 and fails with a
+// confusing "port is already allocated" Docker error. Instead: a RUNNING
+// lwd-caddy (any labels) is adopted as-is; a non-running one is removed and a
+// fresh one created in its place.
 func (c *CaddyRouter) EnsureUp(ctx context.Context) error {
 	if err := c.node.EnsureNetwork(ctx, networkName); err != nil {
 		return fmt.Errorf("router: ensure network: %w", err)
 	}
 
-	running, err := c.caddyRunning(ctx)
+	ct, found, err := c.findCaddy(ctx)
 	if err != nil {
 		return fmt.Errorf("router: check caddy container: %w", err)
 	}
-	if !running {
+
+	if found && ct.State == "running" {
+		// Adopt: reuse the already-running lwd-caddy as-is (e.g. across a
+		// daemon restart); the create path below never runs.
+	} else {
+		if found {
+			// Stale: an lwd-caddy exists but isn't running (older-build
+			// leftover, crashed, or manually stopped). Remove it first so the
+			// create below doesn't fail with a container-name conflict.
+			if err := c.node.RemoveContainer(ctx, ct.ID); err != nil {
+				return fmt.Errorf("router: remove stale caddy container: %w", err)
+			}
+		}
+
 		if err := c.node.EnsureImage(ctx, "caddy:2"); err != nil {
 			return fmt.Errorf("router: ensure caddy image: %w", err)
 		}
@@ -151,7 +174,7 @@ func (c *CaddyRouter) EnsureUp(ctx context.Context) error {
 		// from the very first instant the container runs, before Reload ever
 		// POSTs the real route config to it.
 		bootstrap := GenerateCaddyfile(adminAddr, nil)
-		_, err := c.node.RunContainer(ctx, node.RunSpec{
+		spec := node.RunSpec{
 			Name:    caddyContainerName,
 			Image:   "caddy:2",
 			Network: networkName,
@@ -164,9 +187,30 @@ func (c *CaddyRouter) EnsureUp(ctx context.Context) error {
 				{HostPort: 2019, ContainerPort: 2019},
 			},
 			Labels: map[string]string{"lwd.role": "system"},
-		})
-		if err != nil {
-			return fmt.Errorf("router: run caddy container: %w", err)
+		}
+
+		if _, err := c.node.RunContainer(ctx, spec); err != nil {
+			switch {
+			case strings.Contains(err.Error(), "already allocated") || strings.Contains(err.Error(), "address already in use"):
+				// A genuine host-port conflict: 80/443/2019 is held by some
+				// other process or container lwd doesn't manage. Creating a
+				// second lwd-caddy can never fix this — surface a clear,
+				// actionable error instead of Docker's raw bind message.
+				return fmt.Errorf("router: cannot start lwd's ingress proxy — host port 80 or 443 is already in use by another process/container. lwd needs 80 and 443 for HTTP/HTTPS ingress; stop the conflicting service (docker ps / ss -ltnp) and retry: %w", err)
+			case strings.Contains(err.Error(), "already in use"):
+				// A container-NAME conflict: some lwd-caddy findCaddy didn't
+				// see a moment ago (e.g. a concurrent EnsureUp, or a race
+				// with an external `docker run`) is occupying the name.
+				// Remove whatever's there now and retry the create once.
+				if again, foundAgain, ferr := c.findCaddy(ctx); ferr == nil && foundAgain {
+					_ = c.node.RemoveContainer(ctx, again.ID)
+				}
+				if _, retryErr := c.node.RunContainer(ctx, spec); retryErr != nil {
+					return fmt.Errorf("router: run caddy container: %w", retryErr)
+				}
+			default:
+				return fmt.Errorf("router: run caddy container: %w", err)
+			}
 		}
 	}
 
@@ -219,19 +263,23 @@ func (c *CaddyRouter) pingAdmin(ctx context.Context) error {
 	return nil
 }
 
-// caddyRunning reports whether the lwd-caddy container already exists and is
-// running.
-func (c *CaddyRouter) caddyRunning(ctx context.Context) (bool, error) {
-	containers, err := c.node.ListContainers(ctx, map[string]string{"lwd.role": "system"})
+// findCaddy returns the lwd-caddy container, if one exists, regardless of its
+// state or labels. It deliberately does NOT filter by label: an lwd-caddy
+// left over from an older lwd build (different or missing lwd.role label) or
+// one that's exited must still be found, so EnsureUp can adopt or clean it up
+// instead of blindly trying to create a second one and colliding on host
+// ports 80/443/2019.
+func (c *CaddyRouter) findCaddy(ctx context.Context) (node.Container, bool, error) {
+	containers, err := c.node.ListContainers(ctx, nil)
 	if err != nil {
-		return false, err
+		return node.Container{}, false, err
 	}
 	for _, ct := range containers {
-		if ct.Name == caddyContainerName && ct.State == "running" {
-			return true, nil
+		if ct.Name == caddyContainerName {
+			return ct, true, nil
 		}
 	}
-	return false, nil
+	return node.Container{}, false, nil
 }
 
 // SetRoute installs or replaces the active route for r.Domain and reloads

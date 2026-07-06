@@ -104,6 +104,17 @@ git, curl, and tar. Run `./install.sh --help` for all options. Docker itself is
 a **runtime** dependency (lwd drives a Docker daemon); pass `--docker` or install
 it yourself. WireGuard is only needed for multi-node fleets.
 
+> **One-command public setup.** Don't want to touch any config? `sudo
+> ./install.sh --public` installs Docker (if missing), builds the binaries,
+> and stands up the daemon **and** the web dashboard as systemd services —
+> zero interaction. It auto-generates a strong dashboard password and session
+> secret, binds the dashboard on `0.0.0.0:8079`, starts both services, and
+> prints the dashboard URL and password at the end. Pass `--web-password
+> <yours>` to set your own instead of generating one. The dashboard is served
+> over **plain HTTP** — fine for a quick look or behind a VPN/SSH tunnel, but
+> put a real TLS terminator (or restrict `:8079` to a tunnel) in front of it
+> before treating it as internet-facing.
+
 **Updating an existing install.** From a git checkout, pull and re-run with
 `--update`:
 
@@ -196,6 +207,26 @@ The friendly error message above is meant to point at these fixes directly;
 if it's still unclear, the three options in order of preference are `sudo
 lwd daemon`, `LWD_DATA_DIR=<writable-dir> lwd daemon`, or `sudo ./install.sh
 --systemd` to run it as a managed service.
+
+### Troubleshooting: `:80`/`:443` already in use
+
+lwd's own managed Caddy (`lwd-caddy`) is the single thing that owns host
+ports 80 and 443 — it's the edge that routes every deployed app's `domain`.
+If something else on the box is already bound to 80 or 443 (another
+webserver, a stray Caddy/nginx, a previous `lwd-caddy` container from a
+different Docker context), the daemon will fail to start the edge:
+
+- If a **stopped or orphaned `lwd-caddy` container** already exists, the
+  daemon adopts it if it's healthy and running; otherwise it removes the
+  stale container and recreates it. If that recreation still fails (because
+  something *else* holds the port), you'll get a clear error naming the port
+  and the container it couldn't bind, rather than a silent hang.
+- **Free the ports or stop the conflicting service** — e.g. `sudo systemctl
+  stop nginx` / `apache2`, or `docker ps` to find and stop whatever else is
+  publishing `0.0.0.0:80`/`:443`, then retry `lwd daemon` (or restart the
+  `lwd` systemd unit).
+- This is independent of `lwd-web`'s own port (`8079` by default) — the
+  dashboard doesn't touch 80/443 at all.
 
 ## Concepts
 
