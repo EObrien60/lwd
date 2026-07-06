@@ -9,16 +9,22 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 
 	"lwd/internal/api"
+	"lwd/internal/config"
 	"lwd/internal/reconciler"
 	"lwd/internal/spec"
 	"lwd/internal/store"
 )
 
-// Client talks to the lwd daemon over a unix socket.
+// Client talks to the lwd daemon, either over a local unix socket (New) or
+// over TCP with bearer-token auth (NewHTTP) — see FromEnv for how the
+// CLI/web frontends pick between the two.
 type Client struct {
 	http *http.Client
+	base string
 }
 
 // New returns a Client that dials the given unix socket path. The host in URLs
@@ -33,10 +39,78 @@ func New(socketPath string) *Client {
 				},
 			},
 		},
+		base: "http://lwd",
 	}
 }
 
-func (c *Client) url(path string) string { return "http://lwd" + path }
+// bearerTransport wraps an http.RoundTripper, adding an Authorization:
+// Bearer <token> header to every outgoing request. It clones the request
+// before mutating it, per http.RoundTripper's contract that RoundTrip must
+// not modify the request.
+type bearerTransport struct {
+	base  http.RoundTripper
+	token string
+}
+
+func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.Header.Set("Authorization", "Bearer "+t.token)
+	return t.base.RoundTrip(req)
+}
+
+// NewHTTP returns a Client that talks to the daemon's TCP API listener at
+// baseURL, authenticating with token (sent as "Authorization: Bearer
+// <token>" on every request). baseURL may be a bare host:port (e.g.
+// "10.0.0.5:8077"), in which case "http://" is assumed, or a full
+// "http(s)://..." URL; any trailing slash is trimmed. If token is empty, no
+// Authorization header is sent (matching an unauthenticated daemon).
+//
+// No client-wide timeout is set — same as New — so a long-lived streaming
+// request (e.g. Logs with follow=true) is bounded only by its context, never
+// killed out from under it by an http.Client deadline.
+func NewHTTP(baseURL, token string) *Client {
+	base := strings.TrimSuffix(baseURL, "/")
+	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+		base = "http://" + base
+	}
+
+	var transport http.RoundTripper = &http.Transport{}
+	if token != "" {
+		transport = &bearerTransport{base: transport, token: token}
+	}
+
+	return &Client{
+		http: &http.Client{Transport: transport},
+		base: base,
+	}
+}
+
+// firstNonEmpty returns the first non-empty string among vs, or "" if all
+// are empty.
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// FromEnv builds a Client from environment configuration, preferring a
+// remote TCP daemon over the local unix socket:
+//
+//   - LWD_DAEMON set: dial it over TCP via NewHTTP, authenticating with
+//     LWD_API_TOKEN (may be empty for an unauthenticated daemon).
+//   - LWD_DAEMON unset: dial the local unix socket via New, using
+//     LWD_SOCKET if set, else the default socket path from internal/config.
+func FromEnv() *Client {
+	if daemon := os.Getenv("LWD_DAEMON"); daemon != "" {
+		return NewHTTP(daemon, os.Getenv("LWD_API_TOKEN"))
+	}
+	return New(firstNonEmpty(os.Getenv("LWD_SOCKET"), config.SocketPath()))
+}
+
+func (c *Client) url(path string) string { return c.base + path }
 
 func decodeErr(resp *http.Response) error {
 	var e struct {
