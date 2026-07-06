@@ -166,8 +166,38 @@ func runDaemon() int {
 	fmt.Println("lwd daemon listening on", sock)
 	httpSrv := &http.Server{Handler: srv.Handler()}
 
-	serveErr := make(chan error, 1)
+	serveErr := make(chan error, 2)
 	go func() { serveErr <- httpSrv.Serve(ln) }()
+
+	// Optional second listener: a token-guarded TCP socket for remote access
+	// (lwd-web, a remote CLI, ...), alongside the always-on unix socket. It
+	// is entirely opt-in (LWD_ADDR unset means none of this runs, and
+	// httpSrv above is completely unaffected) and fail-closed: a non-loopback
+	// bind address with no LWD_API_TOKEN configured refuses to start the
+	// daemon at all, rather than silently serving lwd's unauthenticated API
+	// to the network (see apiListenAllowed). The unix socket's own handler,
+	// httpSrv, never gets the bearer middleware — its 0600 file permissions
+	// remain its access boundary, unchanged by any of this.
+	var tcpSrv *http.Server
+	if addr := config.APIAddr(); addr != "" {
+		token := config.APIToken()
+		if err := apiListenAllowed(addr, token); err != nil {
+			fmt.Fprintln(os.Stderr, "lwd:", err)
+			return 1
+		}
+		tcpLn, err := net.Listen("tcp", addr)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "listen:", err)
+			return 1
+		}
+		authState := "off"
+		if token != "" {
+			authState = "on"
+		}
+		fmt.Printf("lwd daemon also listening on tcp %s (auth: %s)\n", addr, authState)
+		tcpSrv = &http.Server{Handler: bearerMiddleware(token, srv.Handler())}
+		go func() { serveErr <- tcpSrv.Serve(tcpLn) }()
+	}
 
 	select {
 	case err := <-serveErr:
@@ -185,6 +215,12 @@ func runDaemon() int {
 		if err := httpSrv.Shutdown(sctx); err != nil {
 			fmt.Fprintln(os.Stderr, "shutdown:", err)
 			return 1
+		}
+		if tcpSrv != nil {
+			if err := tcpSrv.Shutdown(sctx); err != nil {
+				fmt.Fprintln(os.Stderr, "shutdown:", err)
+				return 1
+			}
 		}
 	}
 	return 0
@@ -286,7 +322,7 @@ func buildInitialRoutes(ctx context.Context, n node.Node, s *store.Store) ([]rou
 	return out, nil
 }
 
-func newClient() *client.Client { return client.New(config.SocketPath()) }
+func newClient() *client.Client { return client.FromEnv() }
 
 func runApply(args []string) int {
 	dir := "."

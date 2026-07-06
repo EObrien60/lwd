@@ -102,3 +102,31 @@ func TestFailoverGraceNonPositive(t *testing.T) {
 		t.Errorf("FailoverGrace() = %v, want default 60s for \"garbage\"", got)
 	}
 }
+
+// TestAPIAddrEnv covers the optional remote-daemon-access TCP listener
+// address: unset LWD_ADDR means "disabled" (empty string, not a default
+// address like ":8077") since binding a TCP listener at all must be an
+// explicit opt-in (see apiListenAllowed's fail-closed guard in package cli).
+func TestAPIAddrEnv(t *testing.T) {
+	if got := APIAddr(); got != "" {
+		t.Errorf("APIAddr() = %q, want \"\" when LWD_ADDR is unset", got)
+	}
+
+	t.Setenv("LWD_ADDR", ":8077")
+	if got := APIAddr(); got != ":8077" {
+		t.Errorf("APIAddr() = %q, want \":8077\"", got)
+	}
+}
+
+// TestAPITokenEnv covers the bearer token used to guard the optional TCP
+// listener: unset LWD_API_TOKEN means "no token configured" (empty string).
+func TestAPITokenEnv(t *testing.T) {
+	if got := APIToken(); got != "" {
+		t.Errorf("APIToken() = %q, want \"\" when LWD_API_TOKEN is unset", got)
+	}
+
+	t.Setenv("LWD_API_TOKEN", "s3cr3t")
+	if got := APIToken(); got != "s3cr3t" {
+		t.Errorf("APIToken() = %q, want \"s3cr3t\"", got)
+	}
+}

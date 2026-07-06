@@ -95,3 +95,16 @@ func FailoverGrace() time.Duration {
 	}
 	return d
 }
+
+// APIAddr returns the address the daemon should additionally listen on for
+// remote (TCP) API access (LWD_ADDR, e.g. ":8077" or "127.0.0.1:8077"). The
+// default is "" — disabled — since exposing the control plane over the
+// network at all must be an explicit operator opt-in, not a default.
+func APIAddr() string { return os.Getenv("LWD_ADDR") }
+
+// APIToken returns the bearer token required to authenticate against the
+// optional TCP listener (LWD_API_TOKEN). The default is "" — no token — but
+// see the fail-closed guard in internal/cli: a non-loopback APIAddr with an
+// empty APIToken refuses to start the daemon rather than serving an
+// unauthenticated control plane on the network.
+func APIToken() string { return os.Getenv("LWD_API_TOKEN") }

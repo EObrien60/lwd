@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -86,6 +87,33 @@ func TestLoadConfigRequiresPassword(t *testing.T) {
 	}
 	if len(cfg.SigningKey) != 32 {
 		t.Fatalf("expected generated signing key of 32 bytes, got %d", len(cfg.SigningKey))
+	}
+}
+
+// TestLoadConfigReturnsAddrPasswordKey pins web.Config down to exactly the
+// three fields it needs (Addr, Password, SigningKey). It must NOT have a
+// SocketPath field: resolving the daemon target (unix socket vs. remote TCP)
+// is now entirely client.FromEnv's job (LWD_DAEMON/LWD_API_TOKEN/LWD_SOCKET),
+// not web.Config's.
+func TestLoadConfigReturnsAddrPasswordKey(t *testing.T) {
+	t.Setenv("LWD_WEB_PASSWORD", "hunter2")
+	t.Setenv("LWD_WEB_ADDR", "")
+	t.Setenv("LWD_WEB_SECRET", "")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Addr == "" || cfg.Password == "" || len(cfg.SigningKey) == 0 {
+		t.Fatalf("expected Addr/Password/SigningKey to be populated: %+v", cfg)
+	}
+
+	typ := reflect.TypeOf(cfg)
+	if typ.NumField() != 3 {
+		t.Fatalf("expected Config to have exactly 3 fields (Addr, Password, SigningKey), got %d: %+v", typ.NumField(), cfg)
+	}
+	if _, ok := typ.FieldByName("SocketPath"); ok {
+		t.Fatalf("expected Config to not have a SocketPath field (daemon target now resolved by client.FromEnv)")
 	}
 }
 

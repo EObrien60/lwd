@@ -1,9 +1,10 @@
-// Command lwd-mcp is a local Model Context Protocol (MCP) server: an agent
+// Command lwd-mcp is a Model Context Protocol (MCP) server: an agent
 // launches it over stdio, and it exposes lwd's daemon operations (list,
-// deploy, roll back, logs, secrets, ...) as MCP tools by calling the daemon
-// over its unix socket, exactly as the CLI does. It requires `lwd daemon` to
-// already be running on the same box; it makes no daemon changes and opens
-// no network listener.
+// deploy, roll back, logs, secrets, ...) as MCP tools by calling the daemon,
+// exactly as the CLI does. By default it dials `lwd daemon`'s unix socket on
+// the same box; set LWD_DAEMON (+ optionally LWD_API_TOKEN) to point it at a
+// remote daemon over TCP instead (see client.FromEnv). It makes no daemon
+// changes and opens no network listener of its own.
 //
 // stdout is the MCP JSON-RPC channel: nothing but protocol frames may be
 // written there. All diagnostic logging goes to stderr.
@@ -16,7 +17,6 @@ import (
 	"os"
 
 	"lwd/internal/client"
-	"lwd/internal/config"
 	"lwd/internal/mcp"
 	"lwd/internal/version"
 )
@@ -30,11 +30,10 @@ func main() {
 	log.SetOutput(os.Stderr)
 	log.SetFlags(log.LstdFlags)
 
-	socketPath := config.SocketPath()
-	c := client.New(socketPath)
+	c := client.FromEnv()
 	srv := mcp.NewServer(c)
 
-	log.Printf("lwd-mcp: serving MCP over stdio (daemon socket %s)", socketPath)
+	log.Printf("lwd-mcp: serving MCP over stdio")
 	if err := srv.Serve(context.Background()); err != nil {
 		log.Printf("lwd-mcp: %v", err)
 		os.Exit(1)
