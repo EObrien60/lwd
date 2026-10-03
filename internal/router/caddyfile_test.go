@@ -5,85 +5,68 @@ import (
 	"testing"
 )
 
-func TestGenerateCaddyfileSortedWithTLS(t *testing.T) {
-	out := GenerateCaddyfile("127.0.0.1:2019", []Route{
-		{Domain: "b.example.com", Upstreams: []Upstream{{Host: "lwd-b-2", Port: 8080}}},
-		{Domain: "a.localhost", Upstreams: []Upstream{{Host: "lwd-a-1", Port: 3000}}, TLSInternal: true},
+const golden = `{
+	admin 127.0.0.1:2019
+	email ops@example.com
+}
+
+a.example.com {
+	reverse_proxy 127.0.0.1:20001
+}
+
+b.lwd.internal {
+	tls internal
+	reverse_proxy 127.0.0.1:20000
+}
+`
+
+func TestGenerateCaddyfileGolden(t *testing.T) {
+	out := GenerateCaddyfile(Global{Admin: "127.0.0.1:2019", Email: "ops@example.com"}, []Route{
+		{Domain: "b.lwd.internal", Upstream: "127.0.0.1:20000", TLSInternal: true},
+		{Domain: "a.example.com", Upstream: "127.0.0.1:20001"},
 	})
-	if !strings.Contains(out, "admin 127.0.0.1:2019") {
-		t.Error("missing admin directive")
-	}
-	// deterministic order: a.localhost block appears before b.example.com
-	ai := strings.Index(out, "a.localhost")
-	bi := strings.Index(out, "b.example.com")
-	if ai == -1 || bi == -1 || ai > bi {
-		t.Fatalf("blocks not sorted: a=%d b=%d\n%s", ai, bi, out)
-	}
-	if !strings.Contains(out, "reverse_proxy lwd-b-2:8080") {
-		t.Error("missing reverse_proxy for b")
-	}
-	if !strings.Contains(out, "tls internal") {
-		t.Error("a.localhost should use internal TLS")
-	}
-	// Every route must claim BOTH the plain-http and https addresses for its
-	// domain (not a bare-domain block), so Caddy's automatic HTTP->HTTPS
-	// redirect never kicks in — see the comment in GenerateCaddyfile. A
-	// regression to a bare "b.example.com {" block would silently reintroduce
-	// the redirect and break plain-HTTP health probes; this substring check
-	// catches that here, without needing the Docker-gated e2e test.
-	if !strings.Contains(out, "http://b.example.com, https://b.example.com {") {
-		t.Error("b.example.com route must bind both http:// and https:// addresses")
-	}
-	if !strings.Contains(out, "http://a.localhost, https://a.localhost {") {
-		t.Error("a.localhost route must bind both http:// and https:// addresses")
+	if out != golden {
+		t.Fatalf("got:\n%s\nwant:\n%s", out, golden)
 	}
 }
 
-func TestGenerateCaddyfileEmpty(t *testing.T) {
-	out := GenerateCaddyfile("127.0.0.1:2019", nil)
-	if !strings.Contains(out, "admin 127.0.0.1:2019") {
-		t.Error("empty config must still set admin")
+func TestGenerateCaddyfileNoRoutesNoEmail(t *testing.T) {
+	out := GenerateCaddyfile(Global{Admin: "127.0.0.1:2019"}, nil)
+	if out != "{\n\tadmin 127.0.0.1:2019\n}\n" {
+		t.Fatalf("got %q", out)
 	}
 }
 
-// singleUpstreamGolden is the exact expected output for a single-domain,
-// single-upstream, TLS-internal route. It is the non-regression anchor for
-// Phase 12's multi-upstream generalization: a 1-element Upstreams slice must
-// render byte-identical to what a bare Upstream/Port pair rendered before
-// this change.
-const singleUpstreamGolden = "{\n\tadmin 127.0.0.1:2019\n}\n\nhttp://a.localhost, https://a.localhost {\n\ttls internal\n\treverse_proxy lwd-a-1:3000\n}\n\n"
-
-func TestGenerateCaddyfileSingleUpstreamUnchanged(t *testing.T) {
-	out := GenerateCaddyfile("127.0.0.1:2019", []Route{
-		{Domain: "a.localhost", Upstreams: []Upstream{{Host: "lwd-a-1", Port: 3000}}, TLSInternal: true},
-	})
-	if out != singleUpstreamGolden {
-		t.Fatalf("single-upstream output changed (non-regression break):\ngot:\n%q\nwant:\n%q", out, singleUpstreamGolden)
+func TestGenerateCaddyfileNoPlainHTTPAddress(t *testing.T) {
+	// A bare domain address is what makes Caddy redirect HTTP to HTTPS.
+	out := GenerateCaddyfile(Global{Admin: "127.0.0.1:2019"}, []Route{{Domain: "x.example.com", Upstream: "127.0.0.1:20000"}})
+	if strings.Contains(out, "http://") {
+		t.Fatalf("site address must not carry a scheme:\n%s", out)
 	}
 }
 
-func TestGenerateCaddyfileMultiUpstreamRoundRobin(t *testing.T) {
-	out := GenerateCaddyfile("127.0.0.1:2019", []Route{
-		{
-			Domain: "app.example.com",
-			Upstreams: []Upstream{
-				{Host: "h1", Port: 1001},
-				{Host: "h2", Port: 1002},
-				{Host: "h3", Port: 1003},
-			},
-		},
-	})
-	if !strings.Contains(out, "to h1:1001 h2:1002 h3:1003") {
-		t.Errorf("missing 'to' directive with all upstreams:\n%s", out)
+func TestGenerateCaddyfileDeterministic(t *testing.T) {
+	routes := []Route{
+		{Domain: "c.example.com", Upstream: "127.0.0.1:3"},
+		{Domain: "a.example.com", Upstream: "127.0.0.1:1"},
+		{Domain: "b.example.com", Upstream: "127.0.0.1:2"},
 	}
-	if !strings.Contains(out, "lb_policy round_robin") {
-		t.Errorf("missing lb_policy round_robin:\n%s", out)
+	first := GenerateCaddyfile(Global{Admin: "a"}, routes)
+	routes[0], routes[2] = routes[2], routes[0]
+	if second := GenerateCaddyfile(Global{Admin: "a"}, routes); first != second {
+		t.Fatalf("output depends on input order:\n%s\n---\n%s", first, second)
 	}
-	if !strings.Contains(out, "fail_duration 30s") {
-		t.Errorf("missing fail_duration 30s:\n%s", out)
+}
+
+func TestValidDomain(t *testing.T) {
+	for _, d := range []string{"example.com", "a-b.c1.lwd.internal", "localhost", "x.y"} {
+		if !ValidDomain(d) {
+			t.Errorf("%q should be valid", d)
+		}
 	}
-	// Must not fall into the single-upstream one-liner form.
-	if strings.Contains(out, "reverse_proxy h1:1001\n") {
-		t.Errorf("multi-upstream route rendered as single-upstream one-liner:\n%s", out)
+	for _, d := range []string{"", "Example.com", "a..b", "-a.com", "a-.com", "a.com {", "a.com\n}", "*.a.com", "http://a.com", "a.com:443", strings.Repeat("a", 64) + ".com"} {
+		if ValidDomain(d) {
+			t.Errorf("%q should be invalid", d)
+		}
 	}
 }
