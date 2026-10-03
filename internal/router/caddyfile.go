@@ -13,7 +13,20 @@ import (
 type Global struct {
 	Admin string // admin listener, e.g. 127.0.0.1:2019; never reachable from containers
 	Email string // optional ACME account email
+	// DNS selects the ACME DNS-01 provider for every certificate on this host
+	// ("" = Caddy's default HTTP/TLS-ALPN challenges). Private hosts that the
+	// internet cannot reach need it to get publicly trusted certificates.
+	DNS string
 }
+
+// DNS-01 providers a node may use; each needs the matching Caddy plugin and
+// reads its credential from the Caddy container's environment.
+var dnsProviders = map[string]string{
+	"cloudflare": "cloudflare {env.CLOUDFLARE_API_TOKEN}",
+}
+
+// ValidDNSProvider reports whether p is a supported DNS-01 provider name.
+func ValidDNSProvider(p string) bool { _, ok := dnsProviders[p]; return ok }
 
 // Route sends one domain to one upstream.
 type Route struct {
@@ -34,6 +47,9 @@ func GenerateCaddyfile(g Global, routes []Route) string {
 	b.WriteString("{\n\tadmin " + g.Admin + "\n")
 	if g.Email != "" {
 		b.WriteString("\temail " + g.Email + "\n")
+	}
+	if line, ok := dnsProviders[g.DNS]; ok {
+		b.WriteString("\tacme_dns " + line + "\n")
 	}
 	b.WriteString("}\n")
 

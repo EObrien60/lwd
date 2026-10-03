@@ -49,6 +49,7 @@ type composeService struct {
 	Networks      []string            `json:"networks,omitempty"`
 	Volumes       []string            `json:"volumes,omitempty"`
 	Environment   map[string]string   `json:"environment,omitempty"`
+	EnvFile       []string            `json:"env_file,omitempty"`
 	Labels        map[string]string   `json:"labels,omitempty"`
 	Healthcheck   *composeHealthcheck `json:"healthcheck,omitempty"`
 	Logging       *composeLogging     `json:"logging,omitempty"`
@@ -186,7 +187,7 @@ func renderEnvironment(b *bundle.Bundle) ([]byte, error) {
 }
 
 // renderSystemCompose renders system/compose.yaml for the node's Caddy.
-func renderSystemCompose(root, image string) []byte {
+func renderSystemCompose(root, image, envFile string) []byte {
 	doc := composeDoc{Name: systemProject, Services: map[string]*composeService{
 		"caddy": {
 			Image:       esc(image),
@@ -201,6 +202,9 @@ func renderSystemCompose(root, image string) []byte {
 			Logging: defaultLogging(),
 		},
 	}}
+	if envFile != "" {
+		doc.Services["caddy"].EnvFile = []string{envFile}
+	}
 	out, _ := json.MarshalIndent(doc, "", "  ")
 	return out
 }

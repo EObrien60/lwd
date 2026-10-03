@@ -45,7 +45,7 @@ func TestComposeConfigAcceptsRenderedFiles(t *testing.T) {
 	}
 
 	sys := filepath.Join(dir, "system.yaml")
-	os.WriteFile(sys, renderSystemCompose("/srv/lwd", "caddy:2"), 0o644)
+	os.WriteFile(sys, renderSystemCompose("/srv/lwd", "caddy:2", ""), 0o644)
 	if out, err := exec.Command("docker", "compose", "-f", sys, "config").CombinedOutput(); err != nil {
 		t.Fatalf("system compose: %v\n%s", err, out)
 	}

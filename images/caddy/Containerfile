@@ -1,0 +1,9 @@
+# Caddy with the Cloudflare DNS-01 plugin, for nodes the internet cannot reach
+# (private staging hosts) that still need publicly trusted certificates.
+# Nodes run it by digest via LWD_CADDY_IMAGE.
+ARG CADDY_VERSION=2
+FROM docker.io/library/caddy:${CADDY_VERSION}-builder AS build
+RUN xcaddy build --with github.com/caddy-dns/cloudflare
+
+FROM docker.io/library/caddy:${CADDY_VERSION}
+COPY --from=build /usr/bin/caddy /usr/bin/caddy

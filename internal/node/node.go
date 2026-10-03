@@ -29,6 +29,10 @@ type Config struct {
 	Dir        string // LWD_NODE_DIR
 	CaddyImage string // LWD_CADDY_IMAGE
 	ACMEEmail  string // LWD_ACME_EMAIL, optional
+	ACMEDNS    string // LWD_ACME_DNS, optional DNS-01 provider, e.g. "cloudflare"
+	// CaddyEnvFile (LWD_CADDY_ENV_FILE) is a root-only env file handed to the
+	// Caddy container, e.g. the DNS provider token. Kept out of compose.yaml.
+	CaddyEnvFile string
 }
 
 // ConfigFromEnv reads Config from the environment, applying defaults.
@@ -39,6 +43,9 @@ func ConfigFromEnv() (Config, error) {
 		Dir:        envOr("LWD_NODE_DIR", "/srv/lwd"),
 		CaddyImage: envOr("LWD_CADDY_IMAGE", "caddy:2"),
 		ACMEEmail:  os.Getenv("LWD_ACME_EMAIL"),
+		ACMEDNS:    os.Getenv("LWD_ACME_DNS"),
+
+		CaddyEnvFile: os.Getenv("LWD_CADDY_ENV_FILE"),
 	}
 	if c.Token == "" {
 		return c, errors.New("LWD_NODE_TOKEN is required")
@@ -48,6 +55,15 @@ func ConfigFromEnv() (Config, error) {
 	}
 	if c.ACMEEmail != "" && !router.ValidEmail(c.ACMEEmail) {
 		return c, fmt.Errorf("LWD_ACME_EMAIL %q is not a usable address", c.ACMEEmail)
+	}
+	if c.ACMEDNS != "" && !router.ValidDNSProvider(c.ACMEDNS) {
+		return c, fmt.Errorf("LWD_ACME_DNS %q is not a supported DNS provider", c.ACMEDNS)
+	}
+	if c.ACMEDNS != "" && c.CaddyEnvFile == "" {
+		return c, errors.New("LWD_ACME_DNS needs LWD_CADDY_ENV_FILE carrying the provider credential")
+	}
+	if c.CaddyEnvFile != "" && !filepath.IsAbs(c.CaddyEnvFile) {
+		return c, fmt.Errorf("LWD_CADDY_ENV_FILE must be absolute, got %q", c.CaddyEnvFile)
 	}
 	return c, nil
 }
@@ -183,7 +199,7 @@ func (n *Node) Start(ctx context.Context) error {
 		return err
 	}
 	sys := n.systemProject()
-	if err := router.WriteFileAtomic(sys.files[0], renderSystemCompose(n.cfg.Dir, n.cfg.CaddyImage), 0o644); err != nil {
+	if err := router.WriteFileAtomic(sys.files[0], renderSystemCompose(n.cfg.Dir, n.cfg.CaddyImage, n.cfg.CaddyEnvFile), 0o644); err != nil {
 		return err
 	}
 	states, err := n.loadStates()
@@ -256,7 +272,7 @@ func (n *Node) caddyfileLocked() string {
 			}
 		}
 	}
-	return router.GenerateCaddyfile(router.Global{Admin: router.AdminAddr, Email: n.cfg.ACMEEmail}, routes)
+	return router.GenerateCaddyfile(router.Global{Admin: router.AdminAddr, Email: n.cfg.ACMEEmail, DNS: n.cfg.ACMEDNS}, routes)
 }
 
 // setRoutes points key's domains at live (nil removes them) and applies the

@@ -70,3 +70,13 @@ func TestValidDomain(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerateCaddyfileDNSProvider(t *testing.T) {
+	got := GenerateCaddyfile(Global{Admin: AdminAddr, DNS: "cloudflare"}, []Route{{Domain: "app.example.com", Upstream: "127.0.0.1:20000"}})
+	if !strings.Contains(got, "\tacme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}\n") {
+		t.Fatalf("missing acme_dns:\n%s", got)
+	}
+	if strings.Contains(GenerateCaddyfile(Global{Admin: AdminAddr, DNS: "bogus"}, nil), "acme_dns") {
+		t.Fatal("unknown provider must not be emitted")
+	}
+}

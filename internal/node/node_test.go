@@ -101,3 +101,19 @@ func TestStartFailsWhenCaddyDoesNotStart(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestConfigACMEDNSNeedsKnownProviderAndEnvFile(t *testing.T) {
+	t.Setenv("LWD_NODE_TOKEN", "x")
+	t.Setenv("LWD_ACME_DNS", "cloudflare")
+	if _, err := ConfigFromEnv(); err == nil {
+		t.Fatal("DNS provider without LWD_CADDY_ENV_FILE accepted")
+	}
+	t.Setenv("LWD_CADDY_ENV_FILE", "/etc/lwd/caddy.env")
+	if c, err := ConfigFromEnv(); err != nil || c.ACMEDNS != "cloudflare" {
+		t.Fatalf("config = %+v, %v", c, err)
+	}
+	t.Setenv("LWD_ACME_DNS", "route53")
+	if _, err := ConfigFromEnv(); err == nil {
+		t.Fatal("unsupported provider accepted")
+	}
+}

@@ -250,7 +250,7 @@ func TestRenderEnvironmentRejectsBadKeys(t *testing.T) {
 }
 
 func TestRenderSystemCompose(t *testing.T) {
-	out := renderSystemCompose("/srv/lwd", "caddy:2")
+	out := renderSystemCompose("/srv/lwd", "caddy:2", "")
 	m := decode(t, out)
 	if m["name"] != "lwd-system" {
 		t.Errorf("name = %v", m["name"])
@@ -266,5 +266,15 @@ func TestRenderSystemCompose(t *testing.T) {
 	cmd, _ := json.Marshal(dig(c, "command"))
 	if !strings.Contains(string(cmd), `"caddy","run","--config","/etc/caddy/Caddyfile","--adapter","caddyfile"`) {
 		t.Errorf("command = %s", cmd)
+	}
+}
+
+func TestRenderSystemComposeEnvFile(t *testing.T) {
+	m := decode(t, renderSystemCompose("/srv/lwd", "caddy:2", "/etc/lwd/caddy.env"))
+	if got := dig(m, "services", "caddy", "env_file"); !reflect.DeepEqual(got, []any{"/etc/lwd/caddy.env"}) {
+		t.Fatalf("env_file = %#v", got)
+	}
+	if dig(decode(t, renderSystemCompose("/srv/lwd", "caddy:2", "")), "services", "caddy", "env_file") != nil {
+		t.Fatal("env_file emitted without a file")
 	}
 }
