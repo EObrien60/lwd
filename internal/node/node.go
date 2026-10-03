@@ -124,6 +124,9 @@ type Node struct {
 	// Caddyfile writes so concurrent app-envs cannot interleave.
 	routeMu sync.Mutex
 	routes  map[string]*Live
+
+	// platformMu serialises bringing up and provisioning platform services.
+	platformMu sync.Mutex
 }
 
 func newNode(cfg Config, docker Runner) *Node {
@@ -208,7 +211,11 @@ func (n *Node) Start(ctx context.Context) error {
 		return err
 	}
 	// An already-running Caddy kept its old in-memory config across `up -d`.
-	return n.caddy.Load(ctx, content)
+	if err := n.caddy.Load(ctx, content); err != nil {
+		return err
+	}
+	n.startPlatform(ctx)
+	return nil
 }
 
 // loadStates reads every apps/<key>/state.json.

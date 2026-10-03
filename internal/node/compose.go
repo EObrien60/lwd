@@ -35,19 +35,44 @@ const (
 type composeDoc struct {
 	Name     string                     `json:"name"`
 	Services map[string]*composeService `json:"services"`
+	Networks map[string]*composeNetwork `json:"networks,omitempty"`
 }
 
 type composeService struct {
-	Image       string            `json:"image,omitempty"`
-	Command     []string          `json:"command,omitempty"`
-	Restart     string            `json:"restart,omitempty"`
-	Profiles    []string          `json:"profiles,omitempty"`
-	Ports       []string          `json:"ports,omitempty"`
-	NetworkMode string            `json:"network_mode,omitempty"`
-	Volumes     []string          `json:"volumes,omitempty"`
-	Environment map[string]string `json:"environment,omitempty"`
-	Labels      map[string]string `json:"labels,omitempty"`
-	Logging     *composeLogging   `json:"logging,omitempty"`
+	Image         string              `json:"image,omitempty"`
+	ContainerName string              `json:"container_name,omitempty"`
+	Command       []string            `json:"command,omitempty"`
+	Restart       string              `json:"restart,omitempty"`
+	Profiles      []string            `json:"profiles,omitempty"`
+	Ports         []string            `json:"ports,omitempty"`
+	NetworkMode   string              `json:"network_mode,omitempty"`
+	Networks      []string            `json:"networks,omitempty"`
+	Volumes       []string            `json:"volumes,omitempty"`
+	Environment   map[string]string   `json:"environment,omitempty"`
+	Labels        map[string]string   `json:"labels,omitempty"`
+	Healthcheck   *composeHealthcheck `json:"healthcheck,omitempty"`
+	Logging       *composeLogging     `json:"logging,omitempty"`
+}
+
+// composeNetwork declares a network created outside compose (by the node),
+// so app projects and the platform project can share it.
+type composeNetwork struct {
+	External bool   `json:"external"`
+	Name     string `json:"name"`
+}
+
+type composeHealthcheck struct {
+	Test        []string `json:"test"`
+	Interval    string   `json:"interval"`
+	Timeout     string   `json:"timeout"`
+	Retries     int      `json:"retries"`
+	StartPeriod string   `json:"start_period,omitempty"`
+}
+
+// platformNetworks is the top-level networks block of a project using the
+// node-created platform network.
+func platformNetworks() map[string]*composeNetwork {
+	return map[string]*composeNetwork{bundle.PlatformNetwork: {External: true, Name: bundle.PlatformNetwork}}
 }
 
 type composeLogging struct {
@@ -115,6 +140,14 @@ func renderCompose(b *bundle.Bundle, ports map[string]int) ([]byte, error) {
 			Labels:   labels(b, migrateService),
 			Logging:  defaultLogging(),
 		}
+	}
+	// A bundle using platform resources joins every service (and the
+	// migrate job) to the platform network as well as the project's own.
+	if b.Platform {
+		for _, svc := range doc.Services {
+			svc.Networks = []string{"default", bundle.PlatformNetwork}
+		}
+		doc.Networks = platformNetworks()
 	}
 	return json.MarshalIndent(doc, "", "  ")
 }

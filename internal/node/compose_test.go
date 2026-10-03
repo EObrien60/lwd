@@ -108,6 +108,93 @@ func TestRenderComposeServices(t *testing.T) {
 	}
 }
 
+func TestRenderComposeWithoutPlatformHasNoNetworks(t *testing.T) {
+	b := testBundle()
+	out, err := renderCompose(&b, map[string]int{"web": 20000, "api": 20001})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "networks") || strings.Contains(string(out), bundle.PlatformNetwork) {
+		t.Errorf("non-platform bundle mentions networks:\n%s", out)
+	}
+}
+
+func TestRenderComposePlatformJoinsEveryService(t *testing.T) {
+	b := testBundle()
+	b.Platform = true
+	out, err := renderCompose(&b, map[string]int{"web": 20000, "api": 20001})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := decode(t, out)
+	for _, svc := range []string{"web", "api", "worker", migrateService} {
+		if got := dig(m, "services", svc, "networks"); !reflect.DeepEqual(got, []any{"default", bundle.PlatformNetwork}) {
+			t.Errorf("%s networks = %v", svc, got)
+		}
+	}
+	want := map[string]any{bundle.PlatformNetwork: map[string]any{"external": true, "name": bundle.PlatformNetwork}}
+	if got := m["networks"]; !reflect.DeepEqual(got, want) {
+		t.Errorf("top-level networks = %v", got)
+	}
+}
+
+func TestRenderPlatformCompose(t *testing.T) {
+	out := renderPlatformCompose("/srv/lwd", "pw-secret-value")
+	m := decode(t, out)
+	if m["name"] != platformProject {
+		t.Errorf("name = %v", m["name"])
+	}
+	want := map[string]any{bundle.PlatformNetwork: map[string]any{"external": true, "name": bundle.PlatformNetwork}}
+	if got := m["networks"]; !reflect.DeepEqual(got, want) {
+		t.Errorf("networks = %v", got)
+	}
+	pg := dig(m, "services", "postgres")
+	if dig(pg, "image") != postgresImage || dig(pg, "container_name") != "lwd-postgres" || dig(pg, "restart") != "unless-stopped" {
+		t.Errorf("postgres = %v", pg)
+	}
+	if got := dig(pg, "volumes"); !reflect.DeepEqual(got, []any{"/srv/lwd/postgres:/var/lib/postgresql/data"}) {
+		t.Errorf("postgres volumes = %v", got)
+	}
+	if dig(pg, "environment", "POSTGRES_PASSWORD") != "pw-secret-value" {
+		t.Errorf("postgres environment = %v", dig(pg, "environment"))
+	}
+	if dig(pg, "healthcheck", "test") == nil {
+		t.Error("postgres has no healthcheck")
+	}
+	s3 := dig(m, "services", "s3")
+	if dig(s3, "image") != garageImage || dig(s3, "container_name") != "lwd-s3" || dig(s3, "restart") != "unless-stopped" {
+		t.Errorf("s3 = %v", s3)
+	}
+	wantVols := []any{"/srv/lwd/platform/garage.toml:/etc/garage.toml:ro", "/srv/lwd/garage/meta:/var/lib/garage/meta", "/srv/lwd/garage/data:/var/lib/garage/data"}
+	if got := dig(s3, "volumes"); !reflect.DeepEqual(got, wantVols) {
+		t.Errorf("s3 volumes = %v", got)
+	}
+	for _, svc := range []string{"postgres", "s3"} {
+		if dig(m, "services", svc, "ports") != nil {
+			t.Errorf("%s publishes ports", svc)
+		}
+		if got := dig(m, "services", svc, "networks"); !reflect.DeepEqual(got, []any{bundle.PlatformNetwork}) {
+			t.Errorf("%s networks = %v", svc, got)
+		}
+	}
+	if !strings.Contains(garageImage, "@sha256:") || !strings.Contains(garageImage, ":v2.") {
+		t.Errorf("garage image %q must be a pinned v2 release", garageImage)
+	}
+}
+
+func TestRenderGarageConfig(t *testing.T) {
+	out := string(renderGarageConfig("aa11", "tok22"))
+	for _, want := range []string{
+		`metadata_dir = "/var/lib/garage/meta"`, `data_dir = "/var/lib/garage/data"`,
+		`replication_factor = 1`, `rpc_secret = "aa11"`, `admin_token = "tok22"`,
+		`s3_region = "garage"`, `api_bind_addr = "[::]:3900"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("garage.toml missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestRenderComposeEscapesInterpolation(t *testing.T) {
 	b := testBundle()
 	b.Services[2].Command = []string{"sh", "-c", "echo $HOME ${X}"}

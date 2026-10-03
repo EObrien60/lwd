@@ -26,6 +26,7 @@ type NodeStatus struct {
 	Memory        Memory      `json:"memory"`
 	Disk          Disk        `json:"disk"` // filesystem holding /
 	Caddy         Caddy       `json:"caddy"`
+	Platform      Platform    `json:"platform"`
 	Apps          []AppStatus `json:"apps"`
 	Errors        []string    `json:"errors,omitempty"` // host facts that could not be read
 }
@@ -44,6 +45,13 @@ type Caddy struct {
 	State  string `json:"state"` // compose container state, "missing" or "unknown"
 	Status string `json:"status,omitempty"`
 	Error  string `json:"error,omitempty"`
+}
+
+// Platform is the state of the shared platform services (M2).
+type Platform struct {
+	Provisioned bool        `json:"provisioned"` // the platform project has been started on this node
+	Services    []Container `json:"services"`    // lwd-postgres, lwd-s3
+	Error       string      `json:"error,omitempty"`
 }
 
 // AppStatus is one app-env on this node.
@@ -90,6 +98,15 @@ func (n *Node) status(ctx context.Context) NodeStatus {
 			if c.Service == "caddy" {
 				st.Caddy.State, st.Caddy.Status = c.State, c.Status
 			}
+		}
+	}
+
+	st.Platform = Platform{Provisioned: n.platformExists(), Services: []Container{}}
+	if st.Platform.Provisioned {
+		if cs, err := n.ps(ctx, n.platformProject()); err != nil {
+			st.Platform.Error = err.Error()
+		} else if cs != nil {
+			st.Platform.Services = cs
 		}
 	}
 

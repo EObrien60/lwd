@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +17,10 @@ type Runner interface {
 	// Run executes `docker args...` and returns its stdout. On failure the
 	// error carries the exit status and the tail of stderr.
 	Run(ctx context.Context, args ...string) ([]byte, error)
+	// Stream executes `docker args...` with stdin (may be nil) and copies
+	// its stdout to stdout, for SQL scripts and dumps that should not sit
+	// in memory or on a command line.
+	Stream(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error
 }
 
 // execRunner runs the real docker binary.
@@ -33,6 +38,20 @@ func (execRunner) Run(ctx context.Context, args ...string) ([]byte, error) {
 		return stdout.Bytes(), fmt.Errorf("docker %s: %v: %s", verbOf(args), err, msg)
 	}
 	return stdout.Bytes(), nil
+}
+
+func (execRunner) Stream(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error {
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	var stderr bytes.Buffer
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if len(msg) > 2048 {
+			msg = "..." + msg[len(msg)-2048:]
+		}
+		return fmt.Errorf("docker %s: %v: %s", verbOf(args), err, msg)
+	}
+	return nil
 }
 
 // verbOf names a docker invocation for error messages without echoing paths.

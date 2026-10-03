@@ -156,6 +156,13 @@ func (d *deployRun) run(ctx context.Context) {
 	}
 	defer d.n.ports.release(ports)
 
+	if b.Platform {
+		if err := d.n.ensureNetwork(ctx); err != nil {
+			d.failBeforeLive(ctx, "prepare", err, "")
+			return
+		}
+	}
+
 	d.event("pull", "pulling images")
 	if _, err := d.compose(ctx, "pull"); err != nil {
 		d.failBeforeLive(ctx, "pull", err, "")

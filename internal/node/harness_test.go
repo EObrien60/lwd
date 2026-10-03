@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,8 +29,9 @@ type fakeDocker struct {
 type call struct {
 	Args    []string
 	Project string
-	Verb    string   // compose subcommand: pull, run, up, ps, logs, down, restart
+	Verb    string   // compose subcommand: pull, run, up, ps, logs, down, restart; or exec, network
 	Rest    []string // arguments after the verb
+	Stdin   string   // what a Stream call was fed
 }
 
 func (c call) String() string { return c.Project + " " + c.Verb + " " + strings.Join(c.Rest, " ") }
@@ -72,6 +74,44 @@ func (f *fakeDocker) Run(ctx context.Context, args ...string) ([]byte, error) {
 	}
 	return nil, nil
 }
+
+// Stream records like Run (with stdin) and writes the answer to stdout.
+func (f *fakeDocker) Stream(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error {
+	c := parseCall(args)
+	if stdin != nil {
+		b, err := io.ReadAll(stdin)
+		if err != nil {
+			return err
+		}
+		c.Stdin = string(b)
+	}
+	f.mu.Lock()
+	f.calls = append(f.calls, c)
+	respond := f.respond
+	f.mu.Unlock()
+	if respond != nil {
+		if out, err, ok := respond(c); ok {
+			io.WriteString(stdout, out)
+			return err
+		}
+	}
+	return nil
+}
+
+// callsMatching returns the recorded calls for which keep is true.
+func (f *fakeDocker) callsMatching(keep func(call) bool) []call {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []call
+	for _, c := range f.calls {
+		if keep(c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+var errFake = errors.New("fake docker failure")
 
 func (f *fakeDocker) recorded() []string {
 	f.mu.Lock()

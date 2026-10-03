@@ -30,6 +30,11 @@ func (n *Node) Handler() http.Handler {
 	mux.Handle("POST /v1/apps/{app}/{env}/restart", n.auth(n.handleRestart))
 	mux.Handle("GET /v1/apps/{app}/{env}/logs", n.auth(n.handleLogs))
 	mux.Handle("DELETE /v1/apps/{app}/{env}", n.auth(n.handleDelete))
+	mux.Handle("PUT /v1/platform/databases/{name}", n.auth(n.handleProvisionDatabase))
+	mux.Handle("PUT /v1/platform/buckets/{name}", n.auth(n.handleProvisionBucket))
+	mux.Handle("POST /v1/platform/databases/{name}/backup", n.auth(n.handleBackup))
+	mux.Handle("GET /v1/platform/databases/{name}/backups", n.auth(n.handleListBackups))
+	mux.Handle("POST /v1/platform/databases/{name}/restore", n.auth(n.handleRestore))
 	mux.Handle("/", n.auth(func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such endpoint: "+r.Method+" "+r.URL.Path)
 	}))
@@ -66,7 +71,7 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "invalid", err.Error())
 	case errors.Is(err, errBusy):
 		writeError(w, http.StatusConflict, "conflict", err.Error())
-	case errors.Is(err, errNotFound):
+	case errors.Is(err, errNotFound), errors.Is(err, errNoBackup):
 		writeError(w, http.StatusNotFound, "not_found", err.Error())
 	default:
 		log.Printf("internal error: %v", err)

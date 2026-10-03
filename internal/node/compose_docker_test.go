@@ -49,4 +49,27 @@ func TestComposeConfigAcceptsRenderedFiles(t *testing.T) {
 	if out, err := exec.Command("docker", "compose", "-f", sys, "config").CombinedOutput(); err != nil {
 		t.Fatalf("system compose: %v\n%s", err, out)
 	}
+
+	plat := filepath.Join(dir, "platform.yaml")
+	os.WriteFile(plat, renderPlatformCompose("/srv/lwd", "pw$x"), 0o600)
+	out, err = exec.Command("docker", "compose", "-f", plat, "config", "--format", "json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("platform compose: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), `"POSTGRES_PASSWORD": "pw$$x"`) || !strings.Contains(string(out), `"healthcheck"`) {
+		t.Fatalf("platform compose:\n%s", out)
+	}
+
+	b.Platform = true
+	c, _ = renderCompose(&b, map[string]int{"web": 20000, "api": 20001})
+	os.WriteFile(filepath.Join(dir, composeFile), c, 0o644)
+	out, err = exec.Command("docker", "compose", "-p", b.ProjectName(),
+		"-f", filepath.Join(dir, composeFile), "-f", filepath.Join(dir, environmentFile),
+		"--profile", migrateProfile, "config", "--format", "json").CombinedOutput()
+	if err != nil {
+		t.Fatalf("platform bundle: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), `"lwd-platform": {`) || !strings.Contains(string(out), `"external": true`) {
+		t.Fatalf("platform bundle networks:\n%s", out)
+	}
 }
