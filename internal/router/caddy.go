@@ -11,10 +11,13 @@ import (
 	"time"
 )
 
-// DefaultAdminURL is where the node's Caddy admin API listens. Caddy runs with
-// host networking, so loopback is the host's loopback and containers on
-// bridge networks cannot reach it.
-const DefaultAdminURL = "http://127.0.0.1:2019"
+// AdminAddr is where the node's Caddy admin API listens. Caddy runs with host
+// networking, so loopback is the host's loopback and containers on bridge
+// networks cannot reach it.
+const (
+	AdminAddr       = "127.0.0.1:2019"
+	DefaultAdminURL = "http://" + AdminAddr
+)
 
 // Caddy applies Caddyfiles to a running Caddy.
 type Caddy struct {
