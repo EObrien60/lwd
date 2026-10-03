@@ -1,7 +1,7 @@
 // Package storetest gives tests a migrated store on a throwaway Postgres
 // database. It uses LWD_TEST_DATABASE_URL when set, otherwise the local
-// podman container documented in the README of the tests
-// (postgres://postgres:test@127.0.0.1:55432/postgres). When no server answers,
+// podman container described at DefaultURL. Every call creates its own
+// database, so tests are isolated from each other. When no server answers,
 // the calling test is skipped rather than failed, so `go test ./...` works on
 // machines without Postgres.
 package storetest
