@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"lwd/internal/bundle"
 )
@@ -499,5 +501,45 @@ func TestDeployTruncatesLogs(t *testing.T) {
 	res := h.deploy(bundleN(1))
 	if len(res.Logs) > maxLogBytes+100 || !strings.HasSuffix(res.Logs, "THE END") {
 		t.Fatalf("logs len %d, suffix %q", len(res.Logs), res.Logs[len(res.Logs)-10:])
+	}
+}
+
+func TestDeployWaitsForCertificateBeforeSmoke(t *testing.T) {
+	h := newHarness(t)
+	var mu sync.Mutex
+	attempts := map[string]int{}
+	h.n.handshake = func(ctx context.Context, domain string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		attempts[domain]++
+		if attempts[domain] < 4 {
+			return errors.New("remote error: tls: internal error")
+		}
+		return nil
+	}
+	res := h.deploy(bundleN(1))
+	if res.Status != bundle.StatusSucceeded {
+		t.Fatalf("result = %+v", res)
+	}
+	found := false
+	for _, e := range res.Events {
+		if strings.HasPrefix(e.Message, "certificates ready") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no certificate event in %+v", res.Events)
+	}
+}
+
+func TestDeployRevertsWhenCertificateNeverArrives(t *testing.T) {
+	h := newHarness(t)
+	h.n.certTimeoutInternal = 20 * time.Millisecond
+	h.n.handshake = func(context.Context, string) error { return errors.New("remote error: tls: internal error") }
+	b := bundleN(1)
+	b.TLS = bundle.TLSInternal
+	res := h.deploy(b)
+	if res.Status != bundle.StatusReverted || !strings.Contains(res.Message, "certificate for") {
+		t.Fatalf("result = %+v", res)
 	}
 }

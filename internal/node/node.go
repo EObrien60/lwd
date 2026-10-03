@@ -108,8 +108,12 @@ type Node struct {
 	httpsAddr     string                // where smoke probes dial: Caddy's :443
 	readyInterval time.Duration
 	smokeInterval time.Duration
-	adminTimeout  time.Duration
-	procDir       string // /proc, for host facts
+	// How long a newly routed domain may take to get its certificate.
+	certTimeoutInternal time.Duration
+	certTimeoutACME     time.Duration
+	handshake           func(ctx context.Context, domain string) error // replaced in tests
+	adminTimeout        time.Duration
+	procDir             string // /proc, for host facts
 
 	lockMu sync.Mutex
 	busy   map[string]bool // app-env keys with an operation in progress
@@ -123,24 +127,28 @@ type Node struct {
 }
 
 func newNode(cfg Config, docker Runner) *Node {
-	return &Node{
+	n := &Node{
 		cfg:    cfg,
 		docker: docker,
 		caddy: &router.Caddy{
 			Path:     filepath.Join(cfg.Dir, "caddy", "etc", "Caddyfile"),
 			AdminURL: router.DefaultAdminURL,
 		},
-		ports:         &portAllocator{min: 20000, max: 29999, free: portBindable},
-		started:       time.Now(),
-		loopbackURL:   func(port int) string { return fmt.Sprintf("http://127.0.0.1:%d", port) },
-		httpsAddr:     "127.0.0.1:443",
-		readyInterval: 500 * time.Millisecond,
-		smokeInterval: time.Second,
-		adminTimeout:  60 * time.Second,
-		procDir:       "/proc",
-		busy:          map[string]bool{},
-		routes:        map[string]*Live{},
+		ports:               &portAllocator{min: 20000, max: 29999, free: portBindable},
+		started:             time.Now(),
+		loopbackURL:         func(port int) string { return fmt.Sprintf("http://127.0.0.1:%d", port) },
+		httpsAddr:           "127.0.0.1:443",
+		readyInterval:       500 * time.Millisecond,
+		smokeInterval:       time.Second,
+		certTimeoutInternal: 30 * time.Second,
+		certTimeoutACME:     3 * time.Minute,
+		adminTimeout:        60 * time.Second,
+		procDir:             "/proc",
+		busy:                map[string]bool{},
+		routes:              map[string]*Live{},
 	}
+	n.handshake = n.tlsHandshake
+	return n
 }
 
 func (n *Node) appsDir() string          { return filepath.Join(n.cfg.Dir, "apps") }

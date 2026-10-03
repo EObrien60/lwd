@@ -137,7 +137,10 @@ func TestRenderEnvironment(t *testing.T) {
 	m := decode(t, out)
 	for _, svc := range []string{"web", "api", "worker", migrateService} {
 		env := dig(m, "services", svc, "environment")
-		want := map[string]any{"LOG_LEVEL": "info", "SECRET": "p$$ss'w\"d\n#x"}
+		want := map[string]any{
+			"LOG_LEVEL": "info", "SECRET": "p$$ss'w\"d\n#x",
+			"LWD_APP": "hello", "LWD_ENV": "staging", "LWD_RELEASE": "7", "LWD_DEPLOYMENT": "42",
+		}
 		if !reflect.DeepEqual(env, want) {
 			t.Errorf("%s environment = %#v", svc, env)
 		}

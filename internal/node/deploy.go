@@ -191,6 +191,13 @@ func (d *deployRun) run(ctx context.Context) {
 		return
 	}
 
+	// Caddy obtains certificates for newly routed domains asynchronously;
+	// until one exists the handshake fails. Wait for that before judging the
+	// app, so a slow issuer is not mistaken for a broken release.
+	if err := d.waitCertificates(ctx); err != nil {
+		d.revert(ctx, err)
+		return
+	}
 	d.event("smoke", "checking through Caddy")
 	if err := d.smoke(ctx); err != nil {
 		d.revert(ctx, err)
@@ -420,6 +427,54 @@ func (d *deployRun) checkWorkers(ctx context.Context, workers map[string]bool, p
 			pending[w] = "container " + state[w]
 		}
 	}
+}
+
+// waitCertificates polls a TLS handshake through Caddy for every routed domain
+// until it succeeds or the issuance budget runs out (longer for public ACME).
+func (d *deployRun) waitCertificates(ctx context.Context) error {
+	var domains []string
+	for _, s := range d.b.Services {
+		domains = append(domains, s.Domains...)
+	}
+	if len(domains) == 0 {
+		return nil
+	}
+	budget := d.n.certTimeoutInternal
+	if d.b.TLS == bundle.TLSACME {
+		budget = d.n.certTimeoutACME
+	}
+	deadline := time.Now().Add(budget)
+	for _, dom := range domains {
+		for {
+			err := d.n.handshake(ctx, dom)
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("certificate for %s not ready after %s: %w", dom, budget, err)
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(d.n.smokeInterval):
+			}
+		}
+	}
+	d.event("smoke", fmt.Sprintf("certificates ready for %d domains", len(domains)))
+	return nil
+}
+
+// tlsHandshake completes a TLS handshake with Caddy's https listener for domain.
+func (n *Node) tlsHandshake(ctx context.Context, domain string) error {
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 5 * time.Second},
+		Config:    &tls.Config{ServerName: domain, InsecureSkipVerify: true},
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", n.httpsAddr)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
 }
 
 // smoke probes every HTTP service once per interval for SmokeSeconds ticks:

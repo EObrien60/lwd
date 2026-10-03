@@ -132,6 +132,16 @@ func renderEnvironment(b *bundle.Bundle) ([]byte, error) {
 		}
 		env[k] = esc(v)
 	}
+	// Platform identity, so apps can report what they are running as. These
+	// win over any same-named var: they describe the deployment, not config.
+	for k, v := range map[string]string{
+		"LWD_APP":        b.App,
+		"LWD_ENV":        b.Env,
+		"LWD_RELEASE":    strconv.FormatInt(b.Release, 10),
+		"LWD_DEPLOYMENT": strconv.FormatInt(b.Deployment, 10),
+	} {
+		env[k] = v
+	}
 	doc := composeDoc{Name: b.ProjectName(), Services: map[string]*composeService{}}
 	for _, s := range b.Services {
 		doc.Services[s.Name] = &composeService{Environment: env}
