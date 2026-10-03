@@ -494,6 +494,7 @@ func (c *cli) releaseCreate(args []string) error {
 	commit := fs.String("commit", "", "source commit")
 	images := mapFlag{}
 	fs.Var(images, "image", "svc=ref override (repeatable)")
+	asJSON := fs.Bool("json", false, "print JSON")
 	pos, err := parse(fs, args, 1, 1)
 	if err != nil {
 		return err
@@ -509,6 +510,9 @@ func (c *cli) releaseCreate(args []string) error {
 	r, err := cl.CreateRelease(c.ctx, pos[0], req)
 	if err != nil {
 		return err
+	}
+	if *asJSON {
+		return c.printJSON(r)
 	}
 	fmt.Fprintf(c.out, "release %d of %s created\n", r.ID, r.App)
 	c.table("SERVICE\tIMAGE", func(w io.Writer) {
@@ -550,6 +554,7 @@ func (c *cli) releaseList(args []string) error {
 func (c *cli) deploy(args []string) error {
 	fs := newFlags("deploy")
 	rel := fs.Int64("release", 0, "release id (default newest)")
+	asJSON := fs.Bool("json", false, "print the deployment as JSON")
 	pos, err := parse(fs, args, 2, 2)
 	if err != nil {
 		return err
@@ -563,12 +568,16 @@ func (c *cli) deploy(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *asJSON {
+		return c.printDeploymentJSON(d)
+	}
 	return c.reportDeployment(d)
 }
 
 func (c *cli) rollback(args []string) error {
 	fs := newFlags("rollback")
 	to := fs.Int64("to", 0, "release id (default: previous live release)")
+	asJSON := fs.Bool("json", false, "print the deployment as JSON")
 	pos, err := parse(fs, args, 2, 2)
 	if err != nil {
 		return err
@@ -581,6 +590,9 @@ func (c *cli) rollback(args []string) error {
 	d, err := cl.Rollback(c.ctx, pos[0], pos[1], client.RollbackRequest{To: *to})
 	if err != nil {
 		return err
+	}
+	if *asJSON {
+		return c.printDeploymentJSON(d)
 	}
 	return c.reportDeployment(d)
 }
@@ -789,5 +801,17 @@ func (c *cli) events(args []string) error {
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", ts(e.At), where, e.Kind, oneLine(e.Message))
 		}
 	})
+	return nil
+}
+
+// printDeploymentJSON prints d as JSON; like reportDeployment, anything but
+// success exits 1 so scripts can branch on the exit code or the body.
+func (c *cli) printDeploymentJSON(d store.Deployment) error {
+	if err := c.printJSON(d); err != nil {
+		return err
+	}
+	if d.Status != store.StatusSucceeded {
+		return errReported
+	}
 	return nil
 }
