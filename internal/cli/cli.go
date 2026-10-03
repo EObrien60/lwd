@@ -65,6 +65,13 @@ Secrets:
   lwd secret list APP ENV
   lwd secret rm APP ENV KEY
 
+Databases and backups (apps declaring database = true):
+  lwd db status APP ENV                  resources and last backup
+  lwd db backup APP ENV                  take a backup now
+  lwd db backups APP ENV                 list recorded backups
+  lwd db restore APP ENV BACKUP_ID --yes replace the database with a backup (stops the app meanwhile)
+  lwd backup status                      newest backup and recent failures of every database
+
 Audit:
   lwd events [APP]
 
@@ -120,6 +127,11 @@ var commands = []command{
 	{"secret list", (*cli).secretList},
 	{"secret rm", (*cli).secretRm},
 	{"events", (*cli).events},
+	{"db status", (*cli).dbStatus},
+	{"db backups", (*cli).dbBackups},
+	{"db backup", (*cli).dbBackup},
+	{"db restore", (*cli).dbRestore},
+	{"backup status", (*cli).backupStatus},
 }
 
 func run(args []string, in io.Reader, out, errw io.Writer, getenv func(string) string) int {
