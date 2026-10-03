@@ -359,6 +359,47 @@ func TestDeployBusy(t *testing.T) {
 	}
 }
 
+func TestConcurrentDeploysOfDifferentAppEnvs(t *testing.T) {
+	h := newHarness(t)
+	a, b := bundleN(1), bundleN(2)
+	b.Env = "prod"
+	b.Services[0].Domains = []string{"hello.example.com"}
+	b.Services[1].Domains = []string{"api.hello.example.com"}
+	results := make(chan *bundle.Result, 2)
+	for _, x := range []bundle.Bundle{a, b} {
+		go func() {
+			res, err := h.n.Deploy(context.Background(), &x)
+			if err != nil {
+				t.Error(err)
+			}
+			results <- res
+		}()
+	}
+	for range 2 {
+		if res := <-results; res == nil || res.Status != bundle.StatusSucceeded {
+			t.Fatalf("result = %+v", res)
+		}
+	}
+	// Neither cutover may have dropped the other's routes, and no port is
+	// shared between the two live deployments.
+	cf := h.caddy.last()
+	for _, d := range []string{"hello.lwd.internal", "api.hello.lwd.internal", "hello.example.com", "api.hello.example.com"} {
+		if !strings.Contains(cf, d+" {") {
+			t.Errorf("final Caddyfile lacks %s:\n%s", d, cf)
+		}
+	}
+	seen := map[int]bool{}
+	for _, key := range []string{"hello-staging", "hello-prod"} {
+		st, _ := loadState(filepath.Join(h.dir, "apps", key, "state.json"))
+		for _, p := range st.Live.Ports {
+			if seen[p] {
+				t.Errorf("port %d allocated twice", p)
+			}
+			seen[p] = true
+		}
+	}
+}
+
 func TestDeployRejectsInvalidBundles(t *testing.T) {
 	h := newHarness(t)
 	cases := map[string]func(b *bundle.Bundle){
