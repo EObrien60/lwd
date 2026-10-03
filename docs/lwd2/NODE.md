@@ -85,4 +85,29 @@ Every compose invocation for a deployment is
 (`/proc/loadavg`), memory total/available (`/proc/meminfo`), root filesystem
 size/free (`statfs("/")`), the Caddy container state, and per app-env the live
 deployment, the last attempt and `docker compose ps` rows (both the JSON-array
-and JSON-lines output formats are accepted).
+and JSON-lines output formats are accepted). `platform` reports whether the
+platform project exists and its `docker compose ps` rows.
+
+## Platform services (M2)
+
+- `ensurePlatform` (serialised by one mutex, run by every provisioning call
+  and at node start if `platform/compose.yaml` exists): create dirs (0700),
+  generate `platform/postgres.password` and `platform/garage.toml` (rpc
+  secret, admin token) once, write `platform/compose.yaml` (0600: it carries
+  `POSTGRES_PASSWORD`), `docker network create lwd-platform` if `inspect`
+  fails, `compose up -d --wait --wait-timeout 180`, give the Garage node a
+  role if `layout show` says none has one (and apply any staged layout
+  version), then revoke `CONNECT, TEMPORARY` from `PUBLIC` on `postgres` and
+  `template1`. A platform failure at node start is logged, not fatal.
+- Postgres healthcheck is `pg_isready -h 127.0.0.1` (TCP): initdb's
+  temporary server listens on the socket only.
+- The docker runner gained `Stream(stdin, stdout)`: SQL goes to `psql -X -q
+  -v ON_ERROR_STOP=1` on stdin; dumps stream to a temp file in the backup dir
+  (sha256 computed while writing, fsync, rename), never through memory.
+- Garage is driven through its CLI (`docker exec lwd-s3 /garage ...`):
+  `bucket info`/`create`, `key info --show-secret`, `key list` (to find
+  `lwd-<bucket>` when the controller has no id), `key create`, `bucket allow
+  --read --write --owner`. "Not found" is recognised from the error text.
+- Backup and restore of one database are serialised (lock `db:<name>`);
+  restore also takes the app-env lock, so it is refused (409) during a
+  deploy. Backup files are named `YYYYMMDDTHHMMSS.mmmZ.dump`.

@@ -35,6 +35,7 @@ everything from local state (restart policies + persisted Caddyfile).
   - `POST /v1/apps/{app}/{env}/restart?service=` → restarts live containers
   - `GET  /v1/apps/{app}/{env}/logs?service=&tail=` → text
   - `DELETE /v1/apps/{app}/{env}` → removes live project, routes and state
+  - platform resources (M2): see "M2 — database and storage resources"
 - Uses the `docker` / `docker compose` CLIs only (no Docker SDK).
 - Disk layout (`LWD_NODE_DIR`, default `/srv/lwd`):
   ```
@@ -43,6 +44,9 @@ everything from local state (restart policies + persisted Caddyfile).
   caddy/data, caddy/config      cert + ACME state survive container recreation
   apps/<app>-<env>/state.json   live deployment, ports, last 20 attempts
   apps/<app>-<env>/d<N>/        bundle.json, compose.yaml, .env (0600), result.json, failure.log
+  platform/                     lwd-platform project (0700): compose.yaml, postgres.password, garage.toml (0600)
+  postgres/  garage/{meta,data}  platform service data
+  backups/postgres/<db>/        <UTC ts>.dump, newest 14 kept
   ```
   Keep the 5 newest `d<N>` dirs.
 - Caddy: `caddy:2` with `network_mode: host`, admin `127.0.0.1:2019` (never
@@ -53,6 +57,10 @@ everything from local state (restart policies + persisted Caddyfile).
 - Each deployment is its own compose project `lwd-<app>-<env>-d<deployment>`:
   `restart: unless-stopped`, `env_file: .env`, json-file logs (10m × 3), labels
   `lwd.app/env/release/deployment/service`.
+- `bundle.Platform` (set by the controller when the app declares a resource)
+  attaches every service and the migrate job to the external docker network
+  `lwd-platform` in addition to the project's default network; the node
+  creates that network if it is missing. Nothing else in the bundle changes.
 
 ### Deploy algorithm (per app-env, serialized)
 
@@ -77,14 +85,16 @@ be backwards compatible (expand/contract); rollback never reverts schema.
 
 - `LWD_DATABASE_URL` (Postgres), `LWD_LISTEN` (default `127.0.0.1:7470`),
   `LWD_API_TOKEN` (bearer, single admin token for M1), `LWD_SECRET_KEY_FILE`,
-  `LWD_INSECURE_REGISTRIES` (comma list, dev only).
+  `LWD_INSECURE_REGISTRIES` (comma list, dev only), `LWD_BACKUP_HOUR` (local
+  hour 0-23 of the daily database backups, default 3).
 - Migrations: embedded `internal/store/migrations/NNNN_name.sql`, applied in
   order at start, tracked in `schema_migrations`.
 - Tables: `hosts`, `apps` (manifest text), `environments`, `releases`
   (commit, manifest snapshot, service→digest map), `deployments` (release, env,
   host, kind deploy|rollback, status running|succeeded|failed|reverted, actor,
   reason, timings, result jsonb), `secrets` (app, env, key, version, encrypted
-  value), `events` (append-only).
+  value), `events` (append-only); M2: `resources` (app, env, kind, host, name,
+  encrypted credentials; name unique per kind) and `backups`.
 - Deploy: per app-env Postgres advisory lock → build bundle from release +
   environment + latest secret versions → insert deployment(running) → node
   `/v1/deploy` → record result + events.
@@ -112,6 +122,11 @@ GET    /v1/apps/{app}/envs/{env}/logs?service=&tail=
 PUT    /v1/apps/{app}/envs/{env}/secrets/{key}   body: raw value
 GET    /v1/apps/{app}/envs/{env}/secrets         names + versions only
 DELETE /v1/apps/{app}/envs/{env}/secrets/{key}
+GET    /v1/apps/{app}/envs/{env}/resources       kind, name, host only (never credentials)
+POST   /v1/apps/{app}/envs/{env}/db/backup       manual backup -> backup row
+GET    /v1/apps/{app}/envs/{env}/db/backups      recorded backups, newest first
+POST   /v1/apps/{app}/envs/{env}/db/restore      {backup_id}  destructive; deploy lock held
+GET    /v1/backups                               per database: latest ok + last failure; failures of 7 days
 GET    /v1/events?app=&env=&limit=
 ```
 Errors: `{"error":{"code":"conflict|not_found|invalid|node_unreachable|internal","message":"..."}}`.
@@ -151,7 +166,8 @@ tls    = "internal"                 # default "acme"
 env    = { LOG_LEVEL = "debug" }    # per-environment overrides
 ```
 
-Reserved for M2 (rejected until implemented): `database`, `storage`.
+Resources (M2): top-level `database = true` and/or `storage = true`. An app
+may not define (as a variable or secret) any name these inject.
 
 ## CLI
 
@@ -166,6 +182,9 @@ lwd restart APP ENV [--service S]
 lwd logs APP ENV [--service S] [--tail N]
 lwd history APP ENV
 lwd secret set APP ENV KEY (value on stdin) | secret list APP ENV | secret rm APP ENV KEY
+lwd db status APP ENV | db backup APP ENV | db backups APP ENV
+lwd db restore APP ENV BACKUP_ID --yes
+lwd backup status
 lwd events [APP]
 ```
 Client config: `LWD_URL` (default `http://127.0.0.1:7470`), `LWD_TOKEN` or
@@ -173,39 +192,71 @@ Client config: `LWD_URL` (default `http://127.0.0.1:7470`), `LWD_TOKEN` or
 
 ## M2 — database and storage resources (qMechanic staging)
 
+Status: implemented ("M2-lite": shared class, local backups). Offsite copy and
+PITR are still to come.
+
 Manifest flags: `database = true`, `storage = true`. Applications only see env:
 
 | Flag | Injected |
 |---|---|
-| `database` | `DATABASE_URL=postgres://<app>_<env>:<pw>@lwd-postgres:5432/<app>_<env>` |
-| `storage` | `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET=<app>-<env>`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` |
+| `database` | `DATABASE_URL=postgres://<app>_<env>:<pw>@lwd-postgres:5432/<app>_<env>?sslmode=disable` (`-` → `_`) |
+| `storage` | `S3_ENDPOINT=http://lwd-s3:3900`, `S3_REGION=garage`, `S3_BUCKET=<app>-<env>`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` |
+
+The S3 endpoint is internal to `lwd-platform`; apps that serve files proxy them.
+A user variable or secret with an injected name fails the deploy (and `app
+apply`, for names in the manifest).
 
 Resource class is `shared` (one instance per host). `dedicated`/`managed` are
 reserved names only.
 
-- **Platform services** are a node-owned compose project `lwd-platform` on the
-  docker network `lwd-platform`: `lwd-postgres` (postgres:17, data
-  `/srv/lwd/postgres`) and `lwd-minio` (data `/srv/lwd/minio`). Neither
-  publishes a host port. They start lazily the first time a host is asked to
-  provision a resource. App services that need a resource join
-  `lwd-platform` in addition to their project network.
+- **Platform services** are a node-owned compose project `lwd-platform`
+  (`/srv/lwd/platform/compose.yaml`) on the docker network `lwd-platform`,
+  which the node creates (compose treats it as external): `lwd-postgres`
+  (`postgres:17-alpine`, data `/srv/lwd/postgres`, superuser password
+  generated once into `platform/postgres.password`) and `lwd-s3` (Garage
+  `dxflrs/garage:v2.4.1`, digest-pinned; single-node layout assigned once;
+  data `/srv/lwd/garage`). Neither publishes a host port; both have
+  healthchecks and `restart: unless-stopped`. They start lazily the first
+  time a host is asked to provision a resource (`up -d --wait`) and are
+  re-upped on every node start once they exist. App services of a bundle
+  with `platform: true` join `lwd-platform` in addition to their project
+  network. `/v1/status` reports `platform.services`.
+- **Why Garage, not MinIO**: maintained open-source S3 server with published
+  release images, small single binary, per-key bucket permissions through
+  its CLI. MinIO's community edition no longer ships maintained images.
 - **Database posture** (identical to qMechanic's `local/db-init.sql`): role
   `<app>_<env>` `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE`, database
   `<app>_<env>` `OWNER` that role, `public` schema owned by it, `CONNECT`
   revoked from `PUBLIC`. Row-level security with FORCE therefore binds the app.
-- **Bucket posture**: one MinIO user per app-env with a policy limited to its
-  bucket.
-- **Provisioning**: the controller owns names and generated credentials
-  (stored as LWD-owned secrets, never shown); the node executes idempotent
-  operations via `docker exec` in the platform containers:
-  - `PUT  /v1/platform/databases/{name}` `{password}`
-  - `PUT  /v1/platform/buckets/{name}` `{access_key, secret_key}`
-  - `POST /v1/platform/databases/{name}/backup` → `{file, bytes, sha256}`
-    (`pg_dump -Fc` to `/srv/lwd/backups/postgres/<name>/<UTC ts>.dump`)
-  - `POST /v1/platform/databases/{name}/restore` `{file}` → stops the
-    app-env's live project, recreates the database, `pg_restore`, restarts.
-- **Backups**: the controller records every backup in `backups` and runs one
-  per database daily; `lwd db backup|restore|list`, `lwd backup status`.
+  `CONNECT`/`TEMPORARY` are also revoked from `PUBLIC` on `postgres` and
+  `template1`, so an app role can connect to its own database only.
+- **Bucket posture**: one Garage access key `lwd-<bucket>` per app-env with
+  read/write/owner on its bucket only (new keys cannot create buckets).
+- **Provisioning**: the controller owns names and credentials, stored
+  encrypted in `resources` and never returned by the API, events or
+  deployment results. Every deploy calls the node for each declared resource
+  before building the bundle (idempotent, so a rebuilt host heals). The node
+  executes via `docker exec` (SQL to `psql` on stdin with `ON_ERROR_STOP`;
+  names validated: db `^[a-z][a-z0-9_]{0,62}$`, bucket `^[a-z0-9][a-z0-9-]{2,62}$`):
+  - `PUT  /v1/platform/databases/{name}` `{password}` → create-or-update role + database
+  - `PUT  /v1/platform/buckets/{name}` `{access_key_id?}` → `{access_key_id, secret_access_key}`;
+    the node creates the key (Garage ids are `GK…`) and keeps the one the
+    controller passes while it exists
+  - `POST /v1/platform/databases/{name}/backup` → `{file, bytes, sha256, created_at}`
+    (`pg_dump -Fc` to `/srv/lwd/backups/postgres/<name>/<UTC ts>.dump`, newest 14 kept)
+  - `GET  /v1/platform/databases/{name}/backups` → files, newest first
+  - `POST /v1/platform/databases/{name}/restore` `{file, app, env}` → `compose stop`
+    of the app-env's live project, drop (`WITH (FORCE)`) and recreate with the
+    same posture, `pg_restore --no-owner --role=<name> --exit-on-error`,
+    `compose start` (also after a failed restore); returns step timings.
+- **Backups**: the controller records every attempt in `backups` (manual or
+  scheduled, succeeded or failed with the error) with events
+  `backup.succeeded|failed`. A controller goroutine backs up every database
+  once a day after `LWD_BACKUP_HOUR`; it catches up after downtime and does
+  not repeat a day's attempt. Restores require a succeeded backup of the
+  same app-env, host and database, hold the deploy lock, and are recorded as
+  `db.restored`/`db.restore_failed`. CLI: `lwd db status|backup|backups|restore
+  --yes`, `lwd backup status` (exit 1 if a database has no good backup).
   Offsite copy and PITR come later without changing these commands.
 - Known limitation: services on `lwd-platform` can reach each other at the
   network level; the database role and bucket policy are the isolation
