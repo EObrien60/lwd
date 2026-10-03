@@ -170,3 +170,43 @@ lwd events [APP]
 ```
 Client config: `LWD_URL` (default `http://127.0.0.1:7470`), `LWD_TOKEN` or
 `~/.config/lwd/token`.
+
+## M2 — database and storage resources (qMechanic staging)
+
+Manifest flags: `database = true`, `storage = true`. Applications only see env:
+
+| Flag | Injected |
+|---|---|
+| `database` | `DATABASE_URL=postgres://<app>_<env>:<pw>@lwd-postgres:5432/<app>_<env>` |
+| `storage` | `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET=<app>-<env>`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` |
+
+Resource class is `shared` (one instance per host). `dedicated`/`managed` are
+reserved names only.
+
+- **Platform services** are a node-owned compose project `lwd-platform` on the
+  docker network `lwd-platform`: `lwd-postgres` (postgres:17, data
+  `/srv/lwd/postgres`) and `lwd-minio` (data `/srv/lwd/minio`). Neither
+  publishes a host port. They start lazily the first time a host is asked to
+  provision a resource. App services that need a resource join
+  `lwd-platform` in addition to their project network.
+- **Database posture** (identical to qMechanic's `local/db-init.sql`): role
+  `<app>_<env>` `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE`, database
+  `<app>_<env>` `OWNER` that role, `public` schema owned by it, `CONNECT`
+  revoked from `PUBLIC`. Row-level security with FORCE therefore binds the app.
+- **Bucket posture**: one MinIO user per app-env with a policy limited to its
+  bucket.
+- **Provisioning**: the controller owns names and generated credentials
+  (stored as LWD-owned secrets, never shown); the node executes idempotent
+  operations via `docker exec` in the platform containers:
+  - `PUT  /v1/platform/databases/{name}` `{password}`
+  - `PUT  /v1/platform/buckets/{name}` `{access_key, secret_key}`
+  - `POST /v1/platform/databases/{name}/backup` → `{file, bytes, sha256}`
+    (`pg_dump -Fc` to `/srv/lwd/backups/postgres/<name>/<UTC ts>.dump`)
+  - `POST /v1/platform/databases/{name}/restore` `{file}` → stops the
+    app-env's live project, recreates the database, `pg_restore`, restarts.
+- **Backups**: the controller records every backup in `backups` and runs one
+  per database daily; `lwd db backup|restore|list`, `lwd backup status`.
+  Offsite copy and PITR come later without changing these commands.
+- Known limitation: services on `lwd-platform` can reach each other at the
+  network level; the database role and bucket policy are the isolation
+  boundary. Acceptable while every workload is OBH's own.
