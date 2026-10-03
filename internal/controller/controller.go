@@ -471,6 +471,20 @@ func (c *Controller) buildBundle(ctx context.Context, e store.Environment, rel s
 		return nil, errf(client.CodeInvalid, "missing secrets for %s/%s: %s (set with: lwd secret set %s %s KEY)",
 			e.App, e.Name, strings.Join(missing, ", "), e.App, e.Name)
 	}
+	// Platform-injected variables cannot be overridden: a stale secret named
+	// DATABASE_URL would silently point the app elsewhere.
+	owners := platformVarOwners(m)
+	for _, k := range slices.Sorted(maps.Keys(owners)) {
+		_, isVar := r.Vars[k]
+		_, isSecret := enc[k]
+		if isVar || isSecret {
+			what := "variable"
+			if isSecret {
+				what = fmt.Sprintf("secret (remove with: lwd secret rm %s %s %s)", e.App, e.Name, k)
+			}
+			return nil, errf(client.CodeInvalid, "%s/%s: %s is injected by %s and may not be set as a %s", e.App, e.Name, k, owners[k], what)
+		}
+	}
 	for k, v := range enc {
 		pt, err := c.cipher.Decrypt(v)
 		if err != nil {
@@ -478,10 +492,17 @@ func (c *Controller) buildBundle(ctx context.Context, e store.Environment, rel s
 		}
 		r.Vars[k] = string(pt)
 	}
+	// Provisioned on every deploy: idempotent, and it heals a rebuilt host.
+	pv, err := c.provision(ctx, e, m)
+	if err != nil {
+		return nil, err
+	}
+	maps.Copy(r.Vars, pv)
 
 	b := &bundle.Bundle{
 		App: e.App, Env: e.Name, Release: rel.ID,
 		Services: r.Services, Migrate: r.Migrate, Vars: r.Vars, TLS: r.TLS,
+		Platform:            m.Database || m.Storage,
 		ReadyTimeoutSeconds: ReadyTimeoutSeconds, SmokeSeconds: SmokeSeconds,
 	}
 	// Validate before a deployment row exists; the id is filled in later.

@@ -17,7 +17,7 @@ func TestConfigFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{DatabaseURL: "postgres://x", APIToken: "tok", Listen: "127.0.0.1:7470", SecretKeyFile: "/home/u/.config/lwd/secret.key"}
+	want := Config{DatabaseURL: "postgres://x", APIToken: "tok", Listen: "127.0.0.1:7470", SecretKeyFile: "/home/u/.config/lwd/secret.key", BackupHour: 3}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("cfg = %+v", cfg)
 	}
@@ -33,6 +33,18 @@ func TestConfigFromEnv(t *testing.T) {
 	if cfg, _ = ConfigFromEnv(get); cfg.SecretKeyFile != "/etc/lwd/key" {
 		t.Errorf("key file = %s", cfg.SecretKeyFile)
 	}
+
+	env["LWD_BACKUP_HOUR"] = "23"
+	if cfg, _ = ConfigFromEnv(get); cfg.BackupHour != 23 {
+		t.Errorf("backup hour = %d", cfg.BackupHour)
+	}
+	for _, bad := range []string{"24", "-1", "3am"} {
+		env["LWD_BACKUP_HOUR"] = bad
+		if _, err := ConfigFromEnv(get); err == nil || !strings.Contains(err.Error(), "LWD_BACKUP_HOUR") {
+			t.Errorf("LWD_BACKUP_HOUR=%s: err = %v", bad, err)
+		}
+	}
+	delete(env, "LWD_BACKUP_HOUR")
 
 	for _, missing := range []string{"LWD_API_TOKEN", "LWD_DATABASE_URL"} {
 		saved := env[missing]

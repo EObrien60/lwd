@@ -2,7 +2,9 @@ package controller
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -17,6 +19,7 @@ type Config struct {
 	APIToken           string   // LWD_API_TOKEN (required)
 	SecretKeyFile      string   // LWD_SECRET_KEY_FILE
 	InsecureRegistries []string // LWD_INSECURE_REGISTRIES, comma separated; dev only
+	BackupHour         int      // LWD_BACKUP_HOUR, local hour 0-23 of the daily database backups (default 3)
 }
 
 // ConfigFromEnv reads Config. It refuses to proceed without an API token:
@@ -44,6 +47,15 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			dir = filepath.Join(getenv("HOME"), ".config")
 		}
 		cfg.SecretKeyFile = filepath.Join(dir, "lwd", "secret.key")
+	}
+	cfg.BackupHour = 3
+	if s := strings.TrimSpace(getenv("LWD_BACKUP_HOUR")); s != "" {
+		h, err := strconv.Atoi(s)
+		if err != nil || h < 0 || h > 23 {
+			errs = append(errs, fmt.Errorf("LWD_BACKUP_HOUR must be an hour 0-23, got %q", s))
+		} else {
+			cfg.BackupHour = h
+		}
 	}
 	for _, r := range strings.Split(getenv("LWD_INSECURE_REGISTRIES"), ",") {
 		if r = strings.TrimSpace(r); r != "" {

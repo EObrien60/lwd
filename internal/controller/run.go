@@ -65,6 +65,11 @@ func Serve(ctx context.Context, cfg Config, ln net.Listener, log *slog.Logger) e
 		ReadHeaderTimeout: 10 * time.Second,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
+	bctx, stopBackups := context.WithCancel(ctx)
+	defer stopBackups()
+	go c.backupLoop(bctx, cfg.BackupHour, time.Minute)
+	log.Info("daily database backups scheduled", "hour", cfg.BackupHour)
+
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	log.Info("lwd controller listening", "addr", ln.Addr().String())

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -94,10 +95,21 @@ type fakeNode struct {
 	entered  chan struct{} // if non-nil, deploy signals entry...
 	release  chan struct{} // ...and waits for this before answering
 	status   string
+
+	// platform state
+	dbs        map[string]string // database -> password
+	buckets    map[string]bundle.BucketCredentials
+	keySeq     int
+	bucketReqs []bundle.BucketRequest
+	backups    int
+	restores   []bundle.RestoreRequest
+	failBackup bool
+	failDB     bool
 }
 
 func newFakeNode(t *testing.T) *fakeNode {
-	n := &fakeNode{t: t, result: bundle.Result{Status: bundle.StatusSucceeded, Phase: "done"}}
+	n := &fakeNode{t: t, result: bundle.Result{Status: bundle.StatusSucceeded, Phase: "done"},
+		dbs: map[string]string{}, buckets: map[string]bundle.BucketCredentials{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/deploy", func(w http.ResponseWriter, r *http.Request) {
 		var b bundle.Bundle
@@ -132,6 +144,54 @@ func newFakeNode(t *testing.T) *fakeNode {
 		n.restarts = append(n.restarts, r.PathValue("app")+"/"+r.PathValue("env")+"?"+r.URL.RawQuery)
 		n.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("PUT /v1/platform/databases/{name}", func(w http.ResponseWriter, r *http.Request) {
+		var req bundle.DatabaseRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if n.failDB {
+			http.Error(w, `{"error":{"code":"internal","message":"postgres down"}}`, 500)
+			return
+		}
+		if !bundle.DatabaseNameRE.MatchString(r.PathValue("name")) || !bundle.PasswordRE.MatchString(req.Password) {
+			t.Errorf("node: bad database request %s %+v", r.PathValue("name"), req)
+		}
+		n.dbs[r.PathValue("name")] = req.Password
+		io.WriteString(w, `{"ok":true}`)
+	})
+	mux.HandleFunc("PUT /v1/platform/buckets/{name}", func(w http.ResponseWriter, r *http.Request) {
+		var req bundle.BucketRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		n.bucketReqs = append(n.bucketReqs, req)
+		name := r.PathValue("name")
+		c, ok := n.buckets[name]
+		if !ok || (req.AccessKeyID != "" && req.AccessKeyID != c.AccessKeyID) {
+			n.keySeq++
+			c = bundle.BucketCredentials{AccessKeyID: fmt.Sprintf("GK%024d", n.keySeq), SecretAccessKey: fmt.Sprintf("bucketsecret%052d", n.keySeq)}
+			n.buckets[name] = c
+		}
+		json.NewEncoder(w).Encode(c)
+	})
+	mux.HandleFunc("POST /v1/platform/databases/{name}/backup", func(w http.ResponseWriter, r *http.Request) {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if n.failBackup {
+			http.Error(w, `{"error":{"code":"internal","message":"pg_dump failed"}}`, 500)
+			return
+		}
+		n.backups++
+		json.NewEncoder(w).Encode(bundle.BackupFile{File: fmt.Sprintf("20261003T0300%02d.000Z.dump", n.backups), Bytes: 1234, SHA256: "cafe", CreatedAt: "2026-10-03T03:00:00Z"})
+	})
+	mux.HandleFunc("POST /v1/platform/databases/{name}/restore", func(w http.ResponseWriter, r *http.Request) {
+		var req bundle.RestoreRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		n.mu.Lock()
+		n.restores = append(n.restores, req)
+		n.mu.Unlock()
+		json.NewEncoder(w).Encode(bundle.RestoreResult{File: req.File, Stopped: true, StopMS: 1, RestoreMS: 2, StartMS: 3, TotalMS: 6})
 	})
 	mux.HandleFunc("GET /v1/apps/{app}/{env}/logs", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "logs for "+r.PathValue("app")+"/"+r.PathValue("env")+" "+r.URL.RawQuery+"\n")
@@ -186,6 +246,7 @@ type harness struct {
 	res   *countingResolver
 	store *store.Store
 	srv   *httptest.Server
+	ctrl  *Controller
 	// bodies captures every controller response body for leak checks.
 	bodies *strings.Builder
 }
@@ -205,7 +266,7 @@ func setup(t *testing.T) *harness {
 		"ghcr.io/o/api:fix": "ghcr.io/o/api" + digest('e'),
 	}}
 	ctrl := New(st, ciph, res, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	h := &harness{t: t, ctx: context.Background(), node: newFakeNode(t), res: res, store: st, bodies: &strings.Builder{}}
+	h := &harness{t: t, ctx: context.Background(), node: newFakeNode(t), res: res, store: st, bodies: &strings.Builder{}, ctrl: ctrl}
 	inner := ctrl.Handler(adminToken)
 	var mu sync.Mutex
 	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

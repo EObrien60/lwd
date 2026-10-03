@@ -165,6 +165,44 @@ func (c *Controller) Handler(token string) http.Handler {
 		return writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	})
 
+	h("GET /v1/apps/{app}/envs/{env}/resources", func(w http.ResponseWriter, r *http.Request) error {
+		rs, err := c.Resources(r.Context(), r.PathValue("app"), r.PathValue("env"))
+		return reply(w, rs, err)
+	})
+	// Backups and restores, like deploys, finish and are recorded even if
+	// the caller disconnects.
+	h("POST /v1/apps/{app}/envs/{env}/db/backup", func(w http.ResponseWriter, r *http.Request) error {
+		b, err := c.BackupDB(context.WithoutCancel(r.Context()), r.PathValue("app"), r.PathValue("env"), store.BackupManual, actor(r))
+		return reply(w, b, err)
+	})
+	h("GET /v1/apps/{app}/envs/{env}/db/backups", func(w http.ResponseWriter, r *http.Request) error {
+		app, env := r.PathValue("app"), r.PathValue("env")
+		if _, err := c.database(r.Context(), app, env); err != nil {
+			return err
+		}
+		limit, err := intParam(r, "limit", 50, 1000)
+		if err != nil {
+			return err
+		}
+		bs, err := c.store.ListBackups(r.Context(), app, env, limit)
+		return reply(w, bs, err)
+	})
+	h("POST /v1/apps/{app}/envs/{env}/db/restore", func(w http.ResponseWriter, r *http.Request) error {
+		var req client.RestoreRequest
+		if err := decode(r, &req); err != nil {
+			return err
+		}
+		if req.BackupID <= 0 {
+			return errf(client.CodeInvalid, "backup_id is required")
+		}
+		res, err := c.RestoreDB(context.WithoutCancel(r.Context()), r.PathValue("app"), r.PathValue("env"), req.BackupID, actor(r))
+		return reply(w, res, err)
+	})
+	h("GET /v1/backups", func(w http.ResponseWriter, r *http.Request) error {
+		st, err := c.BackupStatus(r.Context())
+		return reply(w, st, err)
+	})
+
 	h("GET /v1/events", func(w http.ResponseWriter, r *http.Request) error {
 		limit, err := intParam(r, "limit", 50, 1000)
 		if err != nil {
