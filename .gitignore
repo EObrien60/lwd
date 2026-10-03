@@ -13,3 +13,7 @@ secret.key
 
 # Superpowers SDD working dir (task briefs, reports, review diffs, ledgers)
 /.superpowers/
+
+# Cross-compiled binaries (consumed by ~/dev/OBH/infra lwd_node role)
+bin/
+.claude/
