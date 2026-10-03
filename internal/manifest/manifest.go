@@ -61,6 +61,8 @@ type Manifest struct {
 	Services     map[string]Service
 	Migrate      *Job
 	Environments map[string]Environment
+	Database     bool // shared Postgres database per environment (DATABASE_URL)
+	Storage      bool // shared S3 bucket per environment (S3_*)
 }
 
 // Resolved is a manifest flattened for one environment. Service images are
@@ -117,9 +119,8 @@ type rawManifest struct {
 	Secrets  []string                  `toml:"secrets"`
 	Services map[string]rawService     `toml:"services"`
 	Migrate  *rawJob                   `toml:"migrate"`
-	// Reserved for M2: decoded only so we can say so instead of "unknown key".
-	Database toml.Primitive `toml:"database"`
-	Storage  toml.Primitive `toml:"storage"`
+	Database bool                      `toml:"database"`
+	Storage  bool                      `toml:"storage"`
 }
 
 // Parse decodes and validates lwd.toml.
@@ -138,11 +139,20 @@ func Parse(data []byte) (*Manifest, error) {
 		Vars:         map[string]string{},
 		Services:     map[string]Service{},
 		Environments: map[string]Environment{},
+		Database:     raw.Database,
+		Storage:      raw.Storage,
 	}
-
-	for _, k := range []string{"database", "storage"} {
-		if md.IsDefined(k) {
-			add("%s: not supported until M2", k)
+	// injected names the platform variables this manifest's resources set;
+	// the app may not define them itself.
+	injected := map[string]string{}
+	if raw.Database {
+		for _, v := range bundle.DatabaseVars {
+			injected[v] = "database = true"
+		}
+	}
+	if raw.Storage {
+		for _, v := range bundle.StorageVars {
+			injected[v] = "storage = true"
 		}
 	}
 
@@ -160,6 +170,8 @@ func Parse(data []byte) (*Manifest, error) {
 			add("secrets[%d]: invalid variable name %q", i, s)
 		case seenSecret[s]:
 			add("secrets[%d]: duplicate %q", i, s)
+		case injected[s] != "":
+			add("secrets[%d]: %s is injected by %s", i, s, injected[s])
 		}
 		seenSecret[s] = true
 		m.Secrets = append(m.Secrets, s)
@@ -232,6 +244,8 @@ func Parse(data []byte) (*Manifest, error) {
 			}
 			if !varRE.MatchString(k) {
 				add("%s: invalid variable name", path)
+			} else if by := injected[k]; by != "" {
+				add("%s: injected by %s", path, by)
 			}
 			m.Vars[k] = v
 		case "Hash":
@@ -240,7 +254,7 @@ func Parse(data []byte) (*Manifest, error) {
 				add("%s: %v", path, err)
 				continue
 			}
-			m.Environments[k] = checkEnvironment(path, k, re, add)
+			m.Environments[k] = checkEnvironment(path, k, re, injected, add)
 		default:
 			add("%s: must be a string (variable) or a table (environment)", path)
 		}
@@ -250,11 +264,7 @@ func Parse(data []byte) (*Manifest, error) {
 	}
 
 	for _, k := range md.Undecoded() {
-		ks := k.String()
-		if k[0] == "database" || k[0] == "storage" {
-			continue // already reported as reserved
-		}
-		add("unknown key %s", ks)
+		add("unknown key %s", k.String())
 	}
 
 	if len(p) > 0 {
@@ -263,7 +273,7 @@ func Parse(data []byte) (*Manifest, error) {
 	return m, nil
 }
 
-func checkEnvironment(path, name string, re rawEnvironment, add func(string, ...any)) Environment {
+func checkEnvironment(path, name string, re rawEnvironment, injected map[string]string, add func(string, ...any)) Environment {
 	if !nameRE.MatchString(name) {
 		add("%s: invalid name, must match %s", path, nameRE)
 	}
@@ -292,6 +302,8 @@ func checkEnvironment(path, name string, re rawEnvironment, add func(string, ...
 			add("%s.env.%s: invalid variable name", path, k)
 		case !ok:
 			add("%s.env.%s: must be a string", path, k)
+		case injected[k] != "":
+			add("%s.env.%s: injected by %s", path, k, injected[k])
 		default:
 			vars[k] = s
 		}

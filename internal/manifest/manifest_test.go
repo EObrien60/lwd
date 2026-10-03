@@ -251,8 +251,17 @@ A = 1
 `), "env.A: must be a string"},
 		{"secret bad name", strings.Replace(base(""), `name = "a"`, "name = \"a\"\nsecrets = [\"a b\"]", 1), "secrets[0]: invalid variable name"},
 		{"secret dup", strings.Replace(base(""), `name = "a"`, "name = \"a\"\nsecrets = [\"A\", \"A\"]", 1), "secrets[1]: duplicate"},
-		{"database", strings.Replace(base(""), `name = "a"`, "name = \"a\"\n[database]\nengine = \"postgres\"", 1), "database: not supported until M2"},
-		{"storage", strings.Replace(base(""), `name = "a"`, "name = \"a\"\nstorage = true", 1), "storage: not supported until M2"},
+		{"database table", strings.Replace(base(""), `name = "a"`, "name = \"a\"\n[database]\nengine = \"postgres\"", 1), "database"},
+		{"storage string", strings.Replace(base(""), `name = "a"`, "name = \"a\"\nstorage = \"yes\"", 1), "storage"},
+		{"database var collision", strings.Replace(base(`[env]
+DATABASE_URL = "x"
+`), `name = "a"`, "name = \"a\"\ndatabase = true", 1), "env.DATABASE_URL: injected by database = true"},
+		{"storage env var collision", strings.Replace(base(`[env.stage]
+host = "h"
+domain = "x.y"
+env = { S3_BUCKET = "b" }
+`), `name = "a"`, "name = \"a\"\nstorage = true", 1), "env.stage.env.S3_BUCKET: injected by storage = true"},
+		{"storage secret collision", strings.Replace(base(""), `name = "a"`, "name = \"a\"\nstorage = true\nsecrets = [\"S3_SECRET_ACCESS_KEY\"]", 1), "secrets[0]: S3_SECRET_ACCESS_KEY is injected by storage = true"},
 		{"unknown top key", strings.Replace(base(""), `name = "a"`, "name = \"a\"\nreplicas = 3", 1), "unknown key replicas"},
 		{"unknown service key", base(`[services.w]
 image = "r/w"
@@ -351,5 +360,23 @@ func TestEnvironmentNamesSorted(t *testing.T) {
 	}
 	if got := m.EnvironmentNames(); !reflect.DeepEqual(got, []string{"prod", "staging"}) {
 		t.Errorf("names = %v", got)
+	}
+}
+
+func TestParseResources(t *testing.T) {
+	src := strings.Replace(designExample, `name = "hello"`, "name = \"hello\"\ndatabase = true\nstorage = false", 1)
+	m, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Database || m.Storage {
+		t.Errorf("database=%v storage=%v", m.Database, m.Storage)
+	}
+	m, err = Parse([]byte(designExample))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Database || m.Storage {
+		t.Errorf("defaults: database=%v storage=%v", m.Database, m.Storage)
 	}
 }

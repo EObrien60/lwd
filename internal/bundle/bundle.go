@@ -33,6 +33,11 @@ type Bundle struct {
 	Migrate    *Job              `json:"migrate,omitempty"`
 	Vars       map[string]string `json:"vars"` // plain env + resolved secrets, injected into every service
 	TLS        string            `json:"tls"`  // TLSACME or TLSInternal
+	// Platform attaches every service and the migrate job to the external
+	// docker network PlatformNetwork, in addition to the project's default
+	// network, so they can reach the host's platform services
+	// (lwd-postgres, lwd-s3). Set when the app declares a resource.
+	Platform bool `json:"platform,omitempty"`
 
 	ReadyTimeoutSeconds int `json:"ready_timeout_seconds"` // per-service readiness budget before going live
 	SmokeSeconds        int `json:"smoke_seconds"`         // post-cutover window checked through Caddy
