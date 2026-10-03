@@ -26,7 +26,9 @@ const (
 
 // Handler returns the /v1 API. Every route, including unknown ones, requires
 // the bearer token.
-func (c *Controller) Handler(token string) http.Handler {
+// Handler serves /v1. token is the admin bearer; readTokens (optional) may
+// only make GET/HEAD requests — for observers such as the agentd console.
+func (c *Controller) Handler(token string, readTokens ...string) http.Handler {
 	mux := http.NewServeMux()
 	h := func(pattern string, fn func(http.ResponseWriter, *http.Request) error) {
 		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
@@ -217,22 +219,39 @@ func (c *Controller) Handler(token string) http.Handler {
 		return errf(client.CodeNotFound, "no route for %s %s", r.Method, r.URL.Path)
 	})
 
-	return requireToken(token, mux)
+	return requireToken(token, readTokens, mux)
 }
 
 // requireToken checks the bearer token in constant time. Both sides are
 // hashed first so the comparison does not leak the token's length either.
-func requireToken(token string, next http.Handler) http.Handler {
+// A read-only token is accepted for GET/HEAD only; anything else gets 403.
+func requireToken(token string, readTokens []string, next http.Handler) http.Handler {
 	want := sha256.Sum256([]byte(token))
+	var readOnly [][32]byte
+	for _, t := range readTokens {
+		if t = strings.TrimSpace(t); t != "" && t != token {
+			readOnly = append(readOnly, sha256.Sum256([]byte(t)))
+		}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		sum := sha256.Sum256([]byte(got))
-		if !ok || token == "" || subtle.ConstantTimeCompare(sum[:], want[:]) != 1 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="lwd"`)
-			writeErrorBody(w, http.StatusUnauthorized, client.CodeUnauthorized, "missing or invalid bearer token")
+		if ok && token != "" && subtle.ConstantTimeCompare(sum[:], want[:]) == 1 {
+			next.ServeHTTP(w, r)
 			return
 		}
-		next.ServeHTTP(w, r)
+		for _, ro := range readOnly {
+			if ok && subtle.ConstantTimeCompare(sum[:], ro[:]) == 1 {
+				if r.Method != http.MethodGet && r.Method != http.MethodHead {
+					writeErrorBody(w, http.StatusForbidden, client.CodeUnauthorized, "read-only token cannot "+r.Method)
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		w.Header().Set("WWW-Authenticate", `Bearer realm="lwd"`)
+		writeErrorBody(w, http.StatusUnauthorized, client.CodeUnauthorized, "missing or invalid bearer token")
 	})
 }
 

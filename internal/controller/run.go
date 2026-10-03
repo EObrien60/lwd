@@ -61,7 +61,7 @@ func Serve(ctx context.Context, cfg Config, ln net.Listener, log *slog.Logger) e
 
 	c := New(st, ciph, registry.NewRemote(cfg.InsecureRegistries), log)
 	srv := &http.Server{
-		Handler:           c.Handler(cfg.APIToken),
+		Handler:           c.Handler(cfg.APIToken, cfg.ReadToken),
 		ReadHeaderTimeout: 10 * time.Second,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}

@@ -17,6 +17,7 @@ type Config struct {
 	DatabaseURL        string   // LWD_DATABASE_URL (required)
 	Listen             string   // LWD_LISTEN
 	APIToken           string   // LWD_API_TOKEN (required)
+	ReadToken          string   // LWD_READ_TOKEN (optional): GET-only access for observers
 	SecretKeyFile      string   // LWD_SECRET_KEY_FILE
 	InsecureRegistries []string // LWD_INSECURE_REGISTRIES, comma separated; dev only
 	BackupHour         int      // LWD_BACKUP_HOUR, local hour 0-23 of the daily database backups (default 3)
@@ -29,6 +30,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		DatabaseURL:   getenv("LWD_DATABASE_URL"),
 		Listen:        getenv("LWD_LISTEN"),
 		APIToken:      strings.TrimSpace(getenv("LWD_API_TOKEN")),
+		ReadToken:     strings.TrimSpace(getenv("LWD_READ_TOKEN")),
 		SecretKeyFile: getenv("LWD_SECRET_KEY_FILE"),
 	}
 	var errs []error
